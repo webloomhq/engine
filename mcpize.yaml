@@ -1,0 +1,57 @@
+name: chrome-browser-control
+display_name: Chrome Browser Control for Claude
+tagline: Real Chrome control — tabs, clicks, forms, screenshots, and DOM automation via CDP.
+description: |
+  Give Claude direct control over a real Chrome browser. Navigate pages, click elements,
+  fill forms, run JavaScript, take screenshots, and scan page structure — all without
+  browser extensions or headless sandboxes.
+
+  Connect to live Chrome sessions via Chrome DevTools Protocol (CDP). Works with
+  your existing logged-in Chrome profiles — no re-auth needed.
+
+  Free: tab management, navigation, screenshots.
+  Paid ($29/mo): click automation, form filling, JS execution, DOM scanning, session playbooks.
+
+version: 1
+category: Productivity
+tags:
+  - browser
+  - chrome
+  - automation
+  - cdp
+  - scraping
+  - forms
+  - screenshot
+
+runtime: python
+entry: server_fastmcp.py
+transport: http
+install: pip install -r requirements.txt
+
+env:
+  CHROME_SESSIONS_JSON:
+    description: JSON config of Chrome sessions with ports and user data dirs (base64-encoded)
+    required: false
+
+pricing:
+  model: freemium
+  free_tools:
+    - list_sessions
+    - launch_session
+    - list_tabs
+    - screenshot
+  paid:
+    price: 29
+    interval: month
+    currency: usd
+    tools:
+      - read_tab
+      - click
+      - fill
+      - eval_js
+      - navigate
+      - new_tab
+      - scan_tab
+      - get_playbook
+      - save_playbook
+      - wait_for

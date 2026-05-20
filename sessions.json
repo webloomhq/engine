@@ -1,0 +1,27 @@
+{
+  "main": {
+    "port": 9222,
+    "user_data_dir": "D:\\ChromeDebugSession",
+    "description": "Primary session — nanomarche@gmail.com logged in"
+  },
+  "slot-1": {
+    "port": 9224,
+    "user_data_dir": "D:\\BrowserSessions\\slot-1",
+    "description": "Working slot 1 — nanomarche@gmail.com logged in"
+  },
+  "slot-2": {
+    "port": 9226,
+    "user_data_dir": "D:\\BrowserSessions\\slot-2",
+    "description": "Working slot 2 — nanomarche@gmail.com logged in"
+  },
+  "slot-3": {
+    "port": 9223,
+    "user_data_dir": "D:\\BrowserSessions\\slot-3",
+    "description": "Working slot 3 — nanomarche@gmail.com logged in"
+  },
+  "slot-4": {
+    "port": 9225,
+    "user_data_dir": "D:\\BrowserSessions\\slot-4",
+    "description": "Working slot 4 — nanomarche@gmail.com logged in"
+  }
+}

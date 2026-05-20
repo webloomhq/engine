@@ -1,0 +1,12 @@
+{
+  "_README": "Example Reddit campaign config for reddit_poster.py. Copy to reddit_campaigns.json and edit. Run with: python reddit_poster.py --config reddit_campaigns.json",
+  "default_session_port": 9224,
+  "rate_limit_seconds": 1800,
+  "jitter_seconds": [60, 300],
+  "comments": [
+    {
+      "post_url": "https://www.reddit.com/r/n8n/comments/1tgbomu/looking_for_tools_to_enrich_3800_licensed/",
+      "markdown": "I built something for exactly this case — DIY-Hunter pulls emails from public registries + LinkedIn data, runs SMTP+DNS validation, and can dedupe against a list you provide.\n\nThe full enrichment runs ~$0.003 per row vs Hunter/Snov which charge $0.10+. Self-hosted Python so it stays on your infra.\n\nCode: https://github.com/example/diy-hunter\n\nHappy to help wire it up if you want to chat."
+    }
+  ]
+}

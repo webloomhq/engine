@@ -1,0 +1,40 @@
+{
+  "_README": "Reddit account pool config. Each account is one Chrome session on a unique debug port. The orchestrator + karma worker round-robin between these. Copy to reddit_accounts.json (gitignored) and fill in real data.",
+  "accounts": [
+    {
+      "username": "nan0mc",
+      "session_port": 9224,
+      "session_name": "slot-1",
+      "persona": "indie dev — terse, no-nonsense, helpful",
+      "created_at": "2019-07-01",
+      "karma_target": 200,
+      "subs_preferred": ["mildlyinteresting", "lifehacks", "todayilearned"],
+      "subs_blacklist_commercial": ["n8n", "automation", "indiehackers"],
+      "max_actions_per_day": {
+        "upvotes": 25,
+        "comments": 3,
+        "submits": 0
+      },
+      "_status": "u/nan0mc — original account; failed-submit attempts left 0 karma; not shadowbanned per detector",
+      "_last_checked": null
+    },
+    {
+      "_template_for_new_account": true,
+      "username": "FILL_IN",
+      "session_port": 9225,
+      "session_name": "slot-2",
+      "persona": "casual user — friendly, image-share heavy",
+      "created_at": "FILL_IN",
+      "karma_target": 200,
+      "subs_preferred": ["aww", "BeAmazed", "interestingasfuck"],
+      "subs_blacklist_commercial": ["n8n", "automation", "indiehackers"],
+      "max_actions_per_day": {"upvotes": 30, "comments": 4, "submits": 0}
+    }
+  ],
+  "global_settings": {
+    "rotation_min_minutes_between_same_account": 240,
+    "max_cycles_per_account_per_day": 3,
+    "auto_shadowban_check_every_hours": 24,
+    "abort_account_on_shadowban": true
+  }
+}

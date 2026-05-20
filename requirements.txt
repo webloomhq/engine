@@ -1,0 +1,9 @@
+fastmcp
+mcp
+uvicorn
+python-dotenv
+pyautogui
+websockets
+pyotp
+psutil
+pywin32

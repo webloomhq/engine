@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Runtime state — never push these (they may carry session/local data)
+.recording_state.json
+*.local.json
+sandboxes/co.json
+sandboxes/co_resp.json
+sandboxes/disc.json
+sandboxes/p.json
+sandboxes/repo.json
+sandboxes/resp.json
+sandboxes/recipes/*.local.json
+
+# Logs
+*.log
+logs/
+
+# Backup files from weaver promote
+threads/*.bak.*.json
+sandboxes/threads/*.bak.*.json
+
+# Editor + OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local environment overrides
+.env
+.env.local

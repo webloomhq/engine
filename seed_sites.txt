@@ -1,0 +1,53 @@
+# WebLoom seed Thread sites — launch list v1.
+# These are public/anonymous-accessible sites for headless seed generation.
+# Auth-gated sites (KDP, D2D, exchanges) need hand-crafted Threads.
+
+# Discovery & community
+producthunt.com
+github.com
+ycombinator.com
+news.ycombinator.com
+reddit.com
+stackoverflow.com
+medium.com
+substack.com
+dev.to
+
+# Productivity / SaaS landing
+notion.so
+linear.app
+vercel.com
+netlify.com
+cloudflare.com
+supabase.com
+railway.app
+
+# AI / agents
+anthropic.com
+openai.com
+huggingface.co
+replicate.com
+cursor.sh
+
+# Web3 / quests / exchanges (landing pages only — auth-walled flows need hand-crafted)
+galxe.com
+layer3.xyz
+zealy.io
+bitget.com
+mexc.com
+binance.com
+kucoin.com
+
+# Selling / marketplace
+gumroad.com
+etsy.com
+shopify.com
+
+# Productivity content
+quora.com
+duckduckgo.com
+wikipedia.org
+
+# Test / dev
+example.com
+httpbin.org

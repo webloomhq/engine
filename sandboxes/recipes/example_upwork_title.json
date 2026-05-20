@@ -1,0 +1,13 @@
+{
+  "name": "Update Upwork profile title",
+  "thread": "upwork.com",
+  "notes": "Example recipe — selectors are placeholders. After `weaver discover` on your profile, replace with real selectors from the Thread.",
+  "steps": [
+    { "kind": "assert_selector", "selector": "input[name='title'], #profile-title", "label": "title field exists" },
+    { "kind": "fill",            "selector": "input[name='title'], #profile-title", "value": "AI Automation Engineer · WebLoom", "label": "set new title", "pause": 0.6 },
+    { "kind": "screenshot",      "label": "before save" },
+    { "kind": "click_text",      "text": "save",  "label": "click save", "pause": 0.6 },
+    { "kind": "wait_text",       "text": "saved", "timeout": 8, "label": "wait for confirmation" },
+    { "kind": "screenshot",      "label": "after save" }
+  ]
+}
