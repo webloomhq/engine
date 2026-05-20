@@ -1,0 +1,27 @@
+{
+  "main": {
+    "port": 9222,
+    "user_data_dir": "/path/to/your/ChromeDebugSession",
+    "description": "Primary session"
+  },
+  "slot-1": {
+    "port": 9224,
+    "user_data_dir": "/path/to/BrowserSessions/slot-1",
+    "description": "Working slot 1"
+  },
+  "slot-2": {
+    "port": 9226,
+    "user_data_dir": "/path/to/BrowserSessions/slot-2",
+    "description": "Working slot 2"
+  },
+  "slot-3": {
+    "port": 9223,
+    "user_data_dir": "/path/to/BrowserSessions/slot-3",
+    "description": "Working slot 3"
+  },
+  "slot-4": {
+    "port": 9225,
+    "user_data_dir": "/path/to/BrowserSessions/slot-4",
+    "description": "Working slot 4"
+  }
+}

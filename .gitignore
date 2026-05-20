@@ -36,3 +36,8 @@ Thumbs.db
 # Local environment overrides
 .env
 .env.local
+
+# Session config — contains user email + drive paths
+sessions.json
+server.py.with_stage0
+server.py.with_*
