@@ -1,5 +1,5 @@
-name: chrome-browser-control
-display_name: Chrome Browser Control for Claude
+name: webloom-dna
+display_name: "WebloomDNA — Chrome Browser Control"
 tagline: Real Chrome control — tabs, clicks, forms, screenshots, and DOM automation via CDP.
 description: |
   Give Claude direct control over a real Chrome browser. Navigate pages, click elements,

@@ -1714,8 +1714,8 @@ async def list_tools():
         Tool(name="export_profile", description="Export all cookies and storage for a session to a JSON file — for portability across machines or as a session backup. Sensitive: do NOT commit the output to git.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "out_path": {"type": "string", "description": "Absolute path to write the JSON file"}}, "required": ["session", "out_path"]}),
         Tool(name="import_profile", description="Import cookies from a JSON file (previously exported via export_profile) into a session. The session must be live.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "in_path": {"type": "string", "description": "Absolute path to the cookie JSON file"}}, "required": ["session", "in_path"]}),
         Tool(name="capture_network_start", description="Start capturing network requests on a tab. Records URL, method, status, mimeType, request/response timing. Returns immediately; capture continues in the background until capture_network_stop.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
-        Tool(name="capture_network_stop", description="Stop network capture and return all captured requests for the tab.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string", "description": "Optional substring — only return requests whose URL contains this"}}, "required": ["session"]}),
-        Tool(name="get_captured_requests", description="Get current captured network requests for a tab without stopping capture.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string"}}, "required": ["session"]}),
+        Tool(name="capture_network_stop", description="Stop network capture and return all captured requests for the tab. Pass full=true to get headers + request body (required for replay_xhr). Default returns a one-line summary per request.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string", "description": "Optional substring — only return requests whose URL contains this"}, "full": {"type": "boolean", "description": "If true, return full request_headers, request_body, response_headers as JSON. Use when you need to replay (auth tokens, csrf, transaction-ids, body shape)."}}, "required": ["session"]}),
+        Tool(name="get_captured_requests", description="Get current captured network requests for a tab without stopping capture. Pass full=true to get headers + request body.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string"}, "full": {"type": "boolean", "description": "If true, return full headers + body — needed for replay_xhr."}}, "required": ["session"]}),
         Tool(name="scan_tab_diff", description="Diff-scan: returns ONLY buttons/inputs/forms that appeared, disappeared, or changed since the last scan_tab or scan_tab_diff on this tab. Massively reduces tokens on multi-step flows. First call returns the full scan.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
         Tool(name="key_type", description="Type a string into the focused element. Two modes: 'keystrokes' (default) fires per-char keyDown+keyUp with full keyboard metadata (windowsVirtualKeyCode, code, text, unmodifiedText) — what Playwright does, triggers React onChange/Backbone listeners. 'insertText' is faster, IME-friendly, but some legacy/hostile sites (D2D, older React/Backbone) don't see keypress events from it. Tip: click an input first to focus, then key_type. If saved values come out as [object Object] or look corrupted, try react_force_change as an escape hatch.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "text": {"type": "string", "description": "Text to type"}, "delay_ms": {"type": "integer", "default": 30, "description": "Delay between keystrokes"}, "mode": {"type": "string", "enum": ["keystrokes", "insertText", "fast"], "default": "keystrokes", "description": "keystrokes = per-char keyDown+keyUp (most compatible, default). insertText = single CDP call per char (faster, IME-friendly, less compatible with old React). fast = set value once on focused input + dispatch input/change (fastest, only works for non-React/non-Backbone vanilla forms)."}}, "required": ["session", "text"]}),
         Tool(name="react_force_change", description="Escape hatch for hostile React/Backbone inputs where neither fill nor key_type triggers proper state update (D2D 'Add New Author' [object Object] bug). Walks the input element's React fiber and INVOKES the memoized onChange handler directly with a synthetic event carrying the value. Bypasses keyboard dispatch entirely. Last-resort — use only when key_type produces a corrupted saved value.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the input element"}, "value": {"type": "string", "description": "String value to set"}}, "required": ["session", "selector", "value"]}),
@@ -2371,6 +2371,28 @@ async def _execute_tool_action(name: str, arguments: dict):
                 winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             except Exception:
                 pass
+        # Record manual-touch checkpoint in the playbook. We tag the
+        # MOST RECENTLY ACTIVE domain in session_state so the gap is
+        # attached to the right flow. Future Thread authors see exactly
+        # which step needs human help.
+        try:
+            most_recent_domain = None
+            most_recent_ts = 0
+            for d, st in _session_state.items():
+                ts = float(st.get("last_ts", 0) or 0)
+                if ts > most_recent_ts:
+                    most_recent_ts = ts
+                    most_recent_domain = d
+            if most_recent_domain:
+                desc = f"pause_for_human:{reason[:60]}"
+                _playbook_record(
+                    most_recent_domain, desc, "manual", True,
+                    kind="manual_touch",
+                    manual_touch_required=True,
+                    manual_touch_reason=reason,
+                )
+        except Exception:
+            pass
         msg = (
             f"⏸️ **PAUSED — human action required**\n\n"
             f"**Reason:** {reason}\n"
@@ -2681,8 +2703,78 @@ async def _execute_tool_action(name: str, arguments: dict):
         return [TextContent(type="text", text=val)]
 
     if name == "eval_js":
-        result = await eval_in_tab(ws_url, arguments["code"])
+        code = arguments["code"]
+        result = await eval_in_tab(ws_url, code)
         val = result.get("result", {})
+
+        # Heuristic auto-recording: if the eval_js code includes a fetch() call
+        # AND the returned value looks like a successful HTTP response
+        # ({ok:true,status:200} or similar), record it as a proven action.
+        # This catches sessions that discover endpoints via raw fetch() (the
+        # MARSTUDIO 2026-05-21 X-crack pattern) and prevents the discovery
+        # from being lost when the session ends.
+        try:
+            import re
+            if "fetch(" in code:
+                # Try to extract the fetch URL from the code (first quoted URL)
+                m = re.search(r"fetch\(\s*[`'\"]([^`'\"]+)[`'\"]", code)
+                target_url = m.group(1) if m else None
+                # Extract the value the eval returned — could be a dict, string, etc.
+                returned = val.get("value") if isinstance(val, dict) else val
+                # If returned is a JSON string, parse it
+                parsed = None
+                if isinstance(returned, str):
+                    try:
+                        parsed = json.loads(returned)
+                    except Exception:
+                        parsed = None
+                elif isinstance(returned, dict):
+                    parsed = returned
+
+                ok_flag = None
+                status_code = None
+                if isinstance(parsed, dict):
+                    if "ok" in parsed:
+                        ok_flag = bool(parsed.get("ok"))
+                    if "status" in parsed:
+                        status_code = parsed.get("status")
+
+                # Record only when we have a credible success signal
+                if target_url and ok_flag is True and (status_code is None or (200 <= int(status_code or 0) < 400)):
+                    # Resolve full URL if relative
+                    full_url = target_url
+                    if target_url.startswith("/"):
+                        try:
+                            origin_r = await eval_in_tab(ws_url, "location.origin")
+                            origin = origin_r.get("result", {}).get("value", "")
+                            if origin:
+                                full_url = origin + target_url
+                        except Exception:
+                            pass
+                    d = domain_from_url(full_url)
+                    if d:
+                        from urllib.parse import urlparse
+                        p = urlparse(full_url)
+                        parts = [seg for seg in p.path.split("/") if seg]
+                        norm = "/" + "/".join(
+                            "{hash}" if (len(seg) >= 16 and seg.isalnum()) else seg
+                            for seg in parts
+                        ) if parts else "/"
+                        # Detect method from code (default POST if body present, else GET)
+                        method = "GET"
+                        mm = re.search(r"method\s*:\s*['\"](\w+)['\"]", code)
+                        if mm:
+                            method = mm.group(1).upper()
+                        elif "body:" in code or "body :" in code:
+                            method = "POST"
+                        desc = f"eval_js_fetch:{method} {norm}"
+                        _playbook_record(
+                            d, desc, "eval_js_fetch", True,
+                            kind="xhr_replay", selector_pattern=full_url,
+                        )
+        except Exception:
+            pass
+
         return [TextContent(type="text", text=json.dumps(val, indent=2))]
 
     if name == "find_tab_by_selector":
@@ -3405,9 +3497,29 @@ async def _execute_tool_action(name: str, arguments: dict):
                 "method": req.get("method"),
                 "type": p.get("type"),
                 "started_ms": int(p.get("timestamp", 0) * 1000),
+                # Full request headers + body — captured at this stage so replay always works.
+                # The MARSTUDIO 2026-05-21 X-crack incident proved we MUST persist these.
+                "request_headers": dict(req.get("headers") or {}),
+                "request_body": req.get("postData"),
+                "has_post_data": bool(req.get("hasPostData")),
             }
             index[rid] = entry
             buf.append(entry)
+
+        def on_request_extra(msg):
+            # Network.requestWillBeSentExtraInfo carries auth headers (Cookie,
+            # x-csrf-token, x-client-transaction-id, etc.) that the regular event
+            # redacts. Merge in.
+            p = msg.get("params", {})
+            rid = p.get("requestId")
+            entry = index.get(rid)
+            if not entry:
+                return
+            extra = p.get("headers") or {}
+            merged = dict(entry.get("request_headers") or {})
+            for k, v in extra.items():
+                merged[k] = v
+            entry["request_headers"] = merged
 
         def on_response(msg):
             p = msg.get("params", {})
@@ -3419,16 +3531,23 @@ async def _execute_tool_action(name: str, arguments: dict):
             entry["status"] = res.get("status")
             entry["mimeType"] = res.get("mimeType")
             entry["from_cache"] = res.get("fromDiskCache") or res.get("fromServiceWorker")
+            entry["response_headers"] = dict(res.get("headers") or {})
 
         conn.subscribe("Network.requestWillBeSent", on_request)
+        conn.subscribe("Network.requestWillBeSentExtraInfo", on_request_extra)
         conn.subscribe("Network.responseReceived", on_response)
         _network_buffers[ws_url] = buf
-        _network_active[ws_url] = {"req_cb": on_request, "res_cb": on_response}
-        return [TextContent(type="text", text="📡 Network capture started.")]
+        _network_active[ws_url] = {
+            "req_cb": on_request,
+            "req_extra_cb": on_request_extra,
+            "res_cb": on_response,
+        }
+        return [TextContent(type="text", text="📡 Network capture started (full headers + body).")]
 
     if name in ("capture_network_stop", "get_captured_requests"):
         buf = _network_buffers.get(ws_url, [])
         url_filter = (arguments.get("url_filter") or "").lower()
+        full = bool(arguments.get("full"))
         filtered = [e for e in buf if not url_filter or url_filter in (e.get("url") or "").lower()]
         if name == "capture_network_stop":
             try:
@@ -3436,6 +3555,9 @@ async def _execute_tool_action(name: str, arguments: dict):
                 active = _network_active.pop(ws_url, None)
                 if active:
                     conn.unsubscribe("Network.requestWillBeSent", active["req_cb"])
+                    extra = active.get("req_extra_cb")
+                    if extra:
+                        conn.unsubscribe("Network.requestWillBeSentExtraInfo", extra)
                     conn.unsubscribe("Network.responseReceived", active["res_cb"])
                 await conn.send("Network.disable")
             except Exception:
@@ -3444,6 +3566,11 @@ async def _execute_tool_action(name: str, arguments: dict):
             header = f"📴 Capture stopped — {len(filtered)} request(s) returned"
         else:
             header = f"📡 Capture active — {len(filtered)} request(s) so far"
+        # Full-mode output: JSON with full headers + body. Use when you need
+        # to replay a captured call (auth tokens, x-csrf, transaction-id, body shape).
+        if full:
+            out = {"summary": header, "count": len(filtered), "requests": filtered[-50:]}
+            return [TextContent(type="text", text=json.dumps(out, indent=2, default=str))]
         # Compact output: one line per request
         lines = [header + (f" (filter '{url_filter}')" if url_filter else "") + "\n"]
         for e in filtered[-200:]:
@@ -3451,6 +3578,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             mime = (e.get("mimeType") or "")[:30]
             url = (e.get("url") or "")[:120]
             lines.append(f"  [{status}] {e.get('method','?'):4s} {e.get('type','?'):10s} {mime:30s} {url}")
+        lines.append("\n(call again with full=true to get headers + body for replay)")
         return [TextContent(type="text", text="\n".join(lines))]
 
     if name == "scan_tab_diff":
@@ -4435,6 +4563,7 @@ async def _execute_tool_action(name: str, arguments: dict):
 
         # 6. Wait for the post to register + optionally verify
         await asyncio.sleep(2.5)
+        landed = True  # assume success if we reached submit without errors
         if verify:
             check_js = f"""(function() {{
                 const target = {json.dumps(markdown[:60])};
@@ -4446,6 +4575,19 @@ async def _execute_tool_action(name: str, arguments: dict):
             r = await eval_in_tab(ws_url, check_js)
             ver = r.get("result", {}).get("value", "{}")
             trace.append(f"verify: {ver}")
+            try:
+                ver_data = json.loads(ver)
+                landed = int(ver_data.get("found", 0)) > 0
+            except Exception:
+                landed = False
+
+        # Record into playbook — submitting a Reddit comment is a textbook
+        # proven_action for the reddit.com Thread.
+        try:
+            d = domain_from_url(post_url) or "reddit.com"
+            _playbook_record(d, "reddit_submit_comment", "composite", landed, kind="submit_comment", selector_pattern=post_url)
+        except Exception:
+            pass
 
         return [TextContent(type="text", text="reddit_submit_comment complete.\n\nTrace:\n" + "\n".join(trace))]
 
@@ -4558,6 +4700,34 @@ async def _execute_tool_action(name: str, arguments: dict):
         }})({json.dumps(url)}, {json.dumps(method)}, {json.dumps(headers)}, {body_payload}, {json.dumps(is_json)})"""
         r = await eval_in_tab(ws_url, js)
         val = r.get("result", {}).get("value", "{}")
+
+        # Auto-record XHR-replay successes into the playbook. Without this,
+        # major discoveries (e.g. the X CreateTweet GraphQL replay) stay
+        # invisible to the engine. Descriptor uses a normalized path so
+        # rotating hash segments collapse to one entry.
+        try:
+            parsed = json.loads(val) if isinstance(val, str) else (val or {})
+            ok = bool(parsed.get("ok"))
+            status = parsed.get("status", 0)
+            d = domain_from_url(url)
+            if d:
+                from urllib.parse import urlparse
+                p = urlparse(url)
+                # Collapse long-hash segments to {hash} for stable descriptors.
+                parts = [seg for seg in p.path.split("/") if seg]
+                norm = "/" + "/".join(
+                    "{hash}" if (len(seg) >= 16 and seg.isalnum()) else seg
+                    for seg in parts
+                ) if parts else "/"
+                desc = f"xhr_replay:{method} {norm}"
+                success = ok and 200 <= int(status or 0) < 400
+                _playbook_record(
+                    d, desc, "xhr_replay", success,
+                    kind="xhr_replay", selector_pattern=url,
+                )
+        except Exception:
+            pass
+
         return [TextContent(type="text", text=f"replay_xhr {method} {url}: {val}")]
 
     if name == "xhr_upload":
@@ -4755,6 +4925,17 @@ async def _execute_tool_action(name: str, arguments: dict):
         }
         await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", **base, **({"text": info["text"]} if "text" in info else {})})
         await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", **base})
+        # Record key_press into playbook — Enter on a form submit / Ctrl+S save /
+        # Escape on a modal can each be the "unlock" move for a flow.
+        try:
+            cur_url = await eval_in_tab(ws_url, "location.href")
+            url_now = cur_url.get("result", {}).get("value", "")
+            d = domain_from_url(url_now)
+            if d:
+                combo = "+".join(mods + [key]) if mods else key
+                _playbook_record(d, f"key_press:{combo}", "cdp_key", True, kind="key_press")
+        except Exception:
+            pass
         return [TextContent(type="text", text=f"Pressed {key}{' + '+'+'.join(mods) if mods else ''}.")]
 
     if name == "scroll_tab":
