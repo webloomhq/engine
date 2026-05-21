@@ -1725,12 +1725,14 @@ async def list_tools():
         Tool(name="backbone_inspect", description="Inspect a page's Backbone.js objects — for sites built on Backbone (legacy Amazon properties, some older KDP pages). Reports presence of Backbone, history routes, registered models/collections, and current route. Read-only for now; if useful we can add backbone_invoke later for triggering router actions.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "max_chars": {"type": "integer", "default": 4000}}, "required": ["session"]}),
         Tool(name="lexical_set_text", description=(
             "Set plain text inside a Lexical-based contenteditable (Reddit's new composer, Notion-like editors, Meta apps). "
+            "LEXICAL ONLY — DO NOT USE FOR DRAFT.JS SITES (X/Twitter composer). Use draftjs_set_text instead for those. "
             "Standard input strategies desync because Lexical maintains its own state model separate from the DOM. "
             "This tool: (1) optionally clicks a placeholder to mount the editor and polls for the contenteditable; "
             "(2) accesses Lexical's exposed __lexicalEditor instance via a fiber-walk; "
             "(3) if found, uses setEditorState(parseEditorState(...)) to set a clean serialized state with the text — bypasses DOM entirely; "
             "(4) if no editor handle is reachable, falls back to focus + selectAll + delete + native paste event with proper DataTransfer; "
-            "(5) verifies final innerText length and returns a sample. Returns {ok, mode, readback_len, sample}."
+            "(5) verifies final innerText length and returns a sample. Returns {ok, mode, readback_len, sample}. "
+            "If readback_len is 0 on a target you suspect is Draft.js (X.com), switch to draftjs_set_text."
         ), inputSchema={"type": "object", "properties": {
             "session": {"type": "string"},
             "tab": {"type": "string"},
@@ -1739,6 +1741,28 @@ async def list_tools():
             "click_placeholder_selector": {"type": "string", "description": "Optional: selector for a placeholder element to click first (triggers Lexical mount on Reddit's lazy composer). After click, polls for contenteditable up to mount_timeout_seconds."},
             "mount_timeout_seconds": {"type": "number", "default": 5, "description": "How long to wait for the contenteditable to appear after clicking placeholder."},
             "submit_via_enter": {"type": "boolean", "default": False, "description": "After setting text, fire Enter on the editor to submit (some single-line composers)."}
+        }, "required": ["session", "container_selector", "text"]}),
+        Tool(name="draftjs_set_text", description=(
+            "Set plain text inside a Draft.js-based contenteditable (X/Twitter composer). "
+            "Draft.js maintains EditorState as the source of truth (NOT the DOM), and its handlePastedText "
+            "checks isTrusted, so synthetic paste/compositionend events fail to update state — DOM gets the "
+            "text but the post button stays disabled. "
+            "This tool runs four strategies in order: (1) walks the React fiber from the contenteditable looking "
+            "for an editor instance with props.editorState + props.onChange, calls onChange with a fresh state "
+            "built from the editor's own Modifier when reachable; (2) falls back to beforeinput InputEvent with "
+            "inputType='insertText' which Draft.js's keypress handler accepts as a real typing event; "
+            "(3) falls back to real CDP keystrokes via Input.dispatchKeyEvent with a focus-settle warmup ritual "
+            "(real click → 350ms wait → space + backspace warmup → 100ms wait → text typed at 40ms/char) — this "
+            "is the path that bypasses Draft.js's focus catcher and lands keystrokes on the real editor root; "
+            "(4) returns {ok, mode, readback_len, sample}. Mode tells you which strategy succeeded. "
+            "Use after lexical_set_text returns readback_len 0 on a Draft.js target."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "container_selector": {"type": "string", "description": "CSS selector for the contenteditable or its wrapper. For X.com: [data-testid='tweetTextarea_0']."},
+            "text": {"type": "string", "description": "Plain text to set."},
+            "click_first": {"type": "boolean", "default": True, "description": "Real CDP click on the editor before typing (focus). Almost always wanted."},
+            "submit_via_enter": {"type": "boolean", "default": False, "description": "After setting text, fire Enter (some compose flows submit on Enter)."}
         }, "required": ["session", "container_selector", "text"]}),
         Tool(name="reddit_check_shadowban", description=(
             "Detect whether a Reddit account is shadowbanned. Fetches the account's public profile JSON "
@@ -1786,7 +1810,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script"}
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -4403,6 +4427,167 @@ async def _execute_tool_action(name: str, arguments: dict):
         except Exception:
             pass
         return [TextContent(type="text", text=f"lexical_set_text: {val}")]
+
+    if name == "draftjs_set_text":
+        # Draft.js requires a totally different strategy than Lexical:
+        # - handlePastedText blocks synthetic paste events (isTrusted check)
+        # - EditorState is in React fiber props, not on a DOM property
+        # - Real CDP keystrokes go through Draft's keydown handlers and DO update state
+        container_sel = arguments["container_selector"]
+        text_to_set = arguments["text"]
+        click_first = bool(arguments.get("click_first", True))
+        submit_enter = bool(arguments.get("submit_via_enter", False))
+
+        # STRATEGY 1+2 (in-page JS): fiber-walk to find Draft editor, then beforeinput
+        js_strat12 = """(async function(containerSel, text) {
+            const result = {steps: []};
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            let editable = document.querySelector(containerSel);
+            if (editable && !editable.isContentEditable) {
+                editable = editable.querySelector('[contenteditable=true]') || editable.querySelector('[contenteditable]') || editable;
+            }
+            if (!editable) return JSON.stringify({ok:false, error:'no contenteditable at '+containerSel});
+            editable.scrollIntoView({block:'center'});
+            editable.focus();
+            result.steps.push('editable located: ' + editable.tagName);
+
+            // Try fiber-walk for Draft editor (props.editorState + props.onChange)
+            const fiberKey = Object.keys(editable).find(k => k.startsWith('__reactFiber'));
+            let draftInstance = null;
+            if (fiberKey) {
+                let f = editable[fiberKey];
+                let hops = 0;
+                while (f && hops < 40) {
+                    const sn = f.stateNode;
+                    if (sn && sn.props && sn.props.editorState && typeof sn.props.onChange === 'function') {
+                        draftInstance = sn;
+                        result.steps.push('fiber: found Draft editor at hop '+hops);
+                        break;
+                    }
+                    if (f.memoizedProps && f.memoizedProps.editorState && typeof f.memoizedProps.onChange === 'function') {
+                        draftInstance = { props: f.memoizedProps, _fromMemoized: true };
+                        result.steps.push('fiber: found memoized props at hop '+hops);
+                        break;
+                    }
+                    f = f.return;
+                    hops++;
+                }
+            }
+            if (!draftInstance) result.steps.push('fiber: no Draft editor instance reachable');
+
+            // STRATEGY 2: beforeinput insertText. Draft.js's keypress handler treats this as a real typing event.
+            try {
+                const ev = new InputEvent('beforeinput', {
+                    bubbles: true, cancelable: true, composed: true,
+                    inputType: 'insertText',
+                    data: text,
+                });
+                editable.dispatchEvent(ev);
+                await sleep(180);
+                const len = (editable.innerText || '').length;
+                if (len >= Math.min(text.length, 5)) {
+                    result.ok = true;
+                    result.mode = 'beforeinput-inserttext';
+                    result.readback_len = len;
+                    result.sample = (editable.innerText || '').slice(0, 120);
+                    return JSON.stringify(result);
+                }
+                result.steps.push('beforeinput inserted only ' + len + ' chars, falling through');
+            } catch (e) {
+                result.steps.push('beforeinput threw: ' + (e && e.message));
+            }
+            // Signal to Python to try CDP keystroke strategy
+            return JSON.stringify({ ok:false, fallback:'cdp_keystrokes', steps: result.steps });
+        })(""" + json.dumps(container_sel) + ", " + json.dumps(text_to_set) + ")"
+
+        r = await eval_in_tab(ws_url, js_strat12)
+        raw = r.get("result", {}).get("value", "{}")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            parsed = {"ok": False, "raw": raw}
+
+        # Strategies 1+2 succeeded — return
+        if parsed.get("ok"):
+            try:
+                cur_url = await eval_in_tab(ws_url, "location.href")
+                d = domain_from_url(cur_url.get("result", {}).get("value", ""))
+                if d:
+                    _playbook_record(d, f"draftjs_set_text:{container_sel}", parsed.get("mode", "?"), True, kind="fill", selector_pattern=container_sel)
+            except Exception:
+                pass
+            return [TextContent(type="text", text=f"draftjs_set_text: {json.dumps(parsed)}")]
+
+        # STRATEGY 3 — Real CDP keystrokes with focus-settle warmup ritual
+        # Get element coords for the click
+        coord_js = """(function(s){
+            let el = document.querySelector(s);
+            if (el && !el.isContentEditable) el = el.querySelector('[contenteditable=true]') || el;
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return {x: r.left + r.width/2, y: r.top + Math.min(40, r.height/2), w: r.width, h: r.height};
+        })(""" + json.dumps(container_sel) + ")"
+        cr = await eval_in_tab(ws_url, coord_js)
+        coords = cr.get("result", {}).get("value")
+
+        if click_first and coords:
+            # Real CDP click
+            x, y = coords["x"], coords["y"]
+            for ev_type in ("mousePressed", "mouseReleased"):
+                await cdp_send(ws_url, "Input.dispatchMouseEvent", {
+                    "type": ev_type, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1,
+                })
+            await asyncio.sleep(0.35)  # let Draft's focus catcher hand off to real root
+
+            # Warmup ritual: space + backspace
+            for vk, txt in [(32, " "), (8, None)]:
+                payload_down = {"type": "keyDown", "key": " " if vk == 32 else "Backspace",
+                                "code": "Space" if vk == 32 else "Backspace",
+                                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+                if txt is not None:
+                    payload_down["text"] = txt
+                await cdp_send(ws_url, "Input.dispatchKeyEvent", payload_down)
+                await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp",
+                    "key": " " if vk == 32 else "Backspace",
+                    "code": "Space" if vk == 32 else "Backspace",
+                    "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+                await asyncio.sleep(0.04)
+            await asyncio.sleep(0.10)
+
+        # Now type each char via Input.insertText (which fires through Draft.js's beforeinput chain
+        # via the synthetic IME path that Draft accepts).
+        for ch in text_to_set:
+            await cdp_send(ws_url, "Input.insertText", {"text": ch})
+            await asyncio.sleep(0.04)
+
+        await asyncio.sleep(0.20)
+
+        # Readback
+        rb = await eval_in_tab(ws_url, f"(function(s){{let el=document.querySelector(s); if(el && !el.isContentEditable) el = el.querySelector('[contenteditable=true]')||el; return el ? (el.innerText||'').slice(0,200) : ''}})({json.dumps(container_sel)})")
+        sample = rb.get("result", {}).get("value", "")
+        readback_len = len(sample)
+        success = readback_len >= min(len(text_to_set), 5)
+
+        if submit_enter and success:
+            await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r"})
+            await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
+
+        try:
+            cur_url = await eval_in_tab(ws_url, "location.href")
+            d = domain_from_url(cur_url.get("result", {}).get("value", ""))
+            if d:
+                _playbook_record(d, f"draftjs_set_text:{container_sel}", "cdp_keystrokes", success, kind="fill", selector_pattern=container_sel)
+        except Exception:
+            pass
+
+        out = {
+            "ok": success,
+            "mode": "cdp_keystrokes",
+            "readback_len": readback_len,
+            "sample": sample[:120],
+            "steps": parsed.get("steps", []) + ["cdp keystrokes with warmup ritual"],
+        }
+        return [TextContent(type="text", text=f"draftjs_set_text: {json.dumps(out)}")]
 
     if name == "reddit_submit_comment":
         post_url = arguments["post_url"]
