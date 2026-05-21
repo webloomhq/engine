@@ -1762,7 +1762,9 @@ async def list_tools():
             "container_selector": {"type": "string", "description": "CSS selector for the contenteditable or its wrapper. For X.com: [data-testid='tweetTextarea_0']."},
             "text": {"type": "string", "description": "Plain text to set."},
             "click_first": {"type": "boolean", "default": True, "description": "Real CDP click on the editor before typing (focus). Almost always wanted."},
-            "submit_via_enter": {"type": "boolean", "default": False, "description": "After setting text, fire Enter (some compose flows submit on Enter)."}
+            "submit_via_enter": {"type": "boolean", "default": False, "description": "After setting text, fire Enter (some compose flows submit on Enter)."},
+            "delay_ms": {"type": "integer", "default": 80, "description": "Milliseconds between keystrokes in strategy 3 (CDP keystrokes). Default 80 (safe). Bump to 120-150 if char drops occur on slow machines; drop to 40-60 only on fast clean ones. Lower = faster but risks Draft.js missing events."},
+            "verify_per_char": {"type": "boolean", "default": False, "description": "If true, read composer.innerText after each char and retry dropped chars up to 3 times. Bulletproof but adds ~30ms CDP roundtrip per char. Use for high-stakes single shots; leave off for normal posting."}
         }, "required": ["session", "container_selector", "text"]}),
         Tool(name="reddit_check_shadowban", description=(
             "Detect whether a Reddit account is shadowbanned. Fetches the account's public profile JSON "
@@ -4437,6 +4439,11 @@ async def _execute_tool_action(name: str, arguments: dict):
         text_to_set = arguments["text"]
         click_first = bool(arguments.get("click_first", True))
         submit_enter = bool(arguments.get("submit_via_enter", False))
+        delay_ms = int(arguments.get("delay_ms", 80))
+        verify_per_char = bool(arguments.get("verify_per_char", False))
+        # Clamp delay to a sane range
+        delay_ms = max(20, min(500, delay_ms))
+        delay_s = delay_ms / 1000.0
 
         # STRATEGY 1+2 (in-page JS): fiber-walk to find Draft editor, then beforeinput
         js_strat12 = """(async function(containerSel, text) {
@@ -4554,19 +4561,46 @@ async def _execute_tool_action(name: str, arguments: dict):
                 await asyncio.sleep(0.04)
             await asyncio.sleep(0.10)
 
-        # Now type each char via Input.insertText (which fires through Draft.js's beforeinput chain
-        # via the synthetic IME path that Draft accepts).
-        for ch in text_to_set:
-            await cdp_send(ws_url, "Input.insertText", {"text": ch})
-            await asyncio.sleep(0.04)
+        # Type each char via Input.insertText (Draft.js's synthetic IME path).
+        # Optional verify-per-char mode retries dropped chars up to 3x.
+        dropped = 0
+        retried = 0
+        readback_js = f"(function(s){{let el=document.querySelector(s); if(el && !el.isContentEditable) el = el.querySelector('[contenteditable=true]')||el; return el ? (el.innerText||'') : ''}})({json.dumps(container_sel)})"
+
+        if verify_per_char:
+            # Expected length grows by 1 per successfully-landed char
+            expected = 0
+            for ch in text_to_set:
+                landed = False
+                for attempt in range(3):
+                    await cdp_send(ws_url, "Input.insertText", {"text": ch})
+                    await asyncio.sleep(delay_s)
+                    rb = await eval_in_tab(ws_url, readback_js)
+                    cur = rb.get("result", {}).get("value", "")
+                    if len(cur) >= expected + 1:
+                        landed = True
+                        expected = len(cur)
+                        if attempt > 0:
+                            retried += 1
+                        break
+                    # Brief extra settle before retry
+                    await asyncio.sleep(delay_s)
+                if not landed:
+                    dropped += 1
+        else:
+            # Fast path — fixed delay between chars, no per-char verify
+            for ch in text_to_set:
+                await cdp_send(ws_url, "Input.insertText", {"text": ch})
+                await asyncio.sleep(delay_s)
 
         await asyncio.sleep(0.20)
 
-        # Readback
-        rb = await eval_in_tab(ws_url, f"(function(s){{let el=document.querySelector(s); if(el && !el.isContentEditable) el = el.querySelector('[contenteditable=true]')||el; return el ? (el.innerText||'').slice(0,200) : ''}})({json.dumps(container_sel)})")
-        sample = rb.get("result", {}).get("value", "")
-        readback_len = len(sample)
-        success = readback_len >= min(len(text_to_set), 5)
+        # Final readback
+        rb = await eval_in_tab(ws_url, readback_js)
+        sample_full = rb.get("result", {}).get("value", "")
+        sample = sample_full[:200]
+        readback_len = len(sample_full)
+        success = readback_len >= int(len(text_to_set) * 0.95)
 
         if submit_enter and success:
             await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r"})
@@ -4584,9 +4618,16 @@ async def _execute_tool_action(name: str, arguments: dict):
             "ok": success,
             "mode": "cdp_keystrokes",
             "readback_len": readback_len,
+            "expected_len": len(text_to_set),
+            "delay_ms": delay_ms,
+            "dropped_chars": dropped,
+            "retried_chars": retried,
+            "verify_per_char": verify_per_char,
             "sample": sample[:120],
-            "steps": parsed.get("steps", []) + ["cdp keystrokes with warmup ritual"],
+            "steps": parsed.get("steps", []) + [f"cdp keystrokes (delay={delay_ms}ms, verify={verify_per_char})"],
         }
+        if not success:
+            out["hint"] = "char drops detected — increase delay_ms (try 120-150) or pass verify_per_char=true"
         return [TextContent(type="text", text=f"draftjs_set_text: {json.dumps(out)}")]
 
     if name == "reddit_submit_comment":
