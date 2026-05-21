@@ -1765,6 +1765,8 @@ async def list_tools():
         }, "required": ["session", "post_url", "markdown"]}),
         Tool(name="touch_tap", description="Fire a real touch event (CDP Input.dispatchTouchEvent — isTrusted=true touchStart + touchEnd) at an element's center. Use for mobile-first webapps that listen for touchstart/touchend instead of mouse/click — Telegram Web /a/, WhatsApp Web, Instagram Web mobile mode, anything with a custom tap detector. Enables Emulation.setTouchEmulationEnabled if not already on. Pass a CSS selector OR an @eN ref from scan_tab.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the element to tap (or @eN ref)."}, "double": {"type": "boolean", "default": False, "description": "Fire two taps in quick succession (double-tap)."}}, "required": ["session", "selector"]}),
         Tool(name="replay_xhr", description="Replay a captured network request with optional modifications. Takes a request shape (method, url, headers, body) usually obtained from capture_network_start/stop, optionally substitutes new values, and re-fires via fetch() with credentials:'include' so cookies/auth carry. Returns full response. Use to: (a) confirm a discovered endpoint actually works, (b) re-fire idempotent actions, (c) skip the UI entirely once an endpoint is known. Companion to xhr_upload — replay_xhr is for non-file requests.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url": {"type": "string", "description": "Full URL to fetch (absolute or relative to current page origin)"}, "method": {"type": "string", "default": "POST"}, "headers": {"type": "object", "description": "Request headers (do not include Cookie — that flows automatically via credentials:'include')"}, "body": {"description": "Request body. If object → JSON-encoded (Content-Type: application/json added if absent). If string → sent as-is. If null/omitted → no body."}, "params": {"type": "object", "description": "Optional URL query params merged into the URL"}}, "required": ["session", "url"]}),
+        Tool(name="inject_on_new_document", description="Register a JS script that auto-injects on every new document in this tab — survives all navigations (CDP Page.addScriptToEvaluateOnNewDocument). Use to install persistent XHR interceptors, fingerprint probes, or instrumentation that needs to be present BEFORE page scripts run. The script runs in page context. Returns an identifier you can pass to remove_injected_script to remove it. Common pattern: install an XHR interceptor that populates window.__xhrCaptures with full headers + body for a target endpoint regex, then drive the user through actions on multiple pages and read window.__xhrCaptures via eval_js whenever needed.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "script": {"type": "string", "description": "JavaScript source to inject. Runs in page context on every navigation BEFORE page scripts. Typical usage: install Object.defineProperty/proxy hooks on window.fetch or XMLHttpRequest.prototype that capture into a window-level array."}}, "required": ["session", "script"]}),
+        Tool(name="remove_injected_script", description="Remove a previously injected persistent script by its identifier (returned from inject_on_new_document). Future navigations on this tab will no longer auto-install it.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "identifier": {"type": "string", "description": "Identifier returned by inject_on_new_document"}}, "required": ["session", "identifier"]}),
         Tool(name="xhr_upload", description="Direct file upload via fetch()/FormData against a server endpoint. Bypasses widgets that intercept and corrupt programmatic file injection (KDP AjaxInput, custom AJAX uploaders that clear input.files after onchange). Uses the page's cookies/CSRF/session via credentials:'include' — appears identical to the page's own upload request. Pair with capture_network_start/stop to discover the URL and field names by watching one manual upload. Max 25MB combined.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url": {"type": "string", "description": "Upload endpoint URL (absolute or relative to current page origin). Discover via capture_network_start during a real upload."}, "files": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute local file path"}, "field": {"type": "string", "description": "FormData field name (e.g. 'file', 'cover_image', 'manuscript'). Watch a real upload to identify."}}, "required": ["path", "field"]}, "description": "Files to upload, each with its FormData field name."}, "fields": {"type": "object", "description": "Additional FormData fields (CSRF tokens, book IDs, hidden params). Often required — capture a real upload to identify."}, "method": {"type": "string", "default": "POST"}, "headers": {"type": "object", "description": "Extra headers (X-CSRF-Token, etc). Cookies are automatic via credentials:'include'."}}, "required": ["session", "url", "files"]}),
         Tool(name="key_press", description="Press a single named key via CDP Input.dispatchKeyEvent. Use for Enter, Tab, Escape, ArrowUp/Down/Left/Right, Backspace, Space. For navigating React dropdowns/menus (Radix, Headless UI) keyboard-style: focus the trigger, ArrowDown to highlight, Enter to select.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "key": {"type": "string", "description": "Key name: Enter, Tab, Escape, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Backspace, Space, PageDown, PageUp, Home, End"}, "modifiers": {"type": "array", "items": {"type": "string", "enum": ["Alt", "Control", "Meta", "Shift"]}, "description": "Optional modifier keys held during the press"}}, "required": ["session", "key"]}),
     ]
@@ -1784,7 +1786,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "reddit_submit_comment"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script"}
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -4729,6 +4731,44 @@ async def _execute_tool_action(name: str, arguments: dict):
             pass
 
         return [TextContent(type="text", text=f"replay_xhr {method} {url}: {val}")]
+
+    if name == "inject_on_new_document":
+        # CDP Page.addScriptToEvaluateOnNewDocument — survives all navigations
+        # in the tab for the lifetime of the connection. Critical for capturing
+        # network or fingerprint data across multi-page user flows (e.g. X reply
+        # workflow where the user must navigate to a target tweet, which kills
+        # any page-injected interceptor). Cleans up nicely via remove_injected_script.
+        conn = await _get_conn(ws_url)
+        await conn.send("Page.enable")
+        script = arguments["script"]
+        result = await conn.send(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": script, "runImmediately": True},
+        )
+        ident = result.get("identifier") if isinstance(result, dict) else None
+        if not ident:
+            # Some CDP versions wrap the result; be defensive.
+            ident = (result or {}).get("result", {}).get("identifier") if isinstance(result, dict) else None
+        # Also evaluate it once in the CURRENT document so existing tabs get it
+        # without needing a reload. Future navigations re-run via the registered handler.
+        try:
+            await eval_in_tab(ws_url, script)
+        except Exception:
+            pass
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "identifier": ident,
+            "note": "Script is registered and will auto-inject on every future navigation. Also ran once in current document.",
+        }, indent=2))]
+
+    if name == "remove_injected_script":
+        conn = await _get_conn(ws_url)
+        ident = arguments["identifier"]
+        try:
+            await conn.send("Page.removeScriptToEvaluateOnNewDocument", {"identifier": ident})
+            return [TextContent(type="text", text=json.dumps({"ok": True, "removed": ident}))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}))]
 
     if name == "xhr_upload":
         import base64, mimetypes
