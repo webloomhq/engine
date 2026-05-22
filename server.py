@@ -6696,6 +6696,21 @@ async def _execute_tool_action(name: str, arguments: dict):
         query_id = arguments.get("query_id") or ""
         reply_to = arguments.get("reply_to_tweet_id") or ""
 
+        # Auto-route to an x.com / twitter.com tab when caller didn't pass one.
+        # The session may have many tabs (IH, LinkedIn, HN…) and the generic
+        # find_tab() fallback returns the first real tab — which won't have ct0.
+        if not arguments.get("tab"):
+            current_url = (tab.get("url") or "").lower()
+            if "x.com" not in current_url and "twitter.com" not in current_url:
+                x_tabs = [t for t in real_tabs(tabs)
+                          if "x.com" in (t.get("url") or "").lower()
+                          or "twitter.com" in (t.get("url") or "").lower()]
+                if x_tabs:
+                    tab = x_tabs[0]
+                    ws_url = tab["webSocketDebuggerUrl"]
+                else:
+                    return [TextContent(type="text", text=f"x_create_tweet: no x.com tab open in this session. Open https://x.com/home and retry, or pass tab=<id>. Current tabs: {[t.get('url','') for t in real_tabs(tabs)][:5]}")]
+
         # 1. Pull home HTML + ondemand JS from Python directly (urllib).
         #    In-page fetch to x.com → abs.twimg.com is blocked by X's CSP
         #    (connect-src omits the CDN). The home HTML scaffold + ondemand JS
