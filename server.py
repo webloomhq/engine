@@ -1948,6 +1948,26 @@ async def list_tools():
             "action": {"type": "string", "description": "reCAPTCHA v3 action name (optional)"},
             "min_score": {"type": "number", "description": "reCAPTCHA v3 min_score (default 0.3)"}
         }, "required": ["session", "type", "site_key"]}),
+        Tool(name="swarm_run", description=(
+            "Multi-agent swarm — two specialist Claude agents cooperate on one Chrome session to accomplish a "
+            "goal. The DRIVER plans and executes actions. The WATCHER monitors for popups, captchas, error modals, "
+            "session expiry every few seconds via vision_check and signals the driver to pause/handle. "
+            "Use for long high-stakes flows that need babysitting (multi-step publish wizards, complex onboardings, "
+            "anything where a single-agent run would need human intervention mid-flow). "
+            "ALSO doubles as a Thread-authoring accelerator: pass emit_thread=true and the captured driver_actions "
+            "+ verified successes are returned as a proposed Thread JSON skeleton you can review + publish. "
+            "Requires ANTHROPIC_API_KEY. Costs ~$0.15-0.40 per session on the user's key (3-4x single-agent cost). "
+            "Runs synchronously for up to max_minutes; returns full transcript on completion/timeout."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "goal": {"type": "string", "description": "Plain-English goal for the swarm. Example: 'Publish a new book on KDP using book.docx and cover.jpg'."},
+            "thread_domain": {"type": "string", "description": "Optional domain hint — the swarm pulls relevant Thread context from the playbook (proven_actions, preflight, notes, anti-bot signals) for this domain."},
+            "max_minutes": {"type": "integer", "default": 8, "description": "Hard cap on swarm runtime. Default 8 min."},
+            "max_steps": {"type": "integer", "default": 15, "description": "Hard cap on driver actions. Default 15."},
+            "emit_thread": {"type": "boolean", "default": False, "description": "If true, after a successful run, return a proposed Thread JSON skeleton with the captured proven_actions."},
+            "watcher_interval_seconds": {"type": "number", "default": 4.0, "description": "How often the watcher inspects the screen. Lower = more responsive, more tokens. Default 4s."}
+        }, "required": ["goal"]}),
         Tool(name="visual_diff_preflight", description=(
             "Snap a small screenshot region of a target element and either (a) store the perceptual hash + "
             "neighborhood rgb fingerprint as a 'visual anchor' on first run, or (b) compare against the stored "
@@ -2069,7 +2089,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run"}
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -5124,6 +5144,283 @@ async def _execute_tool_action(name: str, arguments: dict):
                 return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}, indent=2))]
         else:
             return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"provider '{provider}' not yet implemented (twocaptcha works)"}, indent=2))]
+
+    # ── SWARM_RUN — 2-role multi-agent (Driver + Watcher) ──────────────
+    if name == "swarm_run":
+        import base64, time as _t
+        goal = arguments["goal"]
+        thread_domain = arguments.get("thread_domain") or ""
+        max_minutes = int(arguments.get("max_minutes", 8))
+        max_steps = int(arguments.get("max_steps", 15))
+        emit_thread = bool(arguments.get("emit_thread", False))
+        watcher_interval = float(arguments.get("watcher_interval_seconds", 4.0))
+
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not anthropic_key:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "ANTHROPIC_API_KEY required for swarm_run"}, indent=2))]
+
+        # Pull Thread context if domain hinted
+        thread_ctx: dict = {}
+        if thread_domain:
+            try:
+                pb_live = load_playbook()
+                d_entry = pb_live.get(thread_domain) or pb_live.get(thread_domain.replace("www.", "")) or {}
+                thread_ctx = {
+                    "domain": thread_domain,
+                    "notes": d_entry.get("notes", [])[:10],
+                    "proven_actions": d_entry.get("proven_actions", [])[:15],
+                    "preflight": d_entry.get("preflight", [])[:10],
+                    "anti_bot_signals": d_entry.get("anti_bot_signals", []),
+                    "framework": d_entry.get("framework"),
+                }
+            except Exception:
+                pass
+
+        # Shared state between agents
+        state = {
+            "events": [],            # ordered log
+            "watcher_alert": None,   # current alert (cleared after driver handles)
+            "should_stop": False,
+            "driver_actions": [],
+            "watcher_alerts": [],
+            "step": 0,
+        }
+
+        async def _call_claude(system: str, messages: list, max_tokens: int = 800, with_image: str | None = None) -> dict:
+            import urllib.request as _req
+            content_list: list = []
+            if with_image:
+                content_list.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": with_image}})
+            # Inject latest user message as final content
+            messages_with_image = list(messages)
+            if content_list and messages_with_image:
+                last_user = messages_with_image[-1]
+                if last_user.get("role") == "user":
+                    if isinstance(last_user["content"], str):
+                        last_user = {"role": "user", "content": content_list + [{"type": "text", "text": last_user["content"]}]}
+                    messages_with_image[-1] = last_user
+            body = {
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": messages_with_image,
+            }
+            req = _req.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(body).encode(),
+                headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            )
+            loop = asyncio.get_event_loop()
+            def _do():
+                return _req.urlopen(req, timeout=25).read()
+            raw = await loop.run_in_executor(None, _do)
+            return json.loads(raw.decode())
+
+        async def watcher_loop():
+            """Snap a screenshot every watcher_interval seconds. Ask Haiku: any
+            popups, captchas, error modals, session expiry, blocking overlays?
+            If yes, publish an alert that the driver checks before each action."""
+            watcher_system = (
+                "You are the WATCHER agent in a 2-agent browser automation swarm. Your ONLY job is to look at the "
+                "current screenshot and answer: is there anything UNUSUAL blocking the main flow? Things to flag: "
+                "popups, modals, captchas, 'session expired' notices, error toasts, cookie consent overlays, "
+                "rate-limit warnings, unexpected confirmation dialogs. Do NOT flag normal UI like nav menus, "
+                "sidebars, or expected content. "
+                "Respond ONLY with JSON: {\"alert\": true|false, \"what\": \"short description\", \"action_hint\": "
+                "\"what the driver should do (dismiss, accept_cookies, solve_captcha, pause_for_human, ignore)\"}."
+            )
+            while not state["should_stop"]:
+                try:
+                    shot = await cdp_send(ws_url, "Page.captureScreenshot", {"format": "png"})
+                    png_b64 = shot.get("data") or shot.get("result", {}).get("data") or ""
+                    if png_b64:
+                        resp = await _call_claude(
+                            watcher_system,
+                            [{"role": "user", "content": "Check the current page state."}],
+                            max_tokens=200,
+                            with_image=png_b64,
+                        )
+                        text = "".join(c.get("text", "") for c in resp.get("content", []) if c.get("type") == "text").strip()
+                        # Extract JSON
+                        try:
+                            jstart = text.find("{"); jend = text.rfind("}")
+                            if jstart >= 0 and jend > jstart:
+                                obj = json.loads(text[jstart:jend + 1])
+                                if obj.get("alert"):
+                                    alert_entry = {"ts": _t.time(), **obj}
+                                    state["watcher_alert"] = alert_entry
+                                    state["watcher_alerts"].append(alert_entry)
+                                    state["events"].append({"role": "watcher", "kind": "alert", **obj})
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # Wait for next interval, but bail fast if swarm stopped
+                slept = 0
+                while slept < watcher_interval and not state["should_stop"]:
+                    await asyncio.sleep(0.2)
+                    slept += 0.2
+
+        async def driver_loop():
+            """Decision loop: ask Haiku what action to take next given the goal,
+            Thread context, last actions, and any pending Watcher alert."""
+            driver_system = (
+                "You are the DRIVER agent in a 2-agent browser automation swarm. You are working toward a USER GOAL "
+                "on a website. You have access to the WebLoom engine's tools. You have an installed Thread with "
+                "proven_actions you can lean on. A separate WATCHER agent monitors the page for popups/captchas/etc "
+                "— if it raises an alert, address that before proceeding to the goal.\n\n"
+                "Respond ONLY with JSON of shape: {\"thought\": \"...\", \"tool\": \"...\", \"args\": {...}, "
+                "\"done\": false}. To finish, set done=true with no tool. To halt with an error, set "
+                "tool=\"pause_for_human\" with args.reason.\n\n"
+                "Available tools (subset): navigate, scan_tab, click, fill, key_press, key_type, "
+                "lexical_set_text, draftjs_set_text, scroll_tab, wait_for, screenshot, vision_check, "
+                "click_at_coords, upload_file, replay_xhr, pause_for_human. "
+                "Always include session and tab in args when relevant."
+            )
+
+            for step_i in range(max_steps):
+                if state["should_stop"]:
+                    break
+                state["step"] = step_i
+
+                # If Watcher has a pending alert, handle that first
+                alert = state["watcher_alert"]
+                state["watcher_alert"] = None
+
+                hist_summary = state["driver_actions"][-5:]
+                user_msg = json.dumps({
+                    "goal": goal,
+                    "thread_context": thread_ctx,
+                    "watcher_alert": alert,
+                    "session": arguments.get("session", "default"),
+                    "tab": arguments.get("tab", ""),
+                    "recent_actions": hist_summary,
+                    "step": step_i,
+                    "max_steps": max_steps,
+                })
+
+                try:
+                    resp = await _call_claude(driver_system, [{"role": "user", "content": user_msg}], max_tokens=500)
+                except Exception as e:
+                    state["events"].append({"role": "driver", "kind": "error", "error": str(e)})
+                    break
+                text = "".join(c.get("text", "") for c in resp.get("content", []) if c.get("type") == "text").strip()
+                try:
+                    jstart = text.find("{"); jend = text.rfind("}")
+                    obj = json.loads(text[jstart:jend + 1]) if jstart >= 0 and jend > jstart else None
+                except Exception:
+                    obj = None
+                if not obj:
+                    state["events"].append({"role": "driver", "kind": "parse_fail", "raw": text[:300]})
+                    break
+
+                if obj.get("done"):
+                    state["events"].append({"role": "driver", "kind": "done", "thought": obj.get("thought", "")})
+                    break
+
+                tool_to_run = obj.get("tool")
+                tool_args = obj.get("args", {}) or {}
+                tool_args.setdefault("session", arguments.get("session", "default"))
+                if arguments.get("tab"):
+                    tool_args.setdefault("tab", arguments["tab"])
+
+                action_entry = {"step": step_i, "thought": obj.get("thought", "")[:200], "tool": tool_to_run, "args": tool_args}
+                state["events"].append({"role": "driver", "kind": "action", **action_entry})
+
+                try:
+                    res = await _execute_tool_action(tool_to_run, tool_args)
+                    out_text = ""
+                    if isinstance(res, list):
+                        for c in res:
+                            if hasattr(c, "text"):
+                                out_text = c.text
+                                break
+                    action_entry["output"] = out_text[:500]
+                    state["driver_actions"].append(action_entry)
+                except Exception as e:
+                    action_entry["error"] = str(e)
+                    state["driver_actions"].append(action_entry)
+                    state["events"].append({"role": "driver", "kind": "tool_error", "error": str(e)})
+                    break
+
+                # Brief pacing between actions so Watcher can catch popups
+                await asyncio.sleep(0.5)
+
+        # Launch swarm with overall timeout
+        start_ts = _t.time()
+        async def with_timeout():
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(watcher_loop(), driver_loop(), return_exceptions=True),
+                    timeout=max_minutes * 60,
+                )
+            except asyncio.TimeoutError:
+                state["events"].append({"role": "swarm", "kind": "timeout"})
+
+        # When driver finishes (done or error), tell watcher to stop too
+        async def finalize():
+            await driver_loop()
+            state["should_stop"] = True
+
+        async def run_pair():
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(watcher_loop(), finalize(), return_exceptions=True),
+                    timeout=max_minutes * 60,
+                )
+            except asyncio.TimeoutError:
+                state["events"].append({"role": "swarm", "kind": "timeout"})
+                state["should_stop"] = True
+
+        await run_pair()
+        duration = int(_t.time() - start_ts)
+
+        # Optional: emit a Thread proposal from the successful actions
+        thread_proposal = None
+        if emit_thread:
+            proven = []
+            for a in state["driver_actions"]:
+                if a.get("error"): continue
+                tool_name = a.get("tool", "")
+                if tool_name in ("scan_tab", "screenshot", "read_tab"): continue  # skip read-only
+                proven.append({
+                    "descriptor": a.get("thought", "")[:80] or f"{tool_name} action",
+                    "strategy": tool_name,
+                    "args_sketch": {k: v for k, v in a.get("args", {}).items() if k not in ("session", "tab")},
+                    "successes": 1,
+                })
+            if thread_domain:
+                thread_proposal = {
+                    "domain": thread_domain,
+                    "name": f"{thread_domain} — swarm-authored",
+                    "version": "0.1.0",
+                    "tier": "mapped",
+                    "author": "swarm",
+                    "notes": [f"Swarm-authored from goal: {goal[:200]}"],
+                    "proven_actions": proven,
+                    "created_at": int(_t.time()),
+                    "created_by": "swarm_run",
+                }
+
+        status = (
+            "completed" if any(e.get("kind") == "done" for e in state["events"])
+            else "timeout" if any(e.get("kind") == "timeout" for e in state["events"])
+            else "max_steps" if state["step"] >= max_steps - 1
+            else "aborted"
+        )
+
+        return [TextContent(type="text", text=json.dumps({
+            "ok": status == "completed",
+            "goal": goal,
+            "status": status,
+            "duration_seconds": duration,
+            "steps_executed": len(state["driver_actions"]),
+            "watcher_alerts_seen": len(state["watcher_alerts"]),
+            "driver_actions": state["driver_actions"],
+            "watcher_alerts": state["watcher_alerts"],
+            "events": state["events"][-50:],  # tail
+            "thread_proposal": thread_proposal,
+        }, indent=2))]
 
     # ── VISUAL DIFF PREFLIGHT ────────────────────────────────────────────
     if name == "visual_diff_preflight":
