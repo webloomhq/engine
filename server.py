@@ -2185,6 +2185,7 @@ async def list_tools():
         Tool(name="remove_injected_script", description="Remove a previously injected persistent script by its identifier (returned from inject_on_new_document). Future navigations on this tab will no longer auto-install it.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "identifier": {"type": "string", "description": "Identifier returned by inject_on_new_document"}}, "required": ["session", "identifier"]}),
         Tool(name="xhr_upload", description="Direct file upload via fetch()/FormData against a server endpoint. Bypasses widgets that intercept and corrupt programmatic file injection (KDP AjaxInput, custom AJAX uploaders that clear input.files after onchange). Uses the page's cookies/CSRF/session via credentials:'include' — appears identical to the page's own upload request. Pair with capture_network_start/stop to discover the URL and field names by watching one manual upload. Max 25MB combined.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url": {"type": "string", "description": "Upload endpoint URL (absolute or relative to current page origin). Discover via capture_network_start during a real upload."}, "files": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute local file path"}, "field": {"type": "string", "description": "FormData field name (e.g. 'file', 'cover_image', 'manuscript'). Watch a real upload to identify."}}, "required": ["path", "field"]}, "description": "Files to upload, each with its FormData field name."}, "fields": {"type": "object", "description": "Additional FormData fields (CSRF tokens, book IDs, hidden params). Often required — capture a real upload to identify."}, "method": {"type": "string", "default": "POST"}, "headers": {"type": "object", "description": "Extra headers (X-CSRF-Token, etc). Cookies are automatic via credentials:'include'."}}, "required": ["session", "url", "files"]}),
         Tool(name="key_press", description="Press a single named key via CDP Input.dispatchKeyEvent. Use for Enter, Tab, Escape, ArrowUp/Down/Left/Right, Backspace, Space. For navigating React dropdowns/menus (Radix, Headless UI) keyboard-style: focus the trigger, ArrowDown to highlight, Enter to select.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "key": {"type": "string", "description": "Key name: Enter, Tab, Escape, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Backspace, Space, PageDown, PageUp, Home, End"}, "modifiers": {"type": "array", "items": {"type": "string", "enum": ["Alt", "Control", "Meta", "Shift"]}, "description": "Optional modifier keys held during the press"}}, "required": ["session", "key"]}),
+        Tool(name="x_create_tweet", description="Post a tweet on X without typing into the DOM. Computes x-client-transaction-id from the page (reverses X's body-signed anti-replay header), refreshes ct0 from cookie, fires CreateTweet GraphQL POST from the tab context (cookies auto-attach). Zero manual seed needed — kills the seed-and-replay dance entirely. Use this instead of draftjs_set_text+click for X posting. Requires the X tab to be open and logged in.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching x.com (defaults to first x.com tab)"}, "text": {"type": "string", "description": "Tweet body"}, "query_id": {"type": "string", "description": "X's CreateTweet GraphQL queryId. Optional — if omitted, scraped from the page. Pass explicitly when scrape fails (X bundles changed)."}, "reply_to_tweet_id": {"type": "string", "description": "Optional — if set, posts as a reply to this tweet id."}}, "required": ["session", "text"]}),
     ]
 
 def resolve_session(session_str: str) -> int:
@@ -2202,7 +2203,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler", "x_create_tweet"}
 # check_thread_updates + show_recent_auto_heals don't need a session — they're admin/info tools
 
 
@@ -6686,6 +6687,180 @@ async def _execute_tool_action(name: str, arguments: dict):
             pass
 
         return [TextContent(type="text", text=f"replay_xhr {method} {url}: {val}")]
+
+    if name == "x_create_tweet":
+        # End-to-end X post via reverse-engineered x-client-transaction-id.
+        # Reads home HTML + ondemand JS from the tab context (cookies attach),
+        # computes the body-bound signature via the vendored x_client_transaction
+        # lib, then POSTs CreateTweet GraphQL from the same tab. Zero manual
+        # seed, zero DOM typing — pure protocol-level send.
+        tweet_text = arguments["text"]
+        query_id = arguments.get("query_id") or ""
+        reply_to = arguments.get("reply_to_tweet_id") or ""
+
+        # 1. Pull home HTML + ondemand JS + ct0 from the tab in one shot
+        bundle_js = r"""(async function() {
+            try {
+                const homeRes = await fetch('https://x.com/home', {credentials: 'include'});
+                const home = await homeRes.text();
+                const idxMatch = home.match(/,(\d+):["']ondemand\.s["']/);
+                if (!idxMatch) return JSON.stringify({error: 'ondemand index not in home HTML — page may be a login wall'});
+                const idx = idxMatch[1];
+                const hashRe = new RegExp(',' + idx + ':"([0-9a-f]+)"');
+                const hashMatch = home.match(hashRe);
+                if (!hashMatch) return JSON.stringify({error: 'ondemand hash not found'});
+                const ondemandUrl = 'https://abs.twimg.com/responsive-web/client-web/ondemand.s.' + hashMatch[1] + 'a.js';
+                const ondemandRes = await fetch(ondemandUrl);
+                const ondemand = await ondemandRes.text();
+                const ct0Match = document.cookie.split('; ').find(c => c.startsWith('ct0='));
+                const ct0 = ct0Match ? ct0Match.split('=')[1] : '';
+                // Best-effort queryId scrape from main bundle. If this fails, caller passes query_id.
+                let scrapedQid = '';
+                try {
+                    const mainScript = Array.from(document.scripts).map(s => s.src).find(s => /main\.[a-f0-9]+\.js/.test(s));
+                    if (mainScript) {
+                        const js = await fetch(mainScript).then(r => r.text());
+                        const m = js.match(/queryId:"([^"]+)",operationName:"CreateTweet"/);
+                        if (m) scrapedQid = m[1];
+                    }
+                } catch(e) {}
+                return JSON.stringify({home, ondemand, ct0, scrapedQid});
+            } catch(e) {
+                return JSON.stringify({error: 'bundle fetch threw: ' + (e && e.message)});
+            }
+        })()"""
+        r = await eval_in_tab(ws_url, bundle_js)
+        raw = r.get("result", {}).get("value", "{}")
+        try:
+            bundle = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            bundle = {"error": "bundle JSON parse failed"}
+        if bundle.get("error"):
+            return [TextContent(type="text", text=f"x_create_tweet: {bundle['error']}")]
+        if not bundle.get("ct0"):
+            return [TextContent(type="text", text="x_create_tweet: ct0 cookie missing — not logged in to X?")]
+
+        # 2. Resolve queryId — arg > scraped > error
+        if not query_id:
+            query_id = bundle.get("scrapedQid") or ""
+        if not query_id:
+            return [TextContent(type="text", text="x_create_tweet: query_id missing — could not scrape from page bundle. Pass it explicitly (extract from any prior captured CreateTweet URL).")]
+
+        # 3. Compute transaction-id with vendored lib
+        try:
+            import sys as _s
+            _vendor_dir = str(Path(__file__).parent)
+            if _vendor_dir not in _s.path:
+                _s.path.insert(0, _vendor_dir)
+            import bs4  # noqa: F401
+            from vendor.x_client_transaction.transaction import ClientTransaction
+            home_soup = bs4.BeautifulSoup(bundle["home"], "html.parser")
+            ct = ClientTransaction(home_soup, bundle["ondemand"])
+            path = f"/i/api/graphql/{query_id}/CreateTweet"
+            transaction_id = ct.generate_transaction_id("POST", path)
+        except ImportError as e:
+            return [TextContent(type="text", text=f"x_create_tweet: missing dep ({e}). Run: pip install beautifulsoup4")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"x_create_tweet: transaction-id compute failed — {type(e).__name__}: {e}")]
+
+        # 4. Build CreateTweet body
+        variables: dict = {
+            "tweet_text": tweet_text,
+            "dark_request": False,
+            "media": {"media_entities": [], "possibly_sensitive": False},
+            "semantic_annotation_ids": [],
+            "disallowed_reply_options": None,
+        }
+        if reply_to:
+            variables["reply"] = {"in_reply_to_tweet_id": reply_to, "exclude_reply_user_ids": []}
+        body = {
+            "variables": variables,
+            "features": {
+                "premium_content_api_read_enabled": False,
+                "communities_web_enable_tweet_community_results_fetch": True,
+                "c9s_tweet_anatomy_moderator_badge_enabled": True,
+                "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+                "responsive_web_grok_analyze_post_followups_enabled": True,
+                "responsive_web_jetfuel_frame": False,
+                "responsive_web_grok_share_attachment_enabled": True,
+                "responsive_web_edit_tweet_api_enabled": True,
+                "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+                "view_counts_everywhere_api_enabled": True,
+                "longform_notetweets_consumption_enabled": True,
+                "responsive_web_twitter_article_tweet_consumption_enabled": True,
+                "tweet_awards_web_tipping_enabled": False,
+                "responsive_web_grok_show_grok_translated_post": False,
+                "responsive_web_grok_analysis_button_from_backend": True,
+                "creator_subscriptions_quote_tweet_preview_enabled": False,
+                "longform_notetweets_rich_text_read_enabled": True,
+                "longform_notetweets_inline_media_enabled": True,
+                "profile_label_improvements_pcf_label_in_post_enabled": True,
+                "rweb_tipjar_consumption_enabled": True,
+                "verified_phone_label_enabled": False,
+                "articles_preview_enabled": True,
+                "rweb_video_timestamps_enabled": True,
+                "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+                "freedom_of_speech_not_reach_fetch_enabled": True,
+                "standardized_nudges_misinfo": True,
+                "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+                "responsive_web_grok_image_annotation_enabled": True,
+                "responsive_web_graphql_timeline_navigation_enabled": True,
+                "responsive_web_enhance_cards_enabled": False,
+            },
+            "queryId": query_id,
+        }
+        # X's public bearer — hardcoded in their bundle, stable for years.
+        PUBLIC_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+        headers = {
+            "authorization": f"Bearer {PUBLIC_BEARER}",
+            "x-csrf-token": bundle["ct0"],
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+            "x-client-transaction-id": transaction_id,
+            "content-type": "application/json",
+        }
+
+        # 5. Fire from tab context — cookies auto-attach
+        post_js = (
+            "(async function(p, h, b) { try {"
+            "  const res = await fetch(p, {method:'POST', credentials:'include', headers:h, body:b});"
+            "  const text = await res.text();"
+            "  let parsed=null, tid=null;"
+            "  try { parsed = JSON.parse(text); tid = parsed && parsed.data && parsed.data.create_tweet && parsed.data.create_tweet.tweet_results && parsed.data.create_tweet.tweet_results.result && parsed.data.create_tweet.tweet_results.result.rest_id; } catch(e) {}"
+            "  return JSON.stringify({status: res.status, ok: res.ok, body: (text||'').slice(0,2000), tweet_id: tid});"
+            "} catch(e) { return JSON.stringify({error: 'post threw: ' + (e && e.message)}); } })("
+            + json.dumps(path) + "," + json.dumps(headers) + "," + json.dumps(json.dumps(body)) + ")"
+        )
+        r = await eval_in_tab(ws_url, post_js)
+        raw = r.get("result", {}).get("value", "{}")
+        try:
+            res = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            res = {"error": "post JSON parse failed", "raw": raw[:300]}
+
+        if res.get("ok") and res.get("tweet_id"):
+            out = {
+                "ok": True,
+                "tweet_id": res["tweet_id"],
+                "url": f"https://x.com/i/web/status/{res['tweet_id']}",
+                "transaction_id": transaction_id,
+                "query_id": query_id,
+            }
+            try:
+                _playbook_record("x.com", f"x_create_tweet", "transaction_id", True, kind="xhr_replay", selector_pattern=path)
+            except Exception:
+                pass
+        else:
+            out = {
+                "ok": False,
+                "status": res.get("status"),
+                "body": (res.get("body") or res.get("error") or "")[:600],
+                "transaction_id": transaction_id,
+                "query_id": query_id,
+                "hint": "If 403/401: queryId rotated, refresh from a captured CreateTweet URL. If 400: features schema shifted — patch the features dict from a fresh capture. If 'Could not authenticate you': bearer/ct0 mismatch — reload the X tab.",
+            }
+        return [TextContent(type="text", text=f"x_create_tweet: {json.dumps(out)}")]
 
     if name == "inject_on_new_document":
         # CDP Page.addScriptToEvaluateOnNewDocument — survives all navigations
