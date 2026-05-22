@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webloom-engine"
+version = "0.2.0"
+description = "WebLoom MCP engine + Python SDK for AI-driven browser automation"
+authors = [{ name = "WebLoom HQ", email = "hi@webloom.run" }]
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["webloom", "mcp", "browser", "automation", "ai", "agent"]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://webloom.run"
+Repository = "https://github.com/webloomhq/engine"
+
+[tool.setuptools.packages.find]
+include = ["webloom_sdk*"]

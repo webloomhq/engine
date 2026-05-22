@@ -25,9 +25,32 @@ META_TOOLS = {
     "launch_session",
 }
 
-# Tools that ARE actions worth recording
+# Tools that ARE actions worth recording. Expanded to include framework-aware
+# tools, XHR replay, and the new vision/stealth/captcha primitives so a
+# captured recipe can re-drive any tool the engine exposes.
 ACTION_TOOLS = {
-    "click", "fill", "navigate", "new_tab", "eval_js", "wait_for", "scroll_tab", "close_tab"
+    # Core interaction
+    "click", "fill", "navigate", "new_tab", "close_tab",
+    "eval_js", "wait_for", "wait_for_idle", "scroll_tab",
+    # Keyboard
+    "key_type", "key_press",
+    # File / upload
+    "upload_file", "xhr_upload",
+    # Framework-aware
+    "lexical_set_text", "draftjs_set_text",
+    "react_force_change", "redux_dispatch", "aui_dispatch",
+    # Network / replay
+    "replay_xhr", "inject_on_new_document", "remove_injected_script",
+    # Vision + coords
+    "vision_check", "click_at_coords",
+    # Stealth + captcha + healing
+    "enable_stealth", "solve_captcha", "drift_heal_suggest",
+    # Touch
+    "touch_tap",
+    # Reddit primitive
+    "reddit_submit_comment",
+    # Manual checkpoint (recorded so replay knows where humans intervened)
+    "pause_for_human",
 }
 
 
