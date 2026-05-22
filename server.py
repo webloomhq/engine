@@ -1766,6 +1766,67 @@ async def list_tools():
             "delay_ms": {"type": "integer", "default": 80, "description": "Milliseconds between keystrokes in strategy 3 (CDP keystrokes). Default 80 (safe). Bump to 120-150 if char drops occur on slow machines; drop to 40-60 only on fast clean ones. Lower = faster but risks Draft.js missing events."},
             "verify_per_char": {"type": "boolean", "default": False, "description": "If true, read composer.innerText after each char and retry dropped chars up to 3 times. Bulletproof but adds ~30ms CDP roundtrip per char. Use for high-stakes single shots; leave off for normal posting."}
         }, "required": ["session", "container_selector", "text"]}),
+        Tool(name="vision_check", description=(
+            "Vision fallback for when DOM strategies can't reach an element (canvas-rendered, weird custom widgets, "
+            "OAuth popups, iframed UIs). Takes a screenshot of the current tab, sends it to Claude with your question, "
+            "returns the answer + optional click coordinates. Use when scan_tab returns no useful selectors or click() "
+            "keeps missing the target. Returns {answer, click: {x,y} | null}. If coordinates returned, you can pass "
+            "them to a CDP click via click_at_coords."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "question": {"type": "string", "description": "Plain-English question. Examples: 'where is the post button?', 'is there a CAPTCHA visible?', 'what does the error message say?'. If asking for a click target, phrase as 'click coords for X' so the model returns coordinates."},
+            "include_coords": {"type": "boolean", "default": True, "description": "Ask the model to return {x, y} coordinates when the question is locating a UI element."}
+        }, "required": ["session", "question"]}),
+        Tool(name="click_at_coords", description="Real CDP click at absolute (x, y) viewport coordinates. Pair with vision_check when you have coords but no selector. Lower-level than click().", inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "x": {"type": "number"}, "y": {"type": "number"},
+            "double": {"type": "boolean", "default": False}
+        }, "required": ["session", "x", "y"]}),
+        Tool(name="enable_stealth", description=(
+            "Apply stealth patches to the current tab — masks navigator.webdriver, plugins, languages, WebGL vendor, "
+            "permissions API, and chrome runtime to defeat the most common Cloudflare/Akamai/Datadome fingerprinting. "
+            "Real Chrome sessions usually don't need this (they ARE real), but use it on fresh-profile flows or sites "
+            "that block CDP-attached Chrome. Persistent across navigations (uses inject_on_new_document)."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"}
+        }, "required": ["session"]}),
+        Tool(name="run_parallel", description=(
+            "Run multiple tool calls in parallel across tabs or sessions. Each item is {tool, args}. Returns a list of "
+            "results in the same order. Useful for: fanning out a check across N tabs (preflight all your Threads at once), "
+            "driving multiple Chrome sessions in lockstep (e.g. cross-poster), or just batching independent CDP work to "
+            "save wall time. Skips ordering guarantees — each call is independent."
+        ), inputSchema={"type": "object", "properties": {
+            "calls": {"type": "array", "description": "List of {tool, args} entries to run concurrently.", "items": {"type": "object", "properties": {
+                "tool": {"type": "string"},
+                "args": {"type": "object"}
+            }, "required": ["tool", "args"]}},
+            "max_concurrency": {"type": "integer", "default": 4, "description": "Max parallel calls in-flight. Default 4."}
+        }, "required": ["calls"]}),
+        Tool(name="solve_captcha", description=(
+            "Submit a CAPTCHA challenge to a third-party solver (2captcha or capmonster) and return the token. "
+            "Currently supports reCAPTCHA v2/v3 + hCaptcha + Cloudflare Turnstile. Requires "
+            "CAPTCHA_PROVIDER ('twocaptcha' or 'capmonster') and CAPTCHA_API_KEY env vars. "
+            "Without keys returns ok:false + a hint to use pause_for_human. Costs money per solve (~$0.001-0.003)."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "type": {"type": "string", "enum": ["recaptcha_v2", "recaptcha_v3", "hcaptcha", "turnstile"], "description": "Challenge type"},
+            "site_key": {"type": "string", "description": "data-sitekey or data-site-key attribute from the captcha widget"},
+            "page_url": {"type": "string", "description": "URL the captcha appears on. Omit to use current tab url."},
+            "action": {"type": "string", "description": "reCAPTCHA v3 action name (optional)"},
+            "min_score": {"type": "number", "description": "reCAPTCHA v3 min_score (default 0.3)"}
+        }, "required": ["session", "type", "site_key"]}),
+        Tool(name="drift_heal_suggest", description=(
+            "When a recorded selector breaks (drift), suggest a replacement by scanning the current DOM for elements "
+            "matching the old selector's accessibility name + role + position + framework hints from the playbook. "
+            "Returns {ok, candidates: [{selector, score, reason}]} ranked by likelihood. Caller decides whether to "
+            "auto-apply or surface to author for review. Pair with the playbook's action_log to find what selector "
+            "was last seen working on this domain."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "old_selector": {"type": "string", "description": "The selector that just failed."},
+            "descriptor": {"type": "string", "description": "Plain-English descriptor of what the element should do (e.g. 'post tweet button', 'price input for USD'). Used to match candidates."}
+        }, "required": ["session", "old_selector", "descriptor"]}),
         Tool(name="reddit_check_shadowban", description=(
             "Detect whether a Reddit account is shadowbanned. Fetches the account's public profile JSON "
             "(/user/<username>/about.json + /user/<username>/comments.json) from an anonymous perspective — "
@@ -1812,7 +1873,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest"}
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -4629,6 +4690,326 @@ async def _execute_tool_action(name: str, arguments: dict):
         if not success:
             out["hint"] = "char drops detected — increase delay_ms (try 120-150) or pass verify_per_char=true"
         return [TextContent(type="text", text=f"draftjs_set_text: {json.dumps(out)}")]
+
+    # ── #1 VISION FALLBACK ──────────────────────────────────────────────
+    if name == "vision_check":
+        import base64
+        question = arguments["question"]
+        include_coords = bool(arguments.get("include_coords", True))
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not anthropic_key:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False,
+                "error": "ANTHROPIC_API_KEY not set — vision_check requires Claude vision.",
+            }, indent=2))]
+        # Capture viewport screenshot via CDP
+        try:
+            shot = await cdp_send(ws_url, "Page.captureScreenshot", {"format": "png"})
+            png_b64 = shot.get("data") or shot.get("result", {}).get("data") or ""
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"screenshot failed: {e}"}, indent=2))]
+        if not png_b64:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "empty screenshot"}, indent=2))]
+
+        # Get viewport dims so the model can return absolute coords
+        vp = await eval_in_tab(ws_url, "JSON.stringify({w:innerWidth, h:innerHeight, dpr:devicePixelRatio||1})")
+        vp_data = {}
+        try:
+            vp_data = json.loads(vp.get("result", {}).get("value", "{}"))
+        except Exception:
+            pass
+
+        coords_prompt = ""
+        if include_coords:
+            coords_prompt = (
+                f"\n\nThe viewport is {vp_data.get('w','?')}x{vp_data.get('h','?')} (devicePixelRatio={vp_data.get('dpr',1)}). "
+                "If the question is locating a UI element, return your answer as JSON only: "
+                "{\"answer\": \"...\", \"click\": {\"x\": <int>, \"y\": <int>}}. "
+                "Coordinates are in CSS pixels (viewport), origin top-left, click center of the element. "
+                "If the element isn't visible or the question isn't a click target, return {\"answer\": \"...\", \"click\": null}."
+            )
+
+        import urllib.request as _req
+        body = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 400,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png_b64}},
+                    {"type": "text", "text": f"{question}{coords_prompt}"},
+                ],
+            }],
+        }
+        try:
+            req = _req.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(body).encode(),
+                headers={
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+            with _req.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"claude call failed: {e}"}, indent=2))]
+        text = "".join(c.get("text", "") for c in data.get("content", []) if c.get("type") == "text").strip()
+        # Try to extract coords if model returned JSON
+        coords = None
+        answer_text = text
+        try:
+            jstart = text.find("{")
+            jend = text.rfind("}")
+            if jstart >= 0 and jend > jstart:
+                parsed = json.loads(text[jstart:jend + 1])
+                if isinstance(parsed, dict):
+                    answer_text = parsed.get("answer", text)
+                    if parsed.get("click") and isinstance(parsed["click"], dict):
+                        coords = {"x": parsed["click"].get("x"), "y": parsed["click"].get("y")}
+        except Exception:
+            pass
+
+        try:
+            cur = await eval_in_tab(ws_url, "location.href")
+            dom = domain_from_url(cur.get("result", {}).get("value", ""))
+            if dom:
+                _playbook_record(dom, f"vision_check:{question[:40]}", "claude_vision", True, kind="vision")
+        except Exception:
+            pass
+
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True, "answer": answer_text, "click": coords,
+            "tokens_in": data.get("usage", {}).get("input_tokens", 0),
+            "tokens_out": data.get("usage", {}).get("output_tokens", 0),
+        }, indent=2))]
+
+    # ── companion to vision_check: click at absolute coords ────────────
+    if name == "click_at_coords":
+        x = float(arguments["x"])
+        y = float(arguments["y"])
+        double = bool(arguments.get("double", False))
+        for ev_type in ("mousePressed", "mouseReleased"):
+            await cdp_send(ws_url, "Input.dispatchMouseEvent", {
+                "type": ev_type, "x": x, "y": y, "button": "left", "buttons": 1,
+                "clickCount": 2 if double else 1,
+            })
+        if double:
+            for ev_type in ("mousePressed", "mouseReleased"):
+                await cdp_send(ws_url, "Input.dispatchMouseEvent", {
+                    "type": ev_type, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 2,
+                })
+        try:
+            cur = await eval_in_tab(ws_url, "location.href")
+            dom = domain_from_url(cur.get("result", {}).get("value", ""))
+            if dom:
+                _playbook_record(dom, f"click_at_coords:({x:.0f},{y:.0f})", "cdp_coords", True, kind="click")
+        except Exception:
+            pass
+        return [TextContent(type="text", text=json.dumps({"ok": True, "x": x, "y": y, "double": double}))]
+
+    # ── #5 STEALTH PATCHES ──────────────────────────────────────────────
+    if name == "enable_stealth":
+        # Register a persistent on-new-document script that masks the most-checked
+        # automation tells. Real-Chrome sessions usually don't need this, but it
+        # unblocks fresh-profile flows + sites that probe for CDP attachment.
+        stealth_js = """(() => {
+            // navigator.webdriver — the textbook tell
+            try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+            // navigator.languages — many sites flag empty array
+            try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+            // navigator.plugins — headless reports 0 plugins
+            try {
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}],
+                });
+            } catch (e) {}
+            // chrome runtime — present in real Chrome, missing in headless
+            try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
+            // permissions API normalization
+            try {
+                const orig = navigator.permissions && navigator.permissions.query;
+                if (orig) {
+                    navigator.permissions.query = (p) =>
+                        p.name === 'notifications'
+                            ? Promise.resolve({ state: Notification.permission })
+                            : orig.call(navigator.permissions, p);
+                }
+            } catch (e) {}
+            // WebGL vendor / renderer — common fingerprint vector
+            try {
+                const getParam = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(p) {
+                    if (p === 37445) return 'Intel Inc.';
+                    if (p === 37446) return 'Intel Iris OpenGL Engine';
+                    return getParam.call(this, p);
+                };
+            } catch (e) {}
+        })();"""
+        try:
+            conn = await _get_conn(ws_url)
+            await conn.send("Page.enable")
+            result = await conn.send("Page.addScriptToEvaluateOnNewDocument", {"source": stealth_js, "runImmediately": True})
+            ident = result.get("identifier") if isinstance(result, dict) else None
+            # Also apply once to current document
+            await eval_in_tab(ws_url, stealth_js)
+            return [TextContent(type="text", text=json.dumps({"ok": True, "identifier": ident, "applied": [
+                "navigator.webdriver=undefined", "navigator.languages", "navigator.plugins",
+                "window.chrome.runtime", "permissions.query notifications", "WebGL vendor",
+            ]}, indent=2))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}, indent=2))]
+
+    # ── #8 CAPTCHA SOLVER ───────────────────────────────────────────────
+    if name == "solve_captcha":
+        import urllib.request as _req
+        provider = os.environ.get("CAPTCHA_PROVIDER", "").lower()
+        api_key = os.environ.get("CAPTCHA_API_KEY", "")
+        if not provider or not api_key:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False,
+                "error": "CAPTCHA_PROVIDER (twocaptcha|capmonster) and CAPTCHA_API_KEY env vars required",
+                "hint": "no provider configured — fall back to pause_for_human",
+            }, indent=2))]
+        ctype = arguments["type"]
+        site_key = arguments["site_key"]
+        page_url = arguments.get("page_url") or ""
+        if not page_url:
+            try:
+                cu = await eval_in_tab(ws_url, "location.href")
+                page_url = cu.get("result", {}).get("value", "")
+            except Exception:
+                pass
+        action = arguments.get("action", "")
+        min_score = arguments.get("min_score", 0.3)
+
+        if provider == "twocaptcha":
+            submit_params = {
+                "key": api_key,
+                "json": "1",
+                "googlekey": site_key if "recaptcha" in ctype else None,
+                "sitekey": site_key if ctype in ("hcaptcha", "turnstile") else None,
+                "pageurl": page_url,
+            }
+            if ctype == "recaptcha_v2":
+                submit_params["method"] = "userrecaptcha"
+            elif ctype == "recaptcha_v3":
+                submit_params["method"] = "userrecaptcha"
+                submit_params["version"] = "v3"
+                if action: submit_params["action"] = action
+                submit_params["min_score"] = str(min_score)
+            elif ctype == "hcaptcha":
+                submit_params["method"] = "hcaptcha"
+            elif ctype == "turnstile":
+                submit_params["method"] = "turnstile"
+            # Compact params, drop None
+            submit_params = {k: v for k, v in submit_params.items() if v is not None}
+            try:
+                from urllib.parse import urlencode
+                submit_url = "https://2captcha.com/in.php?" + urlencode(submit_params)
+                with _req.urlopen(submit_url, timeout=20) as r:
+                    sub = json.loads(r.read().decode())
+                if sub.get("status") != 1:
+                    return [TextContent(type="text", text=json.dumps({"ok": False, "error": sub}, indent=2))]
+                task_id = sub.get("request")
+                # Poll for result (max 120s)
+                for _ in range(40):
+                    await asyncio.sleep(3.0)
+                    poll_url = f"https://2captcha.com/res.php?key={api_key}&action=get&id={task_id}&json=1"
+                    with _req.urlopen(poll_url, timeout=20) as r:
+                        res = json.loads(r.read().decode())
+                    if res.get("status") == 1:
+                        return [TextContent(type="text", text=json.dumps({"ok": True, "token": res.get("request"), "task_id": task_id}, indent=2))]
+                    if res.get("request") not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
+                        return [TextContent(type="text", text=json.dumps({"ok": False, "error": res}, indent=2))]
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "timeout after 120s"}, indent=2))]
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}, indent=2))]
+        else:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"provider '{provider}' not yet implemented (twocaptcha works)"}, indent=2))]
+
+    # ── #9 DRIFT HEAL SUGGEST ───────────────────────────────────────────
+    if name == "drift_heal_suggest":
+        old_sel = arguments["old_selector"]
+        desc = arguments["descriptor"]
+        # Scan the current DOM for elements that look like they could replace old_sel.
+        # Heuristics: matching role, accessibility name (textContent/aria-label), text similarity to descriptor,
+        # surviving structural anchor (data-testid, id, name), and visibility.
+        js = """(function(oldSel, desc) {
+            const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();
+            const descTerms = norm(desc).split(' ').filter(t => t.length > 2);
+            const all = Array.from(document.querySelectorAll('button, a, [role="button"], input, [contenteditable], [data-testid], [id], [name]'));
+            const scored = [];
+            for (const el of all) {
+                if (!(el.offsetWidth || el.offsetHeight)) continue;  // not visible
+                const text = norm((el.getAttribute('aria-label') || el.textContent || el.getAttribute('placeholder') || el.value || '').slice(0, 200));
+                const role = el.getAttribute('role') || el.tagName.toLowerCase();
+                const testid = el.getAttribute('data-testid');
+                const id = el.id;
+                const name = el.getAttribute('name');
+                // Score: text overlap with descriptor terms + structural anchor bonus
+                let score = 0;
+                for (const t of descTerms) if (text.includes(t)) score += 2;
+                if (testid) score += 3;
+                if (id) score += 2;
+                if (name) score += 1;
+                if (role === 'button' && /button|submit|click|post/.test(norm(desc))) score += 1;
+                if (score < 2) continue;
+                // Build a stable selector
+                let stableSel = null;
+                if (testid) stableSel = '[data-testid="' + testid.replace(/"/g, '\\\\"') + '"]';
+                else if (id) stableSel = '#' + CSS.escape(id);
+                else if (name) stableSel = el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\\\"') + '"]';
+                else stableSel = el.tagName.toLowerCase() + ':contains("' + text.slice(0, 30) + '")';  // non-standard, hint only
+                scored.push({
+                    selector: stableSel,
+                    score: score,
+                    text: text.slice(0, 80),
+                    tag: el.tagName.toLowerCase(),
+                    role: role,
+                    reason: testid ? 'data-testid present' : id ? 'id present' : name ? 'name attr' : 'text match',
+                });
+            }
+            scored.sort((a, b) => b.score - a.score);
+            return JSON.stringify({ ok: true, candidates: scored.slice(0, 8) });
+        })(""" + json.dumps(old_sel) + ", " + json.dumps(desc) + ")"
+        r = await eval_in_tab(ws_url, js)
+        val = r.get("result", {}).get("value", "{}")
+        return [TextContent(type="text", text=f"drift_heal_suggest: {val}")]
+
+    # ── #7 PARALLEL ORCHESTRATOR ────────────────────────────────────────
+    if name == "run_parallel":
+        calls = arguments.get("calls", [])
+        max_conc = int(arguments.get("max_concurrency", 4))
+        sem = asyncio.Semaphore(max(1, max_conc))
+
+        async def _one(idx, item):
+            tool_name = item.get("tool")
+            tool_args = item.get("args", {}) or {}
+            async with sem:
+                try:
+                    # Recurse into call_tool by directly invoking the dispatcher.
+                    # We reuse this function's enclosing handlers by calling _execute_tool_action,
+                    # which is the same dispatcher recording.replay_recipe uses.
+                    res = await _execute_tool_action(tool_name, tool_args)
+                    text_out = ""
+                    if isinstance(res, list):
+                        for c in res:
+                            if hasattr(c, "text"):
+                                text_out = c.text
+                                break
+                    return {"idx": idx, "tool": tool_name, "ok": True, "result": text_out[:2000]}
+                except Exception as e:
+                    return {"idx": idx, "tool": tool_name, "ok": False, "error": str(e)}
+
+        tasks = [asyncio.create_task(_one(i, item)) for i, item in enumerate(calls)]
+        results = await asyncio.gather(*tasks)
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "count": len(results),
+            "results": results,
+        }, indent=2))]
 
     if name == "reddit_submit_comment":
         post_url = arguments["post_url"]
