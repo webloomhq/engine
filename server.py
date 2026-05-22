@@ -181,6 +181,80 @@ ENGINE_VERSION = "0.2.0"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 
 
+# Auto-update / auto-heal / auto-share — the community learning loop.
+# Defaults: all three ON; users opt out with WEBLOOM_AUTO_UPDATE=off etc.
+AUTO_UPDATE_ENABLED = os.environ.get("WEBLOOM_AUTO_UPDATE", "on").lower() in ("on", "true", "1", "yes")
+AUTO_HEAL_ENABLED = os.environ.get("WEBLOOM_AUTO_HEAL", "on").lower() in ("on", "true", "1", "yes")
+AUTO_SHARE_ENABLED = os.environ.get("WEBLOOM_AUTO_SHARE", "on").lower() in ("on", "true", "1", "yes")
+AUTO_UPDATE_URL = os.environ.get("WEBLOOM_UPDATE_URL", "https://webloom.run/api/threads")
+_AUTO_UPDATE_INTERVAL_S = 6 * 3600  # 6 hours
+_THREADS_DIR_PATH = Path.home() / ".webloom" / "threads"
+
+
+def _auto_update_threads_once() -> dict:
+    """For every Thread file in ~/.webloom/threads/, poll the marketplace for a
+    newer version. If found, atomically overwrite. Logs heals to a notification
+    file the engine can surface to the user.
+
+    Returns a summary: {checked, updated, errors}. Never raises.
+    """
+    if not AUTO_UPDATE_ENABLED:
+        return {"checked": 0, "updated": 0, "errors": 0, "skipped": "auto-update off"}
+    if not _THREADS_DIR_PATH.exists():
+        return {"checked": 0, "updated": 0, "errors": 0, "skipped": "no threads dir"}
+    import urllib.request as _req
+    checked = updated = errors = 0
+    notif_log_path = Path.home() / ".webloom" / "auto_updates.jsonl"
+    updates_list = []
+    for f in _THREADS_DIR_PATH.glob("*.thread.json"):
+        if ".bak." in f.name:
+            continue
+        domain = f.name.replace(".thread.json", "")
+        try:
+            with open(f, encoding="utf-8") as fh:
+                local = json.load(fh)
+            local_version = local.get("version", "0.1.0")
+            checked += 1
+            try:
+                req = _req.Request(
+                    f"{AUTO_UPDATE_URL}/{domain}/latest?version={local_version}",
+                    headers={"User-Agent": f"webloom-engine/{ENGINE_VERSION}"},
+                )
+                with _req.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode())
+            except Exception:
+                errors += 1
+                continue
+            if data.get("up_to_date"):
+                continue
+            new_thread = data.get("thread")
+            if not new_thread:
+                continue
+            # Atomic write: tmp file → rename. Never leaves a half-written Thread on disk.
+            tmp = f.with_suffix(".thread.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as out:
+                json.dump(new_thread, out, indent=2)
+            tmp.replace(f)
+            updated += 1
+            updates_list.append({
+                "domain": domain,
+                "from_version": local_version,
+                "to_version": new_thread.get("version"),
+                "patches": new_thread.get("patch_log", [])[-3:] if isinstance(new_thread.get("patch_log"), list) else [],
+            })
+        except Exception:
+            errors += 1
+    if updates_list:
+        try:
+            import time as _t
+            with open(notif_log_path, "a", encoding="utf-8") as nl:
+                for u in updates_list:
+                    nl.write(json.dumps({"ts": int(_t.time()), **u}) + "\n")
+        except Exception:
+            pass
+    return {"checked": checked, "updated": updated, "errors": errors, "updates": updates_list}
+
+
 def _get_anon_id() -> str:
     """Persistent anonymous install id. Random uuid stored once on disk.
     Used only to rate-limit + trust-score telemetry. Never tied to user identity."""
@@ -1957,6 +2031,21 @@ async def list_tools():
             "action": {"type": "string", "description": "reCAPTCHA v3 action name (optional)"},
             "min_score": {"type": "number", "description": "reCAPTCHA v3 min_score (default 0.3)"}
         }, "required": ["session", "type", "site_key"]}),
+        Tool(name="check_thread_updates", description=(
+            "Manually trigger the auto-update sweep that the engine runs every 6h automatically. "
+            "For each Thread in ~/.webloom/threads/, polls webloom.run for a newer version (an admin-approved "
+            "patch from another buyer's drift report). If found, atomically overwrites the local Thread file. "
+            "Returns {checked, updated, errors, updates:[{domain, from_version, to_version, patches}]} so you "
+            "can see exactly what was patched. Opt out entirely via env WEBLOOM_AUTO_UPDATE=off."
+        ), inputSchema={"type": "object", "properties": {}}),
+        Tool(name="show_recent_auto_heals", description=(
+            "Show the most recent auto-update events from ~/.webloom/auto_updates.jsonl. Each entry shows the "
+            "domain, the version bump, and a summary of the patches that landed. Transparency tool — buyers can "
+            "see exactly what changed in their Threads and when, even though the updates happen silently in the "
+            "background. Returns {events: [...], total_logged}."
+        ), inputSchema={"type": "object", "properties": {
+            "limit": {"type": "integer", "default": 10}
+        }}),
         Tool(name="react_invoke_handler", description=(
             "Bypass DOM event interceptors by calling a React component's prop handler directly. "
             "Use when normal click() / dispatch-events / vision_click all fail because a custom-element overlay "
@@ -2114,6 +2203,31 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
 _REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler"}
+# check_thread_updates + show_recent_auto_heals don't need a session — they're admin/info tools
+
+
+# ── Background auto-update timer ────────────────────────────────────────
+# Fires the auto-update sweep once on engine startup (after a short grace
+# delay so we don't slow tool registration) and then every 6h. All errors
+# swallowed — telemetry/update failures must never break a user's flow.
+def _start_auto_update_timer():
+    if not AUTO_UPDATE_ENABLED:
+        return
+    import threading
+    def _tick():
+        try:
+            _auto_update_threads_once()
+        except Exception:
+            pass
+        # Reschedule
+        t = threading.Timer(_AUTO_UPDATE_INTERVAL_S, _tick)
+        t.daemon = True
+        t.start()
+    # First fire 30 seconds after import — gives Chrome session + Anthropic API a head start
+    t0 = threading.Timer(30.0, _tick)
+    t0.daemon = True
+    t0.start()
+_start_auto_update_timer()
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -5355,13 +5469,46 @@ async def _execute_tool_action(name: str, arguments: dict):
         else:
             return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"provider '{provider}' not yet implemented (twocaptcha works)"}, indent=2))]
 
+    # ── CHECK THREAD UPDATES ─────────────────────────────────────────────
+    if name == "check_thread_updates":
+        result = _auto_update_threads_once()
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # ── SHOW RECENT AUTO HEALS ───────────────────────────────────────────
+    if name == "show_recent_auto_heals":
+        limit = int(arguments.get("limit", 10))
+        notif = Path.home() / ".webloom" / "auto_updates.jsonl"
+        if not notif.exists():
+            return [TextContent(type="text", text=json.dumps({"events": [], "total_logged": 0, "hint": "No auto-update events yet. Engine will log here after pulling its first marketplace patch."}, indent=2))]
+        events = []
+        try:
+            with open(notif, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        events.append(json.loads(line))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        total = len(events)
+        recent = events[-limit:][::-1]
+        return [TextContent(type="text", text=json.dumps({"events": recent, "total_logged": total}, indent=2))]
+
     # ── REACT_INVOKE_HANDLER — bypass overlay event interception ───────
     if name == "react_invoke_handler":
         sel = arguments["selector"]
         handler = arguments.get("handler", "onClick")
         extra = arguments.get("event_payload", {}) or {}
+        # If handler is "auto", try a sequence of common handler names
+        # in order. Stops at the first that returns ok:true.
+        auto_handler = handler == "auto"
+        handler_sequence = ["onClick", "onPointerDown", "onMouseDown", "onSubmit"] if auto_handler else [handler]
 
-        js = f"""(function(sel, handlerName, extra) {{
+        # Iterate through handler_sequence — first one that lands wins
+        attempts = []
+        val = "{}"
+        for h in handler_sequence:
+            js = f"""(function(sel, handlerName, extra) {{
             // Shadow-DOM-aware deep query: walks every open shadowRoot in the document
             // until it finds a match. Required for LinkedIn / Lit-based sites that wrap
             // composer modals inside <interop-outlet>.shadowRoot.
@@ -5426,24 +5573,40 @@ async def _execute_tool_action(name: str, arguments: dict):
             }}
 
             return JSON.stringify({{ok: false, error: 'no ' + handlerName + ' found in fiber chain', searched_hops: hops}});
-        }})({json.dumps(sel)}, {json.dumps(handler)}, {json.dumps(extra)})"""
+        }})({json.dumps(sel)}, {json.dumps(h)}, {json.dumps(extra)})"""
 
-        r = await eval_in_tab(ws_url, js)
-        val = r.get("result", {}).get("value", "{}")
+            r = await eval_in_tab(ws_url, js)
+            val = r.get("result", {}).get("value", "{}")
+            try:
+                parsed = json.loads(val) if isinstance(val, str) else {}
+            except Exception:
+                parsed = {}
+            attempts.append({"handler": h, "ok": bool(parsed.get("ok")), "via": parsed.get("via"), "error": parsed.get("error")})
 
-        # Record the strategy in the playbook
-        try:
-            cur = await eval_in_tab(ws_url, "location.href")
-            dom = domain_from_url(cur.get("result", {}).get("value", ""))
-            parsed = json.loads(val) if isinstance(val, str) else {}
-            if dom:
-                _playbook_record(dom, f"react_invoke_handler:{sel} via {handler}",
-                                 "react_fiber_handler", bool(parsed.get("ok")), kind="click",
-                                 selector_pattern=sel)
-        except Exception:
-            pass
+            # Record this attempt in the playbook (each attempt counts)
+            try:
+                cur = await eval_in_tab(ws_url, "location.href")
+                dom = domain_from_url(cur.get("result", {}).get("value", ""))
+                if dom:
+                    _playbook_record(dom, f"react_invoke_handler:{sel} via {h}",
+                                     "react_fiber_handler", bool(parsed.get("ok")), kind="click",
+                                     selector_pattern=sel)
+            except Exception:
+                pass
 
-        return [TextContent(type="text", text=f"react_invoke_handler: {val}")]
+            if parsed.get("ok"):
+                # Wrap success — include the attempt log so callers can see which handler won
+                wrapped = {**parsed, "tried_handlers": [a["handler"] for a in attempts]}
+                return [TextContent(type="text", text=f"react_invoke_handler: {json.dumps(wrapped)}")]
+
+        # All handlers in the sequence failed — return the final attempt with the trace
+        final = {
+            "ok": False,
+            "error": "all handlers failed" if auto_handler else attempts[-1].get("error") if attempts else "no attempts",
+            "tried_handlers": [a["handler"] for a in attempts],
+            "attempts": attempts,
+        }
+        return [TextContent(type="text", text=f"react_invoke_handler: {json.dumps(final)}")]
 
     # ── SWARM_RUN — 2-role multi-agent (Driver + Watcher) ──────────────
     if name == "swarm_run":
