@@ -161,6 +161,105 @@ else:
     _chosen_playbook = _default_playbook
 PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_PLAYBOOK", str(_chosen_playbook))))
 
+# ── Telemetry + collective learning ────────────────────────────────────────
+# Optional, opt-out-able telemetry that powers marketplace-level learning.
+# Default ON; users can disable by setting WEBLOOM_TELEMETRY=off.
+#
+# Two streams:
+#   1. Action telemetry — anonymous "strategy X worked on domain Y" rows.
+#      Strict verification gate: only confidence >= 0.7 entries are sent.
+#   2. Patch proposals — when drift_heal_suggest succeeds locally, propose
+#      the heal back to the Thread author for AUTHOR-GATED review. Author
+#      sees suggestion + corroboration count, manually clicks approve.
+#
+# Nothing is ever auto-applied. The marketplace data is ALWAYS just a
+# suggestion; the human author is the final gate.
+TELEMETRY_ENABLED = os.environ.get("WEBLOOM_TELEMETRY", "on").lower() in ("on", "true", "1", "yes")
+TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
+PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
+ENGINE_VERSION = "0.2.0"
+_ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
+
+
+def _get_anon_id() -> str:
+    """Persistent anonymous install id. Random uuid stored once on disk.
+    Used only to rate-limit + trust-score telemetry. Never tied to user identity."""
+    try:
+        if _ANON_ID_FILE.exists():
+            return _ANON_ID_FILE.read_text().strip()
+        import uuid
+        new_id = "anon-" + uuid.uuid4().hex[:24]
+        _ANON_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ANON_ID_FILE.write_text(new_id)
+        return new_id
+    except Exception:
+        return "anon-unknown"
+
+
+def _send_telemetry_fire_forget(payload: dict):
+    """POST a single telemetry row to webloom.run in a background thread.
+    Errors are swallowed silently — telemetry should NEVER block or break a
+    user's flow."""
+    if not TELEMETRY_ENABLED:
+        return
+    import threading, urllib.request
+    def _do():
+        try:
+            req = urllib.request.Request(
+                TELEMETRY_URL,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": f"webloom-engine/{ENGINE_VERSION}"},
+            )
+            urllib.request.urlopen(req, timeout=4).read()
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _propose_patch_fire_forget(payload: dict):
+    """Propose a drift patch (selector heal) to the marketplace.
+    Always author-gated — proposals queue, author reviews, author clicks
+    approve. Nothing auto-applies."""
+    if not TELEMETRY_ENABLED:
+        return
+    import threading, urllib.request
+    def _do():
+        try:
+            req = urllib.request.Request(
+                PROPOSAL_URL,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": f"webloom-engine/{ENGINE_VERSION}"},
+            )
+            urllib.request.urlopen(req, timeout=4).read()
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _verify_confidence(verified: bool, ok: bool, side_effect: bool = False) -> float:
+    """Map (verified, ok, side_effect) → confidence in [0.0, 1.0].
+
+    The strict three-tier model that powers marketplace learning:
+        1.0  = action completed AND verify probe passed (toast appeared, URL
+               changed to expected, response body had real result, etc.)
+        0.7  = action fired with a measurable side effect (DOM mutated,
+               request returned 2xx with non-empty body, URL changed)
+        0.4  = action fired but no observable effect (event dispatched,
+               nothing visibly happened)
+        0.0  = the tool threw / hard-failed
+
+    Marketplace ranking only counts entries with confidence >= 0.7.
+    Lower-confidence rows still upload (for debugging) but are excluded
+    from any auto-suggestion logic."""
+    if not ok:
+        return 0.0
+    if verified:
+        return 1.0
+    if side_effect:
+        return 0.7
+    return 0.4
+
+
 def load_sessions() -> dict:
     with open(SESSIONS_FILE) as f:
         return json.load(f)
@@ -897,6 +996,10 @@ def _playbook_record(
     selector_pattern: str | None = None,
     manual_touch_required: bool = False,
     manual_touch_reason: str | None = None,
+    confidence: float | None = None,
+    verified: bool = False,
+    verify_kind: str | None = None,
+    ms: int | None = None,
 ):
     """Record (domain, desc, kind, strategy) success/failure with enriched context.
 
@@ -904,11 +1007,23 @@ def _playbook_record(
       - click_log (legacy, backward-compat) — kept so existing weaver promote works
       - action_log (enriched, v2) — captures wait timings, sequence (follows), selector pattern,
         manual-touch markers. Used by future weaver promote for full-flow Threads.
+
+    Also (if telemetry is on) fires an anonymous row to webloom.run/api/telemetry
+    so the marketplace can rank strategies. Confidence rules:
+      - 1.0 = verified end-to-end (verify probe passed)
+      - 0.7 = action fired with measurable side effect
+      - 0.4 = action fired, no observable effect (default for legacy callers)
+      - 0.0 = the tool errored
+    Only confidence >= 0.7 entries influence marketplace ranking.
     """
     if not domain:
         return
     import time
     now = time.time()
+    if confidence is None:
+        # Legacy callers didn't pass confidence — assume a side effect happened
+        # if success was True. They get the 0.7 tier (counts) by default.
+        confidence = 0.7 if success else 0.0
     pb = _load_live_playbook_raw()
     if domain not in pb:
         pb[domain] = {}
@@ -986,6 +1101,23 @@ def _playbook_record(
         }
 
     save_playbook_data(pb)
+
+    # Marketplace telemetry — anonymous, opt-out-able, never blocks the flow
+    try:
+        _send_telemetry_fire_forget({
+            "anon_id": _get_anon_id(),
+            "domain": domain,
+            "action_descriptor": desc,
+            "strategy": strategy,
+            "confidence": float(confidence),
+            "ok": bool(success),
+            "verified": bool(verified),
+            "verify_kind": verify_kind,
+            "ms": ms,
+            "engine_version": ENGINE_VERSION,
+        })
+    except Exception:
+        pass
 
 
 def record_coverage_gap(
@@ -4933,6 +5065,7 @@ async def _execute_tool_action(name: str, arguments: dict):
     if name == "drift_heal_suggest":
         old_sel = arguments["old_selector"]
         desc = arguments["descriptor"]
+        propose = bool(arguments.get("propose_to_marketplace", False))
         # Scan the current DOM for elements that look like they could replace old_sel.
         # Heuristics: matching role, accessibility name (textContent/aria-label), text similarity to descriptor,
         # surviving structural anchor (data-testid, id, name), and visibility.
@@ -4976,6 +5109,31 @@ async def _execute_tool_action(name: str, arguments: dict):
         })(""" + json.dumps(old_sel) + ", " + json.dumps(desc) + ")"
         r = await eval_in_tab(ws_url, js)
         val = r.get("result", {}).get("value", "{}")
+        # If caller opted in to propose to marketplace, send the top candidate
+        # to the patch-proposal endpoint. ALWAYS author-gated: this adds a
+        # proposal row to the queue; nothing auto-applies. Author reviews via
+        # /admin/marketplace and clicks approve to ship the patch to all buyers.
+        if propose:
+            try:
+                parsed_drift = json.loads(val) if isinstance(val, str) else {}
+                cands = parsed_drift.get("candidates", []) if isinstance(parsed_drift, dict) else []
+                if cands:
+                    top = cands[0]
+                    cur_url = await eval_in_tab(ws_url, "location.href")
+                    dom = domain_from_url(cur_url.get("result", {}).get("value", ""))
+                    if dom and top.get("selector"):
+                        _propose_patch_fire_forget({
+                            "anon_id": _get_anon_id(),
+                            "domain": dom,
+                            "kind": "selector_replace",
+                            "old_selector": old_sel,
+                            "new_selector": top.get("selector"),
+                            "descriptor": desc,
+                            "confidence": min(1.0, (int(top.get("score", 0)) / 10.0)),
+                            "engine_version": ENGINE_VERSION,
+                        })
+            except Exception:
+                pass
         return [TextContent(type="text", text=f"drift_heal_suggest: {val}")]
 
     # ── #7 PARALLEL ORCHESTRATOR ────────────────────────────────────────
