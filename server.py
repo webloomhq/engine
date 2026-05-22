@@ -1952,6 +1952,21 @@ async def list_tools():
             "action": {"type": "string", "description": "reCAPTCHA v3 action name (optional)"},
             "min_score": {"type": "number", "description": "reCAPTCHA v3 min_score (default 0.3)"}
         }, "required": ["session", "type", "site_key"]}),
+        Tool(name="react_invoke_handler", description=(
+            "Bypass DOM event interceptors by calling a React component's prop handler directly. "
+            "Use when normal click() / dispatch-events / vision_click all fail because a custom-element overlay "
+            "(LinkedIn's interop-outlet, some Web Components wrappers) is eating mouse events at the DOM layer. "
+            "Walks __reactFiber / __reactProps to find an onClick / onSubmit / onChange / onPointerDown handler "
+            "and invokes it with a synthetic event object. This works because React props live on the component "
+            "instance, not in the DOM event chain — overlays can't intercept what isn't dispatched. "
+            "Returns {ok, via, hops, handler_kind}. The fiber walk also handles wrappers (button inside a span "
+            "inside an interop-outlet) by climbing up to 20 hops until it finds the handler."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "selector": {"type": "string", "description": "CSS selector for the element you'd normally click. The fiber walk starts here and climbs."},
+            "handler": {"type": "string", "default": "onClick", "description": "Which prop handler to invoke. Common: onClick, onSubmit, onMouseDown, onPointerDown, onChange, onKeyDown."},
+            "event_payload": {"type": "object", "description": "Optional fields to add to the synthetic event object (e.g. {key:'Enter', keyCode:13} for onKeyDown)."}
+        }, "required": ["session", "selector"]}),
         Tool(name="swarm_run", description=(
             "Multi-agent swarm — two specialist Claude agents cooperate on one Chrome session to accomplish a "
             "goal. The DRIVER plans and executes actions. The WATCHER monitors for popups, captchas, error modals, "
@@ -2093,7 +2108,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler"}
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -5210,6 +5225,81 @@ async def _execute_tool_action(name: str, arguments: dict):
                 return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}, indent=2))]
         else:
             return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"provider '{provider}' not yet implemented (twocaptcha works)"}, indent=2))]
+
+    # ── REACT_INVOKE_HANDLER — bypass overlay event interception ───────
+    if name == "react_invoke_handler":
+        sel = arguments["selector"]
+        handler = arguments.get("handler", "onClick")
+        extra = arguments.get("event_payload", {}) or {}
+
+        js = f"""(function(sel, handlerName, extra) {{
+            const el = document.querySelector(sel);
+            if (!el) return JSON.stringify({{ok: false, error: 'no element matched: ' + sel}});
+
+            // Build a synthetic event object — duck-typed React event
+            const ev = Object.assign({{
+                preventDefault: function() {{ this.defaultPrevented = true; }},
+                stopPropagation: function() {{}},
+                stopImmediatePropagation: function() {{}},
+                nativeEvent: {{}},
+                bubbles: true,
+                cancelable: true,
+                currentTarget: el,
+                target: el,
+                type: handlerName.replace(/^on/, '').toLowerCase(),
+                defaultPrevented: false,
+                isTrusted: false,
+            }}, extra || {{}});
+
+            // 1) Direct check: __reactProps$ on the element itself
+            const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps'));
+            if (propsKey && el[propsKey] && typeof el[propsKey][handlerName] === 'function') {{
+                try {{
+                    el[propsKey][handlerName](ev);
+                    return JSON.stringify({{ok: true, via: 'reactProps', hops: 0, handler: handlerName}});
+                }} catch (e) {{
+                    return JSON.stringify({{ok: false, error: 'handler threw: ' + (e && e.message), via: 'reactProps'}});
+                }}
+            }}
+
+            // 2) Walk the fiber chain looking for the handler in memoizedProps / pendingProps
+            const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+            if (!fiberKey) return JSON.stringify({{ok: false, error: 'no react fiber on this element — is the site really React?'}});
+            let fiber = el[fiberKey];
+            let hops = 0;
+            while (fiber && hops < 20) {{
+                const props = fiber.memoizedProps || fiber.pendingProps;
+                if (props && typeof props[handlerName] === 'function') {{
+                    try {{
+                        props[handlerName](ev);
+                        return JSON.stringify({{ok: true, via: 'fiber.memoizedProps', hops: hops, handler: handlerName}});
+                    }} catch (e) {{
+                        return JSON.stringify({{ok: false, error: 'handler threw at hop ' + hops + ': ' + (e && e.message), via: 'fiber'}});
+                    }}
+                }}
+                fiber = fiber.return;
+                hops++;
+            }}
+
+            return JSON.stringify({{ok: false, error: 'no ' + handlerName + ' found in fiber chain', searched_hops: hops}});
+        }})({json.dumps(sel)}, {json.dumps(handler)}, {json.dumps(extra)})"""
+
+        r = await eval_in_tab(ws_url, js)
+        val = r.get("result", {}).get("value", "{}")
+
+        # Record the strategy in the playbook
+        try:
+            cur = await eval_in_tab(ws_url, "location.href")
+            dom = domain_from_url(cur.get("result", {}).get("value", ""))
+            parsed = json.loads(val) if isinstance(val, str) else {}
+            if dom:
+                _playbook_record(dom, f"react_invoke_handler:{sel} via {handler}",
+                                 "react_fiber_handler", bool(parsed.get("ok")), kind="click",
+                                 selector_pattern=sel)
+        except Exception:
+            pass
+
+        return [TextContent(type="text", text=f"react_invoke_handler: {val}")]
 
     # ── SWARM_RUN — 2-role multi-agent (Driver + Watcher) ──────────────
     if name == "swarm_run":
