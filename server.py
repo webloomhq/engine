@@ -3158,7 +3158,6 @@ async def _execute_tool_action(name: str, arguments: dict):
         # MARSTUDIO 2026-05-21 X-crack pattern) and prevents the discovery
         # from being lost when the session ends.
         try:
-            import re
             if "fetch(" in code:
                 # Try to extract the fetch URL from the code (first quoted URL)
                 m = re.search(r"fetch\(\s*[`'\"]([^`'\"]+)[`'\"]", code)
@@ -6151,7 +6150,6 @@ async def _execute_tool_action(name: str, arguments: dict):
         is_regex = pattern.startswith("regex:")
         regex = None
         if is_regex:
-            import re
             try:
                 regex = re.compile(pattern[6:])
             except Exception as e:
