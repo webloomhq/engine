@@ -6698,23 +6698,38 @@ async def _execute_tool_action(name: str, arguments: dict):
         query_id = arguments.get("query_id") or ""
         reply_to = arguments.get("reply_to_tweet_id") or ""
 
-        # 1. Pull home HTML + ondemand JS + ct0 from the tab in one shot
-        bundle_js = r"""(async function() {
+        # 1. Pull home HTML + ondemand JS from Python directly (urllib).
+        #    In-page fetch to x.com → abs.twimg.com is blocked by X's CSP
+        #    (connect-src omits the CDN). The home HTML scaffold + ondemand JS
+        #    are PUBLIC — no auth required, so a server-side fetch is fine and
+        #    avoids the CORS surface entirely. Only ct0 + queryId still come
+        #    from the tab (cookie + same-origin main bundle scrape).
+        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+        try:
+            req = urllib.request.Request("https://x.com/home", headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+            home_html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
+        except Exception as e:
+            return [TextContent(type="text", text=f"x_create_tweet: home fetch failed — {type(e).__name__}: {e}")]
+
+        idx_match = re.search(r',(\d+):["\']ondemand\.s["\']', home_html)
+        if not idx_match:
+            return [TextContent(type="text", text="x_create_tweet: ondemand index not in home HTML — X may have changed the manifest layout.")]
+        idx = idx_match.group(1)
+        hash_match = re.search(r',' + idx + r':"([0-9a-f]+)"', home_html)
+        if not hash_match:
+            return [TextContent(type="text", text="x_create_tweet: ondemand hash not found in home HTML.")]
+        ondemand_url = f"https://abs.twimg.com/responsive-web/client-web/ondemand.s.{hash_match.group(1)}a.js"
+        try:
+            req2 = urllib.request.Request(ondemand_url, headers={"User-Agent": UA})
+            ondemand_js = urllib.request.urlopen(req2, timeout=10).read().decode("utf-8", errors="replace")
+        except Exception as e:
+            return [TextContent(type="text", text=f"x_create_tweet: ondemand fetch failed — {type(e).__name__}: {e}")]
+
+        # ct0 + queryId scrape from the tab (same-origin, no CORS)
+        tab_js = r"""(async function() {
             try {
-                const homeRes = await fetch('https://x.com/home', {credentials: 'include'});
-                const home = await homeRes.text();
-                const idxMatch = home.match(/,(\d+):["']ondemand\.s["']/);
-                if (!idxMatch) return JSON.stringify({error: 'ondemand index not in home HTML — page may be a login wall'});
-                const idx = idxMatch[1];
-                const hashRe = new RegExp(',' + idx + ':"([0-9a-f]+)"');
-                const hashMatch = home.match(hashRe);
-                if (!hashMatch) return JSON.stringify({error: 'ondemand hash not found'});
-                const ondemandUrl = 'https://abs.twimg.com/responsive-web/client-web/ondemand.s.' + hashMatch[1] + 'a.js';
-                const ondemandRes = await fetch(ondemandUrl);
-                const ondemand = await ondemandRes.text();
                 const ct0Match = document.cookie.split('; ').find(c => c.startsWith('ct0='));
                 const ct0 = ct0Match ? ct0Match.split('=')[1] : '';
-                // Best-effort queryId scrape from main bundle. If this fails, caller passes query_id.
                 let scrapedQid = '';
                 try {
                     const mainScript = Array.from(document.scripts).map(s => s.src).find(s => /main\.[a-f0-9]+\.js/.test(s));
@@ -6724,21 +6739,22 @@ async def _execute_tool_action(name: str, arguments: dict):
                         if (m) scrapedQid = m[1];
                     }
                 } catch(e) {}
-                return JSON.stringify({home, ondemand, ct0, scrapedQid});
+                return JSON.stringify({ct0, scrapedQid});
             } catch(e) {
-                return JSON.stringify({error: 'bundle fetch threw: ' + (e && e.message)});
+                return JSON.stringify({error: 'tab read threw: ' + (e && e.message)});
             }
         })()"""
-        r = await eval_in_tab(ws_url, bundle_js)
+        r = await eval_in_tab(ws_url, tab_js)
         raw = r.get("result", {}).get("value", "{}")
         try:
-            bundle = json.loads(raw) if isinstance(raw, str) else raw
+            tab_data = json.loads(raw) if isinstance(raw, str) else raw
         except Exception:
-            bundle = {"error": "bundle JSON parse failed"}
-        if bundle.get("error"):
-            return [TextContent(type="text", text=f"x_create_tweet: {bundle['error']}")]
-        if not bundle.get("ct0"):
+            tab_data = {"error": "tab JSON parse failed"}
+        if tab_data.get("error"):
+            return [TextContent(type="text", text=f"x_create_tweet: {tab_data['error']}")]
+        if not tab_data.get("ct0"):
             return [TextContent(type="text", text="x_create_tweet: ct0 cookie missing — not logged in to X?")]
+        bundle = {"home": home_html, "ondemand": ondemand_js, "ct0": tab_data["ct0"], "scrapedQid": tab_data.get("scrapedQid", "")}
 
         # 2. Resolve queryId — arg > scraped > error
         if not query_id:
