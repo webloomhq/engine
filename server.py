@@ -5021,26 +5021,68 @@ async def _execute_tool_action(name: str, arguments: dict):
             }
             if (!draftInstance) result.steps.push('fiber: no Draft editor instance reachable');
 
-            // STRATEGY 2: beforeinput insertText. Draft.js's keypress handler treats this as a real typing event.
+            // STRATEGY 2: chunked beforeinput insertText. Draft.js's keypress
+            // handler accepts beforeinput as a real typing event, but silently
+            // truncates large single dispatches (~observed cap around 30-60 chars
+            // on X composer). Fix: dispatch in small chunks and verify after
+            // each batch. Re-target the contenteditable each pass — Draft may
+            // re-mount the editable node mid-insert.
             try {
-                const ev = new InputEvent('beforeinput', {
-                    bubbles: true, cancelable: true, composed: true,
-                    inputType: 'insertText',
-                    data: text,
-                });
-                editable.dispatchEvent(ev);
-                await sleep(180);
-                const len = (editable.innerText || '').length;
-                if (len >= Math.min(text.length, 5)) {
+                const CHUNK = 16;       // chars per dispatch
+                const PASS_DELAY = 25;  // ms between dispatches
+                const STALL_LIMIT = 3;  // give up after N no-progress passes
+                let cursor = 0;
+                let stalls = 0;
+                let lastLen = 0;
+
+                const findEditable = () => {
+                    let el = document.querySelector(containerSel);
+                    if (el && !el.isContentEditable) {
+                        el = el.querySelector('[contenteditable=true]') || el.querySelector('[contenteditable]') || el;
+                    }
+                    return el;
+                };
+
+                while (cursor < text.length && stalls < STALL_LIMIT) {
+                    const live = findEditable();
+                    if (!live) break;
+                    live.focus();
+                    const remaining = text.slice(cursor);
+                    const chunk = remaining.slice(0, CHUNK);
+                    const ev = new InputEvent('beforeinput', {
+                        bubbles: true, cancelable: true, composed: true,
+                        inputType: 'insertText',
+                        data: chunk,
+                    });
+                    live.dispatchEvent(ev);
+                    await sleep(PASS_DELAY);
+                    const curText = (live.innerText || '');
+                    const curLen = curText.length;
+                    if (curLen > lastLen) {
+                        cursor += (curLen - lastLen);
+                        lastLen = curLen;
+                        stalls = 0;
+                    } else {
+                        stalls += 1;
+                        await sleep(60);
+                    }
+                }
+                // Final settle
+                await sleep(120);
+                const finalEl = findEditable();
+                const finalLen = finalEl ? (finalEl.innerText || '').length : 0;
+                // Accept if we got ≥95% — Draft.js can drop trailing whitespace
+                if (finalLen >= Math.floor(text.length * 0.95)) {
                     result.ok = true;
-                    result.mode = 'beforeinput-inserttext';
-                    result.readback_len = len;
-                    result.sample = (editable.innerText || '').slice(0, 120);
+                    result.mode = 'beforeinput-chunked';
+                    result.readback_len = finalLen;
+                    result.expected_len = text.length;
+                    result.sample = (finalEl.innerText || '').slice(0, 120);
                     return JSON.stringify(result);
                 }
-                result.steps.push('beforeinput inserted only ' + len + ' chars, falling through');
+                result.steps.push('chunked beforeinput stalled at ' + finalLen + '/' + text.length + ' (stalls=' + stalls + ')');
             } catch (e) {
-                result.steps.push('beforeinput threw: ' + (e && e.message));
+                result.steps.push('chunked beforeinput threw: ' + (e && e.message));
             }
             // Signal to Python to try CDP keystroke strategy
             return JSON.stringify({ ok:false, fallback:'cdp_keystrokes', steps: result.steps });
