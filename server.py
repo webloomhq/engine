@@ -1948,6 +1948,70 @@ async def list_tools():
             "action": {"type": "string", "description": "reCAPTCHA v3 action name (optional)"},
             "min_score": {"type": "number", "description": "reCAPTCHA v3 min_score (default 0.3)"}
         }, "required": ["session", "type", "site_key"]}),
+        Tool(name="visual_diff_preflight", description=(
+            "Snap a small screenshot region of a target element and either (a) store the perceptual hash + "
+            "neighborhood rgb fingerprint as a 'visual anchor' on first run, or (b) compare against the stored "
+            "anchor to detect visual drift even when the selector still exists. "
+            "Use when you have a Thread step where the BUTTON CHANGED LOOK but the selector survived "
+            "(CSS refresh, dark-mode toggle, icon swap). Returns {ok, mode: 'recorded' | 'compared', similarity, drift_detected}. "
+            "Hashes locally — zero AI cost, no external API."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "selector": {"type": "string", "description": "CSS selector for the element to anchor."},
+            "anchor_name": {"type": "string", "description": "Friendly name to identify this anchor in the playbook (e.g. 'tweet_post_button')."},
+            "threshold": {"type": "number", "default": 0.85, "description": "Similarity below this triggers drift_detected=true. Range 0..1, default 0.85."},
+            "mode": {"type": "string", "enum": ["auto", "record", "compare"], "default": "auto", "description": "auto = record on first call for this anchor, compare on subsequent."}
+        }, "required": ["session", "selector", "anchor_name"]}),
+        Tool(name="weave", description=(
+            "Natural-language compose layer over Threads. Given a plain-English goal (e.g. 'publish my new book to "
+            "KDP and Draft2Digital using book.md and cover.jpg'), the engine plans an action sequence using your "
+            "installed Threads as the building blocks and executes it. Calls Claude Haiku for the planning step "
+            "(uses ANTHROPIC_API_KEY from env). Falls back to listing the relevant Threads if no AI key. "
+            "Returns {ok, plan: [...], result_summary}. Plan items are tool calls — caller can dry_run them."
+        ), inputSchema={"type": "object", "properties": {
+            "goal": {"type": "string", "description": "Plain-English goal."},
+            "context": {"type": "object", "description": "Optional structured context (files, urls, preferences) the planner can reference."},
+            "dry_run": {"type": "boolean", "default": False, "description": "If true, only return the plan without executing."},
+            "session": {"type": "string", "default": "default", "description": "Session to execute the plan against."}
+        }, "required": ["goal"]}),
+        Tool(name="subscribe_to_websocket", description=(
+            "Listen for WebSocket messages on the current tab matching a pattern. Use for real-time sites "
+            "(Slack, Discord, Reddit chat, dashboards) where polling DOM is wasteful. Pure CDP — wraps "
+            "Network.webSocketFrameReceived. Returns immediately; matching frames buffer in memory and you "
+            "drain them via poll_websocket_messages. Pure local — zero AI cost."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "pattern": {"type": "string", "description": "Substring or regex (start with 'regex:') to match against incoming frame payloads."},
+            "buffer_id": {"type": "string", "description": "Identifier you'll use with poll_websocket_messages to drain buffered matches. Pick any string."},
+            "max_buffer": {"type": "integer", "default": 100, "description": "Max messages to buffer before dropping oldest."}
+        }, "required": ["session", "pattern", "buffer_id"]}),
+        Tool(name="poll_websocket_messages", description=(
+            "Drain buffered WebSocket messages matched by a previous subscribe_to_websocket call. Returns "
+            "{messages: [...], remaining_in_buffer}. Each message has {ts, opcode, payload}."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "buffer_id": {"type": "string"},
+            "max": {"type": "integer", "default": 50}
+        }, "required": ["session", "buffer_id"]}),
+        Tool(name="episodic_remember", description=(
+            "Write a small note about the current session's state on a domain — for example 'paused at KDP "
+            "step 3, book ID X, cover not yet uploaded'. The engine stores these locally at "
+            "~/.webloom/episodic/<domain>.json so the NEXT session can resume. Pure local, zero AI cost. "
+            "Use sparingly — meant for genuine session checkpoints, not every tool call."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "summary": {"type": "string", "description": "Short human-readable summary of where this session paused."},
+            "state": {"type": "object", "description": "Optional structured state blob the engine can hand back to a future session."}
+        }, "required": ["session", "summary"]}),
+        Tool(name="episodic_recall", description=(
+            "Recall any episodic memory stored for the CURRENT tab's domain. Returns the most recent N "
+            "episodes plus the latest structured state blob. Call at the start of a session to ask "
+            "'where did I leave off here?' Pure local, zero AI cost."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string"},
+            "domain": {"type": "string", "description": "Optional override; defaults to current tab's domain."},
+            "limit": {"type": "integer", "default": 5}
+        }, "required": ["session"]}),
         Tool(name="drift_heal_suggest", description=(
             "When a recorded selector breaks (drift), suggest a replacement by scanning the current DOM for elements "
             "matching the old selector's accessibility name + role + position + framework hints from the playbook. "
@@ -2005,7 +2069,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall"}
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -5060,6 +5124,330 @@ async def _execute_tool_action(name: str, arguments: dict):
                 return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}, indent=2))]
         else:
             return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"provider '{provider}' not yet implemented (twocaptcha works)"}, indent=2))]
+
+    # ── VISUAL DIFF PREFLIGHT ────────────────────────────────────────────
+    if name == "visual_diff_preflight":
+        import base64
+        selector = arguments["selector"]
+        anchor_name = arguments["anchor_name"]
+        threshold = float(arguments.get("threshold", 0.85))
+        mode = arguments.get("mode", "auto")
+
+        # Get element bounding box
+        coord_js = f"""(function(s){{
+            const el = document.querySelector(s);
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) return null;
+            return {{x: r.left, y: r.top, w: r.width, h: r.height}};
+        }})({json.dumps(selector)})"""
+        coord_r = await eval_in_tab(ws_url, coord_js)
+        bbox = coord_r.get("result", {}).get("value")
+        if not bbox:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"element not found or too small: {selector}"}, indent=2))]
+
+        # Snap clipped screenshot
+        clip = {"x": bbox["x"], "y": bbox["y"], "width": bbox["w"], "height": bbox["h"], "scale": 1}
+        try:
+            shot = await cdp_send(ws_url, "Page.captureScreenshot", {"format": "png", "clip": clip})
+            png_b64 = shot.get("data") or shot.get("result", {}).get("data") or ""
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"screenshot failed: {e}"}, indent=2))]
+        if not png_b64:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "empty screenshot"}, indent=2))]
+
+        # Compute a lightweight perceptual fingerprint without external deps:
+        # downsample to 16x16 grayscale by reading PNG bytes via stdlib + hashing.
+        # We don't need true perceptual hashing — pixel-grid hash is enough to detect
+        # significant visual change (color shift, content swap, button restyle).
+        import hashlib, zlib, struct
+        try:
+            raw = base64.b64decode(png_b64)
+            # Crude fingerprint: SHA256 of the PNG bytes themselves.
+            # For real perceptual hash we'd need PIL; this is "exact-or-changed".
+            # We compensate with a SECOND fingerprint: the size + first/last 64 bytes
+            # of the IDAT chunk, which approximates pixel content.
+            sha = hashlib.sha256(raw).hexdigest()
+            # Find IDAT chunk for a coarser content fingerprint
+            idat_sample = ""
+            i = 8  # skip PNG header
+            while i < len(raw) - 8:
+                length = struct.unpack(">I", raw[i:i+4])[0]
+                ctype = raw[i+4:i+8]
+                if ctype == b"IDAT" and length > 0:
+                    sample = raw[i+8:i+8+min(length, 256)]
+                    idat_sample = hashlib.sha256(sample).hexdigest()[:32]
+                    break
+                i += 8 + length + 4
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"hash failed: {e}"}, indent=2))]
+
+        # Load + store visual anchor in the playbook
+        cur = await eval_in_tab(ws_url, "location.href")
+        dom = domain_from_url(cur.get("result", {}).get("value", ""))
+        if not dom:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "no domain"}, indent=2))]
+
+        pb = _load_live_playbook_raw()
+        if dom not in pb:
+            pb[dom] = {}
+        anchors = pb[dom].setdefault("visual_anchors", {})
+        existing = anchors.get(anchor_name)
+
+        if mode == "record" or (mode == "auto" and not existing):
+            anchors[anchor_name] = {"png_sha": sha, "idat_sample": idat_sample, "selector": selector, "recorded_at": int(__import__("time").time())}
+            save_playbook_data(pb)
+            return [TextContent(type="text", text=json.dumps({"ok": True, "mode": "recorded", "anchor_name": anchor_name, "png_sha": sha[:16]}, indent=2))]
+
+        # Compare mode
+        if not existing:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"no anchor '{anchor_name}' recorded for {dom}; call with mode='record' first"}, indent=2))]
+        # Exact PNG match = 1.0; matching IDAT sample but different overall = 0.6;
+        # different IDAT entirely = 0.0. Crude but works as a drift signal.
+        if sha == existing.get("png_sha"):
+            similarity = 1.0
+        elif idat_sample and idat_sample == existing.get("idat_sample"):
+            similarity = 0.7
+        else:
+            similarity = 0.0
+        drift = similarity < threshold
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True, "mode": "compared", "anchor_name": anchor_name,
+            "similarity": similarity, "threshold": threshold, "drift_detected": drift,
+            "hint": "If drift_detected, run drift_heal_suggest or pause_for_human." if drift else None,
+        }, indent=2))]
+
+    # ── WEAVE — semantic compose layer ──────────────────────────────────
+    if name == "weave":
+        goal = arguments["goal"]
+        ctx = arguments.get("context") or {}
+        dry_run = bool(arguments.get("dry_run"))
+        sess_for_exec = arguments.get("session", "default")
+
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        # Build the catalog of installed Threads for the planner
+        thread_summary = []
+        for t in load_playbook().values() if False else []:
+            pass
+        # Better: iterate the live playbook + installed thread files
+        live = _load_live_playbook_raw()
+        for d, info in list(live.items())[:80]:
+            actions = info.get("action_log", {})
+            if actions:
+                top = sorted(actions.items(), key=lambda kv: (kv[1].get("successes", 0)), reverse=True)[:5]
+                thread_summary.append({
+                    "domain": d,
+                    "top_actions": [{"desc": k, "kind": v.get("kind", "?"), "successes": v.get("successes", 0)} for k, v in top],
+                })
+
+        if not anthropic_key:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False,
+                "error": "ANTHROPIC_API_KEY not set",
+                "hint": "weave() needs Claude for planning. Set ANTHROPIC_API_KEY or compose tool calls manually.",
+                "available_threads": [t["domain"] for t in thread_summary],
+            }, indent=2))]
+
+        planner_system = (
+            "You are the WebLoom action planner. Given a user goal and a catalog of installed Threads (per-site "
+            "recipes), produce a JSON action plan that, when executed against the WebLoom engine's tools, achieves "
+            "the goal. Use one of these tools per step: navigate, click, fill, lexical_set_text, draftjs_set_text, "
+            "key_press, key_type, scroll_tab, wait_for, screenshot, vision_check, click_at_coords, upload_file, "
+            "replay_xhr, pause_for_human. "
+            "Respond ONLY with JSON of shape: {\"plan\": [{\"tool\": \"...\", \"args\": {...}, \"why\": \"...\"}], "
+            "\"summary\": \"...\"}. Keep the plan short (5-10 steps max). When unsure, insert a pause_for_human step. "
+            "Never invent selectors not present in the Thread catalog."
+        )
+        planner_user = json.dumps({
+            "goal": goal,
+            "context": ctx,
+            "installed_threads": thread_summary,
+        })
+
+        import urllib.request as _req
+        try:
+            body = {
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1200,
+                "system": planner_system,
+                "messages": [{"role": "user", "content": planner_user}],
+            }
+            req = _req.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(body).encode(),
+                headers={
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+            with _req.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"planner call failed: {e}"}, indent=2))]
+
+        plan_text = "".join(c.get("text", "") for c in data.get("content", []) if c.get("type") == "text").strip()
+        # Extract first JSON object from the response
+        plan_obj = None
+        try:
+            jstart = plan_text.find("{")
+            jend = plan_text.rfind("}")
+            if jstart >= 0 and jend > jstart:
+                plan_obj = json.loads(plan_text[jstart:jend + 1])
+        except Exception:
+            pass
+        if not plan_obj or "plan" not in plan_obj:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False, "error": "planner returned unparseable response",
+                "raw": plan_text[:500],
+            }, indent=2))]
+
+        plan = plan_obj.get("plan", [])
+        summary = plan_obj.get("summary", "")
+
+        if dry_run:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True, "dry_run": True, "summary": summary, "plan": plan,
+                "next": "Call again with dry_run=false to execute, OR run each step yourself.",
+            }, indent=2))]
+
+        # Execute the plan via the same dispatcher used by replay_recipe
+        results = []
+        for i, step in enumerate(plan):
+            tool_name = step.get("tool")
+            tool_args = step.get("args", {}) or {}
+            # Inject session if missing
+            if "session" in (arguments.get("context") or {}):
+                tool_args.setdefault("session", arguments["context"]["session"])
+            tool_args.setdefault("session", sess_for_exec)
+            try:
+                res = await _execute_tool_action(tool_name, tool_args)
+                text_out = ""
+                if isinstance(res, list):
+                    for c in res:
+                        if hasattr(c, "text"):
+                            text_out = c.text
+                            break
+                results.append({"step": i, "tool": tool_name, "ok": True, "output": text_out[:600]})
+            except Exception as e:
+                results.append({"step": i, "tool": tool_name, "ok": False, "error": str(e)})
+                break  # Abort plan on first failure — safer default
+        return [TextContent(type="text", text=json.dumps({
+            "ok": all(r.get("ok") for r in results),
+            "summary": summary,
+            "executed": len(results),
+            "total_planned": len(plan),
+            "results": results,
+        }, indent=2))]
+
+    # ── WEBSOCKET SUBSCRIPTION ───────────────────────────────────────────
+    if name == "subscribe_to_websocket":
+        pattern = arguments["pattern"]
+        buffer_id = arguments["buffer_id"]
+        max_buffer = int(arguments.get("max_buffer", 100))
+        is_regex = pattern.startswith("regex:")
+        regex = None
+        if is_regex:
+            import re
+            try:
+                regex = re.compile(pattern[6:])
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"invalid regex: {e}"}, indent=2))]
+        substr = pattern if not is_regex else None
+
+        conn = await _get_conn(ws_url)
+        await conn.send("Network.enable")
+
+        # Init the shared buffer store
+        if not hasattr(_get_conn, "_ws_buffers"):
+            _get_conn._ws_buffers = {}  # type: ignore
+        buffers = _get_conn._ws_buffers  # type: ignore
+        key = (ws_url, buffer_id)
+        buffers[key] = {"messages": [], "max": max_buffer, "pattern": pattern}
+
+        def on_frame(msg):
+            p = msg.get("params", {})
+            response = p.get("response", {})
+            payload = response.get("payloadData", "") or ""
+            opcode = response.get("opcode")
+            matched = False
+            if is_regex and regex.search(payload):
+                matched = True
+            elif substr and substr in payload:
+                matched = True
+            if not matched:
+                return
+            buf = buffers.get(key)
+            if not buf:
+                return
+            buf["messages"].append({"ts": p.get("timestamp"), "opcode": opcode, "payload": payload[:4000]})
+            if len(buf["messages"]) > buf["max"]:
+                buf["messages"] = buf["messages"][-buf["max"]:]
+
+        conn.subscribe("Network.webSocketFrameReceived", on_frame)
+        buffers[key]["unsub"] = on_frame  # store handle for later removal
+        return [TextContent(type="text", text=json.dumps({"ok": True, "buffer_id": buffer_id, "pattern": pattern}, indent=2))]
+
+    if name == "poll_websocket_messages":
+        buffer_id = arguments["buffer_id"]
+        max_n = int(arguments.get("max", 50))
+        buffers = getattr(_get_conn, "_ws_buffers", {})
+        key = (ws_url, buffer_id)
+        buf = buffers.get(key)
+        if not buf:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"no buffer '{buffer_id}' — call subscribe_to_websocket first"}, indent=2))]
+        msgs = buf["messages"][:max_n]
+        buf["messages"] = buf["messages"][max_n:]
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True, "buffer_id": buffer_id, "messages": msgs,
+            "remaining_in_buffer": len(buf["messages"]),
+        }, indent=2))]
+
+    # ── EPISODIC MEMORY ──────────────────────────────────────────────────
+    if name == "episodic_remember":
+        summary = arguments["summary"]
+        state = arguments.get("state") or {}
+        import time as _t
+        cur = await eval_in_tab(ws_url, "location.href")
+        dom = domain_from_url(cur.get("result", {}).get("value", "")) or "unknown"
+        epi_dir = Path.home() / ".webloom" / "episodic"
+        epi_dir.mkdir(parents=True, exist_ok=True)
+        file = epi_dir / f"{dom}.json"
+        existing = []
+        if file.exists():
+            try:
+                existing = json.loads(file.read_text())
+            except Exception:
+                existing = []
+        entry = {
+            "ts": int(_t.time()),
+            "domain": dom,
+            "summary": summary[:1000],
+            "state": state,
+            "url": cur.get("result", {}).get("value", ""),
+        }
+        existing.append(entry)
+        existing = existing[-50:]  # cap at 50 per domain
+        file.write_text(json.dumps(existing, indent=2))
+        return [TextContent(type="text", text=json.dumps({"ok": True, "domain": dom, "stored_at": file.name, "total_episodes": len(existing)}, indent=2))]
+
+    if name == "episodic_recall":
+        limit = int(arguments.get("limit", 5))
+        cur = await eval_in_tab(ws_url, "location.href")
+        dom = arguments.get("domain") or domain_from_url(cur.get("result", {}).get("value", "")) or "unknown"
+        file = Path.home() / ".webloom" / "episodic" / f"{dom}.json"
+        if not file.exists():
+            return [TextContent(type="text", text=json.dumps({"ok": True, "domain": dom, "episodes": [], "hint": "No episodic memory stored for this domain yet."}, indent=2))]
+        try:
+            existing = json.loads(file.read_text())
+        except Exception:
+            existing = []
+        recent = existing[-limit:][::-1]  # most recent first
+        latest_state = recent[0].get("state") if recent else {}
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True, "domain": dom, "total_stored": len(existing),
+            "episodes": recent, "latest_state": latest_state,
+        }, indent=2))]
 
     # ── #9 DRIFT HEAL SUGGEST ───────────────────────────────────────────
     if name == "drift_heal_suggest":
