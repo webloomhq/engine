@@ -1813,9 +1813,14 @@ async def list_tools():
             "STRATEGY D (pass inject_input_selector): Reads file bytes, constructs File in PAGE-JS context, assigns input.files = DataTransfer.files, fires input+change. "
             "Use for label-wrapped hidden inputs (D2D, KDP, Etsy) — the pattern <label><input type=file hidden></label>. "
             "Works on Windows where A drops CDP. Confirmed working on D2D paperback uploads. Max 25MB combined.\n\n"
-            "DECISION TREE: Hidden input inside a <label>? → D. Visible drop zone with 'drop files here'? → C. Visible 'Browse' button (and not on Windows)? → A. Plain unhidden input? → B.\n"
+            "STRATEGY E (pass react_input_selector): Shadow-DOM-aware lookup + native HTMLInputElement.files setter + onChange via fiber walk. "
+            "Use for React-controlled file inputs that live inside shadow DOM (LinkedIn composer's interop-outlet pattern, Lit-based SaaS dashboards). "
+            "Strategies B and D set the FileList but React's controlled-input observer doesn't notice the synthetic change. "
+            "E uses Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files').set — the path React DOES observe — and additionally invokes the input's React onChange via fiber walk for sites that gate on the handler. "
+            "Max 25MB combined.\n\n"
+            "DECISION TREE: Inside shadow DOM (LinkedIn-style)? → E. Hidden input inside a <label>? → D. Visible drop zone with 'drop files here'? → C. Visible 'Browse' button (and not on Windows)? → A. Plain unhidden input? → B.\n"
             "Always pass absolute file paths."
-        ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}}, "required": ["session", "selector", "files"]}),
+        ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}, "react_input_selector": {"type": "string", "description": "Strategy E: CSS selector for a React-controlled file input, possibly inside shadow DOM. Walks shadow roots recursively to find the input, builds File objects in page JS, assigns via the native HTMLInputElement.files prototype setter (which React's controlled-input observer DOES notice — unlike B/D's synthetic path), fires input+change, AND invokes the input's onChange via fiber walk for handler-gated implementations. Use for LinkedIn composer + similar Lit/shadow-DOM React patterns. Max 25MB combined."}}, "required": ["session", "selector", "files"]}),
         Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget — works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}}, "required": ["session"]}),
         Tool(name="wait_for", description="Wait for an element to appear in a tab (polls every 500ms)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session", "selector"]}),
         Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first — it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}}, "required": []}),
@@ -3156,12 +3161,136 @@ async def _execute_tool_action(name: str, arguments: dict):
         click_first = arguments.get("click_first_selector", "")
         drop_target = arguments.get("drop_target_selector", "")
         inject_input = arguments.get("inject_input_selector", "")
+        react_input = arguments.get("react_input_selector", "")
         if not files:
             return [TextContent(type="text", text="upload_file: 'files' is empty.")]
         missing = [f for f in files if not Path(f).is_file()]
         if missing:
             return [TextContent(type="text", text=f"upload_file: files not found: {missing}")]
         abs_files = [str(Path(f).resolve()) for f in files]
+
+        # ── STRATEGY E: shadow-DOM-aware + native HTMLInputElement setter + React onChange ──
+        # Solves LinkedIn-style composer modals: file input lives inside a
+        # shadow root, AND React's controlled-input observer doesn't trust
+        # Strategies B/D because they go through DOM.setFileInputFiles or
+        # synthetic events. The native HTMLInputElement.files setter is the
+        # path React DOES track via its descriptor-injection magic.
+        if react_input:
+            import base64, mimetypes
+            file_blobs = []
+            total = 0
+            for fp in abs_files:
+                with open(fp, "rb") as f:
+                    data = f.read()
+                if total + len(data) > 25 * 1024 * 1024:
+                    return [TextContent(type="text", text=json.dumps({"ok": False, "error": "Strategy E: combined files exceed 25MB cap"}, indent=2))]
+                total += len(data)
+                mime = mimetypes.guess_type(fp)[0] or "application/octet-stream"
+                file_blobs.append({
+                    "name": Path(fp).name,
+                    "mime": mime,
+                    "b64": base64.b64encode(data).decode("ascii"),
+                })
+
+            js = """(async function(sel, blobs) {
+                function deepQuery(root, s) {
+                    const direct = root.querySelector(s);
+                    if (direct) return direct;
+                    const all = root.querySelectorAll('*');
+                    for (const node of all) {
+                        if (node.shadowRoot) {
+                            const inner = deepQuery(node.shadowRoot, s);
+                            if (inner) return inner;
+                        }
+                    }
+                    return null;
+                }
+                const inp = deepQuery(document, sel);
+                if (!inp) return JSON.stringify({ok:false, error:'input not found in light+shadow DOM: ' + sel});
+                if (inp.tagName !== 'INPUT' || inp.type !== 'file') {
+                    return JSON.stringify({ok:false, error:'matched but not <input type=file>: ' + inp.tagName + '/' + inp.type});
+                }
+
+                // Build File objects in page context from base64 payloads
+                const fileObjs = [];
+                for (const b of blobs) {
+                    const bin = atob(b.b64);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    fileObjs.push(new File([bytes], b.name, { type: b.mime }));
+                }
+                const dt = new DataTransfer();
+                fileObjs.forEach(f => dt.items.add(f));
+
+                // CRITICAL: use the native prototype setter, not direct assignment.
+                // React's controlled-input observer tracks the descriptor's setter
+                // and ignores changes made via direct assignment.
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files').set;
+                setter.call(inp, dt.files);
+
+                // Fire input + change so legacy listeners + React's onChange both see it
+                inp.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                inp.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+
+                // ALSO walk fiber to invoke onChange directly — for handler-gated implementations
+                let onChangeCalled = false;
+                const propsKey = Object.keys(inp).find(k => k.startsWith('__reactProps'));
+                if (propsKey && inp[propsKey] && typeof inp[propsKey].onChange === 'function') {
+                    try {
+                        inp[propsKey].onChange({
+                            target: inp,
+                            currentTarget: inp,
+                            preventDefault: () => {},
+                            stopPropagation: () => {},
+                            nativeEvent: { target: inp },
+                            bubbles: true,
+                        });
+                        onChangeCalled = true;
+                    } catch (e) {}
+                }
+                if (!onChangeCalled) {
+                    const fiberKey = Object.keys(inp).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+                    if (fiberKey) {
+                        let fiber = inp[fiberKey];
+                        let hops = 0;
+                        while (fiber && hops < 20) {
+                            const p = fiber.memoizedProps || fiber.pendingProps;
+                            if (p && typeof p.onChange === 'function') {
+                                try {
+                                    p.onChange({
+                                        target: inp, currentTarget: inp,
+                                        preventDefault: () => {}, stopPropagation: () => {},
+                                        nativeEvent: { target: inp }, bubbles: true,
+                                    });
+                                    onChangeCalled = true;
+                                    break;
+                                } catch (e) {}
+                            }
+                            fiber = fiber.return;
+                            hops++;
+                        }
+                    }
+                }
+
+                return JSON.stringify({
+                    ok: true,
+                    readback_len: inp.files ? inp.files.length : 0,
+                    react_onchange_invoked: onChangeCalled,
+                    file_names: Array.from(inp.files || []).map(f => f.name),
+                });
+            })(""" + json.dumps(react_input) + ", " + json.dumps(file_blobs) + ")"
+            r = await eval_in_tab(ws_url, js)
+            val = r.get("result", {}).get("value", "{}")
+            try:
+                cur = await eval_in_tab(ws_url, "location.href")
+                dom = domain_from_url(cur.get("result", {}).get("value", ""))
+                parsed = json.loads(val) if isinstance(val, str) else {}
+                if dom:
+                    _playbook_record(dom, f"upload_file:E:{react_input}", "strategy_e_shadow_react",
+                                     bool(parsed.get("ok")), kind="upload", selector_pattern=react_input)
+            except Exception:
+                pass
+            return [TextContent(type="text", text=f"upload_file (Strategy E — shadow+React): {val}")]
 
         # Strategy D: re-inject file bytes as real File objects and assign via
         # DataTransfer.files onto the actual <input type=file>. Solves the
@@ -5233,8 +5362,23 @@ async def _execute_tool_action(name: str, arguments: dict):
         extra = arguments.get("event_payload", {}) or {}
 
         js = f"""(function(sel, handlerName, extra) {{
-            const el = document.querySelector(sel);
-            if (!el) return JSON.stringify({{ok: false, error: 'no element matched: ' + sel}});
+            // Shadow-DOM-aware deep query: walks every open shadowRoot in the document
+            // until it finds a match. Required for LinkedIn / Lit-based sites that wrap
+            // composer modals inside <interop-outlet>.shadowRoot.
+            function deepQuery(root, s) {{
+                const direct = root.querySelector(s);
+                if (direct) return direct;
+                const all = root.querySelectorAll('*');
+                for (const node of all) {{
+                    if (node.shadowRoot) {{
+                        const inner = deepQuery(node.shadowRoot, s);
+                        if (inner) return inner;
+                    }}
+                }}
+                return null;
+            }}
+            const el = deepQuery(document, sel);
+            if (!el) return JSON.stringify({{ok: false, error: 'no element matched (light + shadow): ' + sel}});
 
             // Build a synthetic event object — duck-typed React event
             const ev = Object.assign({{
