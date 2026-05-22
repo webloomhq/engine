@@ -1883,11 +1883,15 @@ async def list_tools():
             "for an editor instance with props.editorState + props.onChange, calls onChange with a fresh state "
             "built from the editor's own Modifier when reachable; (2) falls back to beforeinput InputEvent with "
             "inputType='insertText' which Draft.js's keypress handler accepts as a real typing event; "
-            "(3) falls back to real CDP keystrokes via Input.dispatchKeyEvent with a focus-settle warmup ritual "
-            "(real click → 350ms wait → space + backspace warmup → 100ms wait → text typed at 40ms/char) — this "
-            "is the path that bypasses Draft.js's focus catcher and lands keystrokes on the real editor root; "
-            "(4) returns {ok, mode, readback_len, sample}. Mode tells you which strategy succeeded. "
-            "Use after lexical_set_text returns readback_len 0 on a Draft.js target."
+            "(3) falls back to REAL CDP KEYSTROKES via Input.dispatchKeyEvent with proper keyDown/keyUp pairs + "
+            "the `text` field per char — this is the same shape Chrome produces from real human typing, which "
+            "Draft.js's keypress handler accepts and routes through its proper state update. Preceded by a focus-"
+            "settle ritual (real click → 350ms wait → space + backspace warmup → 100ms wait). "
+            "NOT Input.insertText (which is IME composition mode — Draft.js drops/commits unpredictably at "
+            "non-human cadences). delay_ms default 80; bump to 120-150 if char drops persist on slow machines, "
+            "or pass verify_per_char=true for bulletproof per-char retry. "
+            "Returns {ok, mode, readback_len, dropped_chars, sample}. Use after lexical_set_text returns "
+            "readback_len 0 on a Draft.js target."
         ), inputSchema={"type": "object", "properties": {
             "session": {"type": "string"},
             "tab": {"type": "string"},
@@ -4838,11 +4842,62 @@ async def _execute_tool_action(name: str, arguments: dict):
                 await asyncio.sleep(0.04)
             await asyncio.sleep(0.10)
 
-        # Type each char via Input.insertText (Draft.js's synthetic IME path).
-        # Optional verify-per-char mode retries dropped chars up to 3x.
+        # Type each char via Input.dispatchKeyEvent with proper keyDown/keyUp
+        # pairs + the `text` field. This is REAL TYPING — what Draft.js's
+        # keypress handler expects. Earlier this handler used Input.insertText
+        # (IME composition mode), which Draft.js drops or commits unpredictably
+        # at non-human cadences (40ms partial drops, 80ms 100% drops because
+        # composition window expires mid-flight). Real keystrokes don't have
+        # that race.
         dropped = 0
         retried = 0
         readback_js = f"(function(s){{let el=document.querySelector(s); if(el && !el.isContentEditable) el = el.querySelector('[contenteditable=true]')||el; return el ? (el.innerText||'') : ''}})({json.dumps(container_sel)})"
+
+        def _char_to_keystroke(ch: str) -> tuple[dict, dict]:
+            """Map any char → (keyDown, keyUp) CDP payloads. The `text` field
+            on keyDown is what makes Chrome produce the actual character —
+            without it, the key fires but no text is entered."""
+            if ch == " ":
+                key, code, vk = " ", "Space", 32
+            elif ch == "\n":
+                key, code, vk = "Enter", "Enter", 13
+            elif ch == "\t":
+                key, code, vk = "Tab", "Tab", 9
+            elif ch.isalpha():
+                key, code, vk = ch, "Key" + ch.upper(), ord(ch.upper())
+            elif ch.isdigit():
+                key, code, vk = ch, "Digit" + ch, ord(ch)
+            else:
+                # Punctuation/symbols — pass char through, use ASCII code for vk
+                key, code, vk = ch, "Unidentified", ord(ch) if len(ch) == 1 else 0
+            down = {
+                "type": "keyDown",
+                "key": key, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+                "text": ch, "unmodifiedText": ch,
+            }
+            up = {
+                "type": "keyUp",
+                "key": key, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+            }
+            return down, up
+
+        async def _safe_readback() -> str:
+            """Read current composer text. Defensive against null returns and
+            transient CDP failures — never raises, always returns a string."""
+            try:
+                rb = await eval_in_tab(ws_url, readback_js)
+                if not isinstance(rb, dict):
+                    return ""
+                val = rb.get("result", {}).get("value")
+                if val is None:
+                    return ""
+                if not isinstance(val, str):
+                    val = str(val)
+                return val
+            except Exception:
+                return ""
 
         if verify_per_char:
             # Expected length grows by 1 per successfully-landed char
@@ -4850,10 +4905,16 @@ async def _execute_tool_action(name: str, arguments: dict):
             for ch in text_to_set:
                 landed = False
                 for attempt in range(3):
-                    await cdp_send(ws_url, "Input.insertText", {"text": ch})
+                    down, up = _char_to_keystroke(ch)
+                    try:
+                        await cdp_send(ws_url, "Input.dispatchKeyEvent", down)
+                        await cdp_send(ws_url, "Input.dispatchKeyEvent", up)
+                    except Exception:
+                        # CDP hiccup — give it one more shot
+                        await asyncio.sleep(0.05)
+                        continue
                     await asyncio.sleep(delay_s)
-                    rb = await eval_in_tab(ws_url, readback_js)
-                    cur = rb.get("result", {}).get("value", "")
+                    cur = await _safe_readback()
                     if len(cur) >= expected + 1:
                         landed = True
                         expected = len(cur)
@@ -4865,9 +4926,14 @@ async def _execute_tool_action(name: str, arguments: dict):
                 if not landed:
                     dropped += 1
         else:
-            # Fast path — fixed delay between chars, no per-char verify
+            # Fast path — fixed delay between real keystrokes, no per-char verify
             for ch in text_to_set:
-                await cdp_send(ws_url, "Input.insertText", {"text": ch})
+                down, up = _char_to_keystroke(ch)
+                try:
+                    await cdp_send(ws_url, "Input.dispatchKeyEvent", down)
+                    await cdp_send(ws_url, "Input.dispatchKeyEvent", up)
+                except Exception:
+                    pass
                 await asyncio.sleep(delay_s)
 
         await asyncio.sleep(0.20)
