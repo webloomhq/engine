@@ -2259,6 +2259,21 @@ async def list_tools():
         Tool(name="xhr_upload", description="Direct file upload via fetch()/FormData against a server endpoint. Bypasses widgets that intercept and corrupt programmatic file injection (KDP AjaxInput, custom AJAX uploaders that clear input.files after onchange). Uses the page's cookies/CSRF/session via credentials:'include' — appears identical to the page's own upload request. Pair with capture_network_start/stop to discover the URL and field names by watching one manual upload. Max 25MB combined.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url": {"type": "string", "description": "Upload endpoint URL (absolute or relative to current page origin). Discover via capture_network_start during a real upload."}, "files": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute local file path"}, "field": {"type": "string", "description": "FormData field name (e.g. 'file', 'cover_image', 'manuscript'). Watch a real upload to identify."}}, "required": ["path", "field"]}, "description": "Files to upload, each with its FormData field name."}, "fields": {"type": "object", "description": "Additional FormData fields (CSRF tokens, book IDs, hidden params). Often required — capture a real upload to identify."}, "method": {"type": "string", "default": "POST"}, "headers": {"type": "object", "description": "Extra headers (X-CSRF-Token, etc). Cookies are automatic via credentials:'include'."}}, "required": ["session", "url", "files"]}),
         Tool(name="key_press", description="Press a single named key via CDP Input.dispatchKeyEvent. Use for Enter, Tab, Escape, ArrowUp/Down/Left/Right, Backspace, Space. For navigating React dropdowns/menus (Radix, Headless UI) keyboard-style: focus the trigger, ArrowDown to highlight, Enter to select.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "key": {"type": "string", "description": "Key name: Enter, Tab, Escape, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Backspace, Space, PageDown, PageUp, Home, End"}, "modifiers": {"type": "array", "items": {"type": "string", "enum": ["Alt", "Control", "Meta", "Shift"]}, "description": "Optional modifier keys held during the press"}}, "required": ["session", "key"]}),
         Tool(name="x_create_tweet", description="Post a tweet on X without typing into the DOM. Computes x-client-transaction-id from the page (reverses X's body-signed anti-replay header), refreshes ct0 from cookie, fires CreateTweet GraphQL POST from the tab context (cookies auto-attach). Zero manual seed needed — kills the seed-and-replay dance entirely. Use this instead of draftjs_set_text+click for X posting. Requires the X tab to be open and logged in.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching x.com (defaults to first x.com tab)"}, "text": {"type": "string", "description": "Tweet body"}, "query_id": {"type": "string", "description": "X's CreateTweet GraphQL queryId. Optional — if omitted, scraped from the page. Pass explicitly when scrape fails (X bundles changed)."}, "reply_to_tweet_id": {"type": "string", "description": "Optional — if set, posts as a reply to this tweet id."}}, "required": ["session", "text"]}),
+        Tool(name="tiktok_sign", description="Compute TikTok's anti-bot signature for any URL via the page's own in-bundle signer. Reads window.byted_acrawler.sign(url) — TikTok exposes this on every page after the bundle loads, used for their own internal API calls. Returns {x-bogus, x-tt-params, signature, msToken} for the given URL so you can hit TikTok's authenticated API endpoints directly (POST aweme/create, upload, comment, follow, etc.) WITHOUT driving the DOM. msToken is read from cookie. Requires an already-loaded tiktok.com tab (any page; opens / first if needed).", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching tiktok.com (defaults to first one)"}, "url": {"type": "string", "description": "Full URL to sign. The signer takes the full URL including query params and returns the headers TikTok's API expects on that request."}}, "required": ["session", "url"]}),
+        Tool(name="tiktok_post_video", description=(
+            "End-to-end TikTok video post via the upload-studio UI. Drives /tiktokstudio/upload: drops the file on the dropzone, fills caption + hashtags, "
+            "optionally toggles privacy, clicks Post, returns the resulting video URL. Pure DOM-driving (uses upload_file Strategy C internally) — works on "
+            "tiktok.com and tiktok-studio. For batch/native-API posting use tiktok_sign + replay_xhr instead."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching tiktok.com (defaults to first)"},
+            "video_path": {"type": "string", "description": "Absolute local path to the video file (mp4 recommended, 1080×1920 vertical)."},
+            "caption": {"type": "string", "description": "Caption text. Hashtags can be embedded as `#tag` — TikTok converts them. Up to 2200 chars."},
+            "privacy": {"type": "string", "enum": ["public", "friends", "private"], "default": "public"},
+            "wait_for_upload_seconds": {"type": "integer", "default": 90, "description": "How long to wait for the upload to finish before clicking Post (file size dependent)."},
+            "drop_selector": {"type": "string", "description": "Override the drop-zone selector if TikTok rotates classes."},
+            "caption_selector": {"type": "string", "description": "Override the caption editor selector if TikTok rotates."},
+            "post_button_selector": {"type": "string", "description": "Override the Post-button selector."},
+        }, "required": ["session", "video_path", "caption"]}),
     ]
 
 def resolve_session(session_str: str) -> int:
@@ -2276,7 +2291,7 @@ _STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_pl
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
 _LOGIN_CONFIRMED: set = set()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler", "x_create_tweet"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler", "x_create_tweet", "tiktok_sign", "tiktok_post_video"}
 # check_thread_updates + show_recent_auto_heals don't need a session — they're admin/info tools
 
 
@@ -7001,6 +7016,236 @@ async def _execute_tool_action(name: str, arguments: dict):
                 "hint": "If 403/401: queryId rotated, refresh from a captured CreateTweet URL. If 400: features schema shifted — patch the features dict from a fresh capture. If 'Could not authenticate you': bearer/ct0 mismatch — reload the X tab.",
             }
         return [TextContent(type="text", text=f"x_create_tweet: {json.dumps(out)}")]
+
+    if name == "tiktok_sign":
+        # Call TikTok's in-page signer. TikTok exposes byted_acrawler (or
+        # __webmssdk in newer bundles) on window after their bundle loads.
+        # We call it via eval_js — cookies attach automatically to any
+        # follow-up fetch from the same tab.
+        if not arguments.get("tab"):
+            cur_url = (tab.get("url") or "").lower()
+            if "tiktok.com" not in cur_url:
+                tt_tabs = [t for t in real_tabs(tabs) if "tiktok.com" in (t.get("url") or "").lower()]
+                if tt_tabs:
+                    tab = tt_tabs[0]
+                    ws_url = tab["webSocketDebuggerUrl"]
+                else:
+                    return [TextContent(type="text", text="tiktok_sign: no tiktok.com tab open. Open https://www.tiktok.com/ and retry.")]
+        target_url = arguments["url"]
+        sign_js = r"""(async function(targetUrl) {
+            const out = {ok:false, steps:[]};
+            try {
+                // msToken from cookie
+                const ct = document.cookie.split('; ').find(c => c.startsWith('msToken='));
+                out.msToken = ct ? ct.split('=')[1] : '';
+                // Locate the signer — TikTok bundles vary across web/studio/login
+                const signer = window.byted_acrawler || window.__webmssdk || window._signer;
+                if (!signer || typeof signer.sign !== 'function') {
+                    out.error = 'no signer on window (byted_acrawler/__webmssdk/_signer all missing). Page may not have fully loaded the SDK bundle. Reload tiktok.com and retry.';
+                    return JSON.stringify(out);
+                }
+                out.steps.push('signer found: ' + (signer === window.byted_acrawler ? 'byted_acrawler' : signer === window.__webmssdk ? '__webmssdk' : '_signer'));
+                const signed = signer.sign({url: targetUrl}) || signer.sign(targetUrl);
+                out.ok = true;
+                out.signature = signed;
+                // Common header extraction patterns — different TT bundles return different shapes
+                if (signed && typeof signed === 'object') {
+                    out.x_bogus = signed['x-bogus'] || signed.xBogus || signed.X_Bogus || '';
+                    out.x_tt_params = signed['x-tt-params'] || signed.xTTParams || '';
+                } else if (typeof signed === 'string') {
+                    out.x_bogus = signed;
+                }
+                return JSON.stringify(out);
+            } catch (e) {
+                out.error = 'signer threw: ' + (e && e.message);
+                return JSON.stringify(out);
+            }
+        })(""" + json.dumps(target_url) + ")"
+        r = await eval_in_tab(ws_url, sign_js)
+        raw = r.get("result", {}).get("value", "{}")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            parsed = {"ok": False, "raw": raw}
+        try:
+            cur_url = await eval_in_tab(ws_url, "location.href")
+            d = domain_from_url(cur_url.get("result", {}).get("value", ""))
+            if d:
+                _playbook_record(d, "tiktok_sign", parsed.get("steps", ["?"])[0] if parsed.get("steps") else "signer", bool(parsed.get("ok")), kind="xhr_replay", selector_pattern=target_url)
+        except Exception:
+            pass
+        return [TextContent(type="text", text=f"tiktok_sign: {json.dumps(parsed)}")]
+
+    if name == "tiktok_post_video":
+        # End-to-end UI-driven upload on tiktok.com/tiktokstudio/upload.
+        # Uses upload_file Strategy C internally (drop synthesis) which is the
+        # path TikTok's editor reliably accepts.
+        video_path = arguments["video_path"]
+        caption_text = arguments["caption"]
+        privacy = arguments.get("privacy", "public")
+        wait_upload = int(arguments.get("wait_for_upload_seconds", 90))
+        drop_sel = arguments.get("drop_selector") or "[class*='upload-card'], [data-tt='Upload_index_dragArea'], .upload-stage, .file-upload, input[type=file]"
+        caption_sel = arguments.get("caption_selector") or "div[contenteditable='true'], [data-text='true'], textarea[name='caption']"
+        post_sel = arguments.get("post_button_selector") or "button[data-e2e='post_video_button'], button:has-text('Post'), [data-tt='upload_post_btn']"
+
+        if not Path(video_path).is_file():
+            return [TextContent(type="text", text=f"tiktok_post_video: file not found at {video_path}")]
+
+        # Resolve TikTok tab
+        if not arguments.get("tab"):
+            cur_url = (tab.get("url") or "").lower()
+            if "tiktok.com" not in cur_url:
+                tt_tabs = [t for t in real_tabs(tabs) if "tiktok.com" in (t.get("url") or "").lower()]
+                if tt_tabs:
+                    tab = tt_tabs[0]
+                    ws_url = tab["webSocketDebuggerUrl"]
+                else:
+                    return [TextContent(type="text", text="tiktok_post_video: no tiktok.com tab open. Open https://www.tiktok.com/tiktokstudio/upload and retry.")]
+
+        steps = []
+        # 1. Navigate to the upload page
+        await cdp_send(ws_url, "Page.navigate", {"url": "https://www.tiktok.com/tiktokstudio/upload"})
+        await asyncio.sleep(3)
+        steps.append("navigated to /tiktokstudio/upload")
+
+        # 2. Drop the video file via Strategy C
+        from pathlib import Path as _P
+        try:
+            file_bytes = _P(video_path).read_bytes()
+        except Exception as e:
+            return [TextContent(type="text", text=f"tiktok_post_video: read file failed — {e}")]
+        if len(file_bytes) > 200 * 1024 * 1024:
+            return [TextContent(type="text", text=f"tiktok_post_video: file is {len(file_bytes)//(1024*1024)}MB, too large (200MB cap)")]
+        file_b64 = base64.b64encode(file_bytes).decode()
+        file_name = _P(video_path).name
+        drop_js = """(async function(dropSel, fileName, b64, mime) {
+            const target = document.querySelector(dropSel) || document.querySelector('input[type=file]');
+            if (!target) return JSON.stringify({ok:false, error:'no drop target at '+dropSel});
+            // Build File from base64
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const f = new File([bytes], fileName, {type: mime});
+            // If we found an input directly, set files via native setter + change
+            if (target.tagName === 'INPUT' && target.type === 'file') {
+                const dt = new DataTransfer();
+                dt.items.add(f);
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files').set;
+                setter.call(target, dt.files);
+                target.dispatchEvent(new Event('input', {bubbles:true}));
+                target.dispatchEvent(new Event('change', {bubbles:true}));
+                return JSON.stringify({ok:true, mode:'native-setter'});
+            }
+            // Otherwise synthesize drop events on the zone
+            const r = target.getBoundingClientRect();
+            const cx = r.left + r.width/2, cy = r.top + r.height/2;
+            const dt = new DataTransfer();
+            dt.items.add(f);
+            for (const t of ['dragenter','dragover','drop']) {
+                const ev = new DragEvent(t, {bubbles:true, cancelable:true, composed:true, clientX:cx, clientY:cy, dataTransfer:dt});
+                Object.defineProperty(ev, 'dataTransfer', {value: dt});
+                target.dispatchEvent(ev);
+                await new Promise(r => setTimeout(r, 80));
+            }
+            return JSON.stringify({ok:true, mode:'drop-synthesis'});
+        })(""" + json.dumps(drop_sel) + "," + json.dumps(file_name) + "," + json.dumps(file_b64) + "," + json.dumps("video/mp4") + ")"
+        rd = await eval_in_tab(ws_url, drop_js)
+        rd_val = rd.get("result", {}).get("value", "{}")
+        try:
+            rd_parsed = json.loads(rd_val) if isinstance(rd_val, str) else rd_val
+        except Exception:
+            rd_parsed = {"ok": False}
+        if not rd_parsed.get("ok"):
+            return [TextContent(type="text", text=f"tiktok_post_video: drop failed — {json.dumps(rd_parsed)}")]
+        steps.append(f"video dropped ({rd_parsed.get('mode')})")
+
+        # 3. Wait for upload to register (caption editor becomes available)
+        for _ in range(wait_upload):
+            await asyncio.sleep(1)
+            probe = await eval_in_tab(ws_url, f"!!document.querySelector({json.dumps(caption_sel)})")
+            if probe.get("result", {}).get("value"):
+                break
+        else:
+            return [TextContent(type="text", text=f"tiktok_post_video: upload editor never appeared after {wait_upload}s. Try a smaller file or check tiktok.com is logged in.")]
+        steps.append("caption editor visible")
+        await asyncio.sleep(1)
+
+        # 4. Fill caption — use Lexical/contentEditable path
+        cap_js = """(async function(sel, text) {
+            const el = document.querySelector(sel);
+            if (!el) return JSON.stringify({ok:false, error:'no caption editor'});
+            el.focus();
+            // Try contentEditable text insert via beforeinput chunks
+            const CHUNK = 24;
+            let i = 0;
+            while (i < text.length) {
+                const ev = new InputEvent('beforeinput', {bubbles:true, cancelable:true, composed:true, inputType:'insertText', data: text.slice(i, i+CHUNK)});
+                el.dispatchEvent(ev);
+                i += CHUNK;
+                await new Promise(r => setTimeout(r, 30));
+            }
+            const len = (el.innerText || el.textContent || '').length;
+            return JSON.stringify({ok: len >= Math.min(text.length, 5), readback_len: len, expected: text.length});
+        })(""" + json.dumps(caption_sel) + "," + json.dumps(caption_text) + ")"
+        rc = await eval_in_tab(ws_url, cap_js)
+        rc_val = rc.get("result", {}).get("value", "{}")
+        try:
+            rc_parsed = json.loads(rc_val) if isinstance(rc_val, str) else rc_val
+        except Exception:
+            rc_parsed = {"ok": False}
+        steps.append(f"caption filled (readback={rc_parsed.get('readback_len')} of {rc_parsed.get('expected')})")
+        await asyncio.sleep(1)
+
+        # 5. Optional privacy toggle (skip if public — that's default)
+        if privacy != "public":
+            priv_js = """(function(p) {
+                const want = p === 'friends' ? 'Friends' : 'Only you';
+                // TikTok privacy selector pattern: radio role with text content
+                const items = Array.from(document.querySelectorAll('[role=radio], button, label'));
+                const target = items.find(el => (el.innerText||'').trim() === want);
+                if (!target) return JSON.stringify({ok:false, error:'no privacy radio with text '+want});
+                target.click();
+                return JSON.stringify({ok:true});
+            })(""" + json.dumps(privacy) + ")"
+            await eval_in_tab(ws_url, priv_js)
+            steps.append(f"privacy → {privacy}")
+            await asyncio.sleep(0.5)
+
+        # 6. Click Post
+        post_js = """(function(sel) {
+            const all = Array.from(document.querySelectorAll(sel.replace(/:has-text\\([^)]*\\)/g, '')));
+            const want = all.find(b => /post/i.test(b.innerText || ''));
+            const btn = want || document.querySelector('button[data-e2e=post_video_button]') || document.querySelector('[data-tt=upload_post_btn]');
+            if (!btn) return JSON.stringify({ok:false, error:'no post button'});
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return JSON.stringify({ok:false, error:'post button disabled — upload may still be processing'});
+            btn.click();
+            return JSON.stringify({ok:true});
+        })(""" + json.dumps(post_sel) + ")"
+        rp = await eval_in_tab(ws_url, post_js)
+        rp_val = rp.get("result", {}).get("value", "{}")
+        try:
+            rp_parsed = json.loads(rp_val) if isinstance(rp_val, str) else rp_val
+        except Exception:
+            rp_parsed = {"ok": False}
+        if not rp_parsed.get("ok"):
+            return [TextContent(type="text", text=f"tiktok_post_video: post-click failed — {json.dumps(rp_parsed)}. Steps so far: {steps}")]
+        steps.append("post button clicked")
+
+        # 7. Wait for redirect to studio drafts / contents page
+        post_url = ""
+        for _ in range(30):
+            await asyncio.sleep(1)
+            cur = await eval_in_tab(ws_url, "location.href")
+            url_now = cur.get("result", {}).get("value", "")
+            if "/tiktokstudio/upload" not in url_now:
+                post_url = url_now
+                break
+        steps.append(f"final url: {post_url or '(still on upload page)'}")
+        try:
+            _playbook_record("tiktok.com", "tiktok_post_video", "ui_drive", True, kind="action", selector_pattern=drop_sel)
+        except Exception:
+            pass
+        return [TextContent(type="text", text=json.dumps({"ok": True, "steps": steps, "url": post_url}))]
 
     if name == "inject_on_new_document":
         # CDP Page.addScriptToEvaluateOnNewDocument — survives all navigations
