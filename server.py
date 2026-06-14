@@ -174,11 +174,44 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 #
 # Nothing is ever auto-applied. The marketplace data is ALWAYS just a
 # suggestion; the human author is the final gate.
-TELEMETRY_ENABLED = os.environ.get("WEBLOOM_TELEMETRY", "on").lower() in ("on", "true", "1", "yes")
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
+ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.2.0"
+ENGINE_VERSION = "0.3.0"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
+_CONFIG_FILE = Path.home() / ".webloom" / "config.json"
+
+
+def _load_config() -> dict:
+    try:
+        if _CONFIG_FILE.exists():
+            return json.loads(_CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_config(cfg: dict):
+    try:
+        _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    except Exception:
+        pass
+
+
+# OPT-IN OFF default — matches the public promise on /transparency.
+# Env var override (WEBLOOM_TELEMETRY=on|off) takes precedence for testing.
+# Persistent toggle: `python server.py telemetry on|off|preview` writes to
+# ~/.webloom/config.json. Once on, stays on across engine restarts.
+def _telemetry_pref() -> bool:
+    env = os.environ.get("WEBLOOM_TELEMETRY")
+    if env is not None:
+        return env.lower() in ("on", "true", "1", "yes")
+    cfg = _load_config()
+    return bool(cfg.get("telemetry", False))
+
+
+TELEMETRY_ENABLED = _telemetry_pref()
 
 
 # Auto-update / auto-heal / auto-share — the community learning loop.
@@ -281,6 +314,39 @@ def _send_telemetry_fire_forget(payload: dict):
         try:
             req = urllib.request.Request(
                 TELEMETRY_URL,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": f"webloom-engine/{ENGINE_VERSION}"},
+            )
+            urllib.request.urlopen(req, timeout=4).read()
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _send_engine_telemetry_fire_forget(tool: str, ok: bool, error_class: str | None, duration_ms: int):
+    """Engine-tool-level telemetry: one row per tool call. Always opt-in.
+
+    Payload is INTENTIONALLY tiny — no URLs, no selectors, no page content,
+    no anything that could leak a user's activity. Just "did `tool` succeed
+    or fail, in how many ms, on which engine version." Aggregated across all
+    opt-in installs into the immune-system signal.
+    """
+    if not TELEMETRY_ENABLED:
+        return
+    payload = {
+        "tool": str(tool)[:64],
+        "ok": bool(ok),
+        "error_class": (str(error_class)[:32] if error_class else None),
+        "duration_ms": int(max(0, min(duration_ms, 1_000_000))),
+        "engine_version": ENGINE_VERSION,
+        "anon_id": _get_anon_id(),
+        "ts": int(__import__("time").time()),
+    }
+    import threading, urllib.request
+    def _do():
+        try:
+            req = urllib.request.Request(
+                ENGINE_TELEMETRY_URL,
                 data=json.dumps(payload).encode(),
                 headers={"Content-Type": "application/json", "User-Agent": f"webloom-engine/{ENGINE_VERSION}"},
             )
@@ -2344,8 +2410,46 @@ async def call_tool(name: str, arguments: dict):
     if recipe_result is not None:
         return recipe_result
 
-    # Execute the real action and capture the result
-    result = await _execute_tool_action(name, arguments)
+    # Execute the real action and capture the result (with telemetry)
+    import time as _t
+    _start = _t.time()
+    _err_class: str | None = None
+    _ok = False
+    try:
+        result = await _execute_tool_action(name, arguments)
+        _ok = True
+    except Exception as e:
+        _err_class = type(e).__name__
+        # Best-effort: re-raise so MCP returns the error to the caller
+        try:
+            _send_engine_telemetry_fire_forget(name, False, _err_class, int((_t.time() - _start) * 1000))
+        except Exception:
+            pass
+        raise
+    finally:
+        if _ok:
+            # Inspect result for a soft-failure marker (tools return text like
+            # 'click: not interactable' or 'upload: failed' rather than raising)
+            soft_failed = False
+            try:
+                if result and isinstance(result, list):
+                    for item in result:
+                        if hasattr(item, "text"):
+                            low = (item.text or "").lower()
+                            if any(s in low for s in ("not interactable", "all_failed", "failed:", "error:", '"ok":false', '"ok": false')):
+                                soft_failed = True
+                            break
+            except Exception:
+                pass
+            try:
+                _send_engine_telemetry_fire_forget(
+                    name,
+                    not soft_failed,
+                    "soft_failure" if soft_failed else None,
+                    int((_t.time() - _start) * 1000),
+                )
+            except Exception:
+                pass
 
     # Auto-log to current recipe if recording (and not replaying)
     if not _replaying and recording.is_recording() and name in recording.ACTION_TOOLS:
@@ -7218,9 +7322,63 @@ async def main():
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 
+def _cli_telemetry(args: list[str]) -> int:
+    """`python server.py telemetry on|off|preview|status` — persist user pref."""
+    if not args:
+        print("usage: python server.py telemetry on|off|preview|status")
+        return 2
+    cmd = args[0].lower()
+    cfg = _load_config()
+    if cmd == "on":
+        cfg["telemetry"] = True
+        _save_config(cfg)
+        print("✓ engine telemetry ON")
+        print(f"  anon_id: {_get_anon_id()}")
+        print(f"  endpoint: {ENGINE_TELEMETRY_URL}")
+        print("  payload shape: {tool, ok, error_class, duration_ms, engine_version, anon_id, ts}")
+        print("  what's NEVER sent: URLs, page content, selectors, cookies, identity.")
+        print("  toggle off any time: python server.py telemetry off")
+        return 0
+    if cmd == "off":
+        cfg["telemetry"] = False
+        _save_config(cfg)
+        print("✓ engine telemetry OFF — engine sends zero rows.")
+        return 0
+    if cmd == "status":
+        env = os.environ.get("WEBLOOM_TELEMETRY")
+        if env is not None:
+            print(f"telemetry: {env.upper()} (env var WEBLOOM_TELEMETRY overrides config)")
+        else:
+            print(f"telemetry: {'ON' if cfg.get('telemetry') else 'OFF'} (~/.webloom/config.json)")
+        print(f"anon_id: {_get_anon_id()}")
+        return 0
+    if cmd == "preview":
+        # Dry-run: print one row the engine WOULD send next, without sending it
+        import time as _t
+        preview_row = {
+            "tool": "preview_call",
+            "ok": True,
+            "error_class": None,
+            "duration_ms": 42,
+            "engine_version": ENGINE_VERSION,
+            "anon_id": _get_anon_id(),
+            "ts": int(_t.time()),
+        }
+        print("preview row (NOT sent):")
+        print(json.dumps(preview_row, indent=2))
+        print(f"\nWould POST to: {ENGINE_TELEMETRY_URL}")
+        return 0
+    print(f"unknown subcommand: {cmd}")
+    return 2
+
+
 if __name__ == "__main__":
+    import sys as _sys
+    # CLI subcommands run BEFORE the MCP stdio loop
+    if len(_sys.argv) >= 2 and _sys.argv[1] == "telemetry":
+        _sys.exit(_cli_telemetry(_sys.argv[2:]))
+
     try:
-        import sys as _sys
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "_lib"))
         import bulletproof
