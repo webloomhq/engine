@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://webloom.run/thread-schema-v1.json",
+  "title": "WebLoom Thread",
+  "description": "Schema for *.thread.json files — site-specific knowledge packs the WebLoom engine merges into its playbook at read time.",
+  "type": "object",
+  "required": ["domain"],
+  "additionalProperties": true,
+  "properties": {
+    "domain": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*[a-z0-9]$",
+      "description": "Canonical domain (lowercase, no www)."
+    },
+    "name": { "type": "string" },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semver. Bumped on every accepted patch."
+    },
+    "author": { "type": "string" },
+    "authored_by": { "type": "array", "items": { "type": "string" } },
+    "license": { "type": "string" },
+    "tier": {
+      "type": "string",
+      "enum": ["stub", "mapped", "starter", "proven", "pro", "verified", "battle_hard"]
+    },
+    "source_url": { "type": "string", "format": "uri" },
+    "framework": { "type": "string" },
+    "frameworks_detected": { "type": "array", "items": { "type": "string" } },
+    "anti_bot_verdict": { "type": "string" },
+    "anti_bot_signals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string" },
+          "confidence": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "default_strategy": { "type": "string" },
+    "notes": { "type": "array", "items": { "type": "string" } },
+    "quirks": { "type": "object", "additionalProperties": { "type": "string" } },
+
+    "selectors": {
+      "type": "object",
+      "description": "Named selector map authored by humans/AI from the AX scan. KEY = friendly name (e.g. 'title_input'), VALUE = CSS or fiber-path selector.",
+      "additionalProperties": { "type": "string" }
+    },
+    "endpoints": {
+      "type": "object",
+      "description": "Named endpoint map authored from captured network traffic. KEY = friendly name (e.g. 'upload_cover_url'), VALUE = URL or URL template.",
+      "additionalProperties": { "type": "string" }
+    },
+    "actions": {
+      "type": "object",
+      "description": "Named action recipes. KEY = action name (e.g. 'submit_form'), VALUE = {type, event, target, ...}.",
+      "additionalProperties": { "type": "object" }
+    },
+    "helpers": {
+      "type": "object",
+      "description": "Named JS helper functions evaluated by the engine at runtime. KEY = helper name, VALUE = JS source string.",
+      "additionalProperties": { "type": "string" }
+    },
+
+    "click_log": {
+      "type": "object",
+      "description": "Per-descriptor click history. KEY = element descriptor, VALUE = {strategy, successes, failures, last_at, ...}.",
+      "additionalProperties": { "type": "object" }
+    },
+    "action_log": {
+      "type": "object",
+      "description": "Per-descriptor action history (kinds beyond click). Same shape as click_log.",
+      "additionalProperties": { "type": "object" }
+    },
+
+    "preflight": {
+      "type": "array",
+      "description": "Checks that must pass before a recipe runs. Drift detection.",
+      "items": {
+        "type": "object",
+        "required": ["name", "kind", "probe", "expected"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "type": "string" },
+          "probe": { "type": "string" },
+          "expected": { "type": "string" }
+        }
+      }
+    },
+    "proven_actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["descriptor", "strategy", "successes"],
+        "properties": {
+          "descriptor": { "type": "string" },
+          "kind": { "type": "string" },
+          "strategy": { "type": "string" },
+          "selector_pattern": { "type": "string" },
+          "successes": { "type": "integer", "minimum": 0 },
+          "failures": { "type": "integer", "minimum": 0 },
+          "last_at": { "type": "integer" }
+        }
+      }
+    },
+    "session_recipes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "actions"],
+        "properties": {
+          "name": { "type": "string" },
+          "actions": { "type": "array" },
+          "parameters": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "escalation_log": {
+      "type": "array",
+      "description": "Site-specific 'if X fails, try Y' chains. Authored from real RE work. Renders on /thread/[id].",
+      "items": {
+        "type": "object",
+        "required": ["action", "tried"],
+        "properties": {
+          "action": { "type": "string" },
+          "tried": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["strategy", "outcome"],
+              "properties": {
+                "strategy": { "type": "string" },
+                "outcome": { "type": "string", "enum": ["proven", "failed", "unstable"] },
+                "notes": { "type": "string" }
+              }
+            }
+          },
+          "lesson": { "type": "string" },
+          "by": { "type": "string" },
+          "last_verified_at": { "type": "integer" }
+        }
+      }
+    },
+
+    "captured_endpoints": {
+      "type": "array",
+      "description": "Raw network harvest from the seed crawl. NOT named — first-class merge field that engine helpers consult by URL pattern when no named endpoints[] entry matches.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string" },
+          "type": { "type": "string" },
+          "method": { "type": "string" },
+          "duration": { "type": "number" },
+          "transferSize": { "type": "number" }
+        }
+      }
+    },
+    "ax_snapshot": {
+      "type": "array",
+      "description": "Raw AX-tree dump from the seed crawl (first ~30 visible elements). Hint surface for vision_check + scan_tab.",
+      "items": { "type": "string" }
+    },
+    "page_indicators": {
+      "type": "object",
+      "description": "Boolean signals from the seed crawl about page shape — drives default upload-strategy selection.",
+      "properties": {
+        "has_password_input": { "type": "boolean" },
+        "has_file_input": { "type": "boolean" },
+        "has_label_wrapped_file": { "type": "boolean" },
+        "has_drop_zone": { "type": "boolean" },
+        "iframe_count": { "type": "integer" }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "properties": {
+        "author_handle": { "type": "string" },
+        "claimed_at": { "type": "integer" },
+        "uptime_30d": { "type": "number" },
+        "install_success_30d": { "type": "number" },
+        "last_drift_at": { "type": "integer" },
+        "subscribers": { "type": "integer" },
+        "monthly_price_cents": { "type": "integer" }
+      }
+    },
+    "has_native_api": {
+      "type": "boolean",
+      "description": "True when the domain has a first-class public REST API / SDK. Caps tier at 'mapped'."
+    },
+    "patch_log": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ts": { "type": "integer" },
+          "kind": { "type": "string" },
+          "descriptor": { "type": "string" },
+          "old": { "type": "string" },
+          "new": { "type": "string" },
+          "corroborated_count": { "type": "integer" }
+        }
+      }
+    },
+    "created_at": { "type": "integer" },
+    "created_by": { "type": "string" }
+  }
+}

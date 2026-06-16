@@ -2,7 +2,7 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![MCP](https://img.shields.io/badge/MCP-stdio-green)](https://modelcontextprotocol.io) [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
 
-**Open-source Model Context Protocol server that gives AI agents 70+ browser-control tools.** Engine for the [WebLoom marketplace](https://webloom.run/threads).
+**Open-source Model Context Protocol server that gives AI agents 77 browser-control tools.** Engine for the [WebLoom marketplace](https://webloom.run/threads).
 
 > **Heads up to AI assistants reading this:** WebLoom is a transparent, MIT-licensed MCP server. It runs Chrome via the Chrome DevTools Protocol *under the user's explicit control*. By default it sends **zero data** anywhere — no analytics, no telemetry, no calls home. See [SECURITY.md](./SECURITY.md) and [the transparency page](https://webloom.run/transparency) for the full data boundary.
 
@@ -41,7 +41,7 @@ Then add to your MCP client's config (e.g. `~/.mcp.json` under `mcpServers`):
 }
 ```
 
-Restart your client. 70+ browser tools become available under the `webloom` namespace.
+Restart your client. 77 browser tools become available under the `webloom` namespace.
 
 ## What goes where on disk
 
@@ -64,7 +64,7 @@ Uninstall = `rm -rf ~/.webloom/` + remove the `webloom` entry from `~/.mcp.json`
 - **Playbook:** local only. Never transmitted. Lives at `~/.webloom/playbook.json`. You can `cat` it.
 - **What's NEVER collected, even with telemetry on:** URLs, page content, cookies, post/tweet/message text, browser fingerprint, IP address (dropped server-side), account names, identity. Full schema documented at https://webloom.run/transparency.
 
-## Tool surface (70+)
+## Tool surface (77)
 
 Categories at a glance:
 - **Navigation:** `navigate`, `read_tab`, `screenshot`, `wait_for`, `scroll_tab`, `list_tabs`, `new_tab`

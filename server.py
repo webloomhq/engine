@@ -1718,11 +1718,69 @@ THREADS_DIR = Path(os.environ.get("WEBLOOM_THREADS", str(Path.home() / ".webloom
 PROJECT_THREADS_DIR = Path(__file__).parent / "threads"  # bundled with the server (built-in default Threads)
 
 
+_THREAD_VALIDATE_KEYS = {
+    # Required minimum
+    "domain",
+    # Named (authored) fields — engine merges these into the live playbook
+    "selectors", "endpoints", "actions", "helpers",
+    "click_log", "action_log",
+    # Raw harvest fields — first-class, consulted by tool handlers as hints
+    "captured_endpoints", "ax_snapshot", "page_indicators",
+    # Other supported fields
+    "name", "version", "author", "authored_by", "license", "tier",
+    "source_url", "framework", "frameworks_detected",
+    "anti_bot_verdict", "anti_bot_signals", "default_strategy",
+    "notes", "quirks", "preflight", "proven_actions", "session_recipes",
+    "escalation_log", "claim", "has_native_api", "patch_log",
+    "created_at", "created_by", "open_for_claim", "category_hint",
+    "use_cases", "states", "pacing", "source_domain_in_playbook",
+}
+
+
+def _validate_thread(data: dict) -> list[str]:
+    """Best-effort schema validation. Returns warnings (not errors) so an
+    imperfect Thread still loads — but malformed fields surface to the user.
+
+    Authoritative schema at ./thread-schema.json. This helper is a tight
+    subset that doesn't require the jsonschema dep.
+    """
+    warns: list[str] = []
+    if not isinstance(data, dict):
+        warns.append("not an object")
+        return warns
+    domain = data.get("domain")
+    if not domain or not isinstance(domain, str):
+        warns.append("missing or invalid 'domain'")
+    elif not re.fullmatch(r"[a-z0-9][a-z0-9.-]*[a-z0-9]", domain):
+        warns.append(f"domain '{domain}' is not canonical (expected lowercase, no www)")
+    # Named maps must be objects (not arrays) — this is THE bug that the v0.3.0
+    # external review caught: generator emitted captured_endpoints[] but the
+    # merge engine reads endpoints{}. Surface the mismatch loudly.
+    for k in ("selectors", "endpoints", "actions", "helpers", "click_log", "action_log", "quirks", "claim"):
+        if k in data and not isinstance(data[k], dict):
+            warns.append(f"'{k}' must be a JSON object (dict), got {type(data[k]).__name__}")
+    # Raw harvest arrays
+    for k in ("captured_endpoints", "ax_snapshot", "notes", "frameworks_detected", "anti_bot_signals",
+              "preflight", "proven_actions", "session_recipes", "escalation_log", "patch_log",
+              "states", "use_cases", "authored_by"):
+        if k in data and not isinstance(data[k], list):
+            warns.append(f"'{k}' must be a JSON array, got {type(data[k]).__name__}")
+    # Unknown keys (whitelisted — extra metadata is OK, just noted)
+    unknown = set(data.keys()) - _THREAD_VALIDATE_KEYS
+    if unknown:
+        warns.append(f"unknown fields: {sorted(unknown)} — will load but not consumed by engine")
+    return warns
+
+
 def _load_thread_file(path: Path) -> dict | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not data.get("domain"):
             return None
+        warns = _validate_thread(data)
+        if warns:
+            # Stderr only — never stdout (would corrupt MCP stdio framing)
+            print(f"[webloom] Thread {path.name}: " + "; ".join(warns), file=__import__('sys').stderr)
         return data
     except Exception:
         return None
@@ -1769,6 +1827,13 @@ def load_playbook() -> dict:
 
     merged = {}
     all_domains = set(live.keys()) | set(threads.keys())
+    # Per-domain raw-harvest fields surface from the Thread side. Live can
+    # extend them — e.g. the engine may capture more endpoints over time and
+    # write them back to the live playbook — but the Thread's seed values
+    # remain visible.
+    RAW_HARVEST_LIST_FIELDS = {"captured_endpoints", "ax_snapshot"}
+    NAMED_DICT_FIELDS = {"selectors", "endpoints", "actions", "helpers", "click_log", "action_log", "quirks"}
+
     for dom in all_domains:
         t = threads.get(dom, {})
         l = live.get(dom, {})
@@ -1791,11 +1856,26 @@ def load_playbook() -> dict:
                         seen.add(note)
                         combined.append(note)
                 m["notes"] = combined
-            elif k == "click_log":
-                # live wins per-key, but Thread's entries persist for keys live doesn't cover
-                merged_log = dict(t.get("click_log", {}) or {})
-                merged_log.update(l.get("click_log", {}) or {})
-                m["click_log"] = merged_log
+            elif k in NAMED_DICT_FIELDS:
+                # Named-map merge: live wins per-key, thread keys persist if
+                # live doesn't override. Defensive: skip if either side is
+                # malformed (validator already warned at load time).
+                t_map = t.get(k) if isinstance(t.get(k), dict) else {}
+                l_map = v if isinstance(v, dict) else {}
+                m[k] = {**t_map, **l_map}
+            elif k in RAW_HARVEST_LIST_FIELDS:
+                # Raw harvest lists: concat thread + live, de-dup on equality.
+                # Keeps Thread's seed harvest visible even if user accumulates
+                # more captures locally.
+                seen_key = set()
+                combined: list = []
+                for item in (t.get(k) or []) + (v or []):
+                    key_repr = json.dumps(item, sort_keys=True) if isinstance(item, dict) else str(item)
+                    if key_repr in seen_key:
+                        continue
+                    seen_key.add(key_repr)
+                    combined.append(item)
+                m[k] = combined
             else:
                 m[k] = v
         m["_thread_present"] = dom in threads
@@ -7613,11 +7693,19 @@ if __name__ == "__main__":
     if len(_sys.argv) >= 2 and _sys.argv[1] == "telemetry":
         _sys.exit(_cli_telemetry(_sys.argv[2:]))
 
+    # Optional process-hygiene wrapper. Only loaded when running from the
+    # MCP Studio monorepo where _lib/bulletproof.py exists. On a fresh
+    # buyer install (cloned from webloomhq/engine) it is silently absent —
+    # not a warning, not an error. This used to print a noisy stderr message
+    # on every install that read as a bug.
     try:
         from pathlib import Path as _Path
-        _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "_lib"))
-        import bulletproof
-        bulletproof.protect("webloom")
-    except Exception as _e:
-        print(f"[webloom] bulletproof unavailable: {_e}", file=__import__('sys').stderr)
+        _bulletproof_dir = _Path(__file__).resolve().parent.parent.parent / "_lib"
+        if (_bulletproof_dir / "bulletproof.py").exists():
+            _sys.path.insert(0, str(_bulletproof_dir))
+            import bulletproof
+            bulletproof.protect("webloom")
+    except Exception:
+        # Hygiene is best-effort. Engine runs identically without it.
+        pass
     asyncio.run(main())

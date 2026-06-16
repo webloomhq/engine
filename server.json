@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.webloomhq/engine",
   "title": "WebLoom",
-  "description": "Open-source MCP server giving AI agents 70+ browser-control tools. Drives YOUR real Chrome with YOUR cookies, your session, your fingerprint (CDP attach, no headless spawn). Per-site protocol cracks (X transaction-id, TikTok signer). Multi-strategy fallback ladders for click, fill, upload across React/Lexical/Draft.js/Quill. Optional marketplace of community-authored Thread packs at webloom.run. Telemetry off by default.",
+  "description": "Open-source MCP server giving AI agents 77 browser-control tools. Drives YOUR real Chrome with YOUR cookies, your session, your fingerprint (CDP attach, no headless spawn). Per-site protocol cracks (X transaction-id, TikTok signer). Multi-strategy fallback ladders for click, fill, upload across React/Lexical/Draft.js/Quill. Optional marketplace of community-authored Thread packs at webloom.run. Telemetry off by default.",
   "version": "0.3.0",
   "websiteUrl": "https://webloom.run",
   "repository": {

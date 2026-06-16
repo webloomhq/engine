@@ -1,47 +1,54 @@
-# WebLoom seed Thread sites — launch list v1.
+# WebLoom seed Thread sites — launch list v2 (anti-bot tagged 2026-06-14).
 # These are public/anonymous-accessible sites for headless seed generation.
 # Auth-gated sites (KDP, D2D, exchanges) need hand-crafted Threads.
+#
+# Tags:
+#   #anti-bot — known to fingerprint headless Chrome → seed Thread will be
+#               near-empty + flagged. Crawl with real-Chrome session for
+#               useful output. Skipped from the default launch batch.
+#   #api-native — domain has a first-class public REST API/SDK. Thread will
+#                 be auto-flagged has_native_api:true, capped at "mapped" tier.
 
 # Discovery & community
 producthunt.com
-github.com
+github.com                                  #api-native
 ycombinator.com
 news.ycombinator.com
-reddit.com
+reddit.com                                  #anti-bot
 stackoverflow.com
 medium.com
 substack.com
 dev.to
 
 # Productivity / SaaS landing
-notion.so
-linear.app
-vercel.com
-netlify.com
-cloudflare.com
-supabase.com
-railway.app
+notion.so                                   #api-native
+linear.app                                  #api-native
+vercel.com                                  #api-native
+netlify.com                                 #api-native
+cloudflare.com                              #api-native
+supabase.com                                #api-native
+railway.app                                 #api-native
 
 # AI / agents
-anthropic.com
-openai.com
-huggingface.co
-replicate.com
+anthropic.com                               #api-native
+openai.com                                  #api-native
+huggingface.co                              #api-native
+replicate.com                               #api-native
 cursor.sh
 
 # Web3 / quests / exchanges (landing pages only — auth-walled flows need hand-crafted)
 galxe.com
 layer3.xyz
 zealy.io
-bitget.com
-mexc.com
-binance.com
-kucoin.com
+bitget.com                                  #anti-bot
+mexc.com                                    #anti-bot
+binance.com                                 #anti-bot
+kucoin.com                                  #anti-bot
 
 # Selling / marketplace
-gumroad.com
+gumroad.com                                 #api-native
 etsy.com
-shopify.com
+shopify.com                                 #api-native
 
 # Productivity content
 quora.com

@@ -38,7 +38,7 @@ Imagine YouTube but for web-automation knowledge. Anyone who uses a website dail
 ### 3.1 The Engine
 
 - Controls real logged-in Chrome via CDP (and eventually via a companion Extension — see §10)
-- Ships with ~50 tools covering: click, fill, type (3 modes), upload (4 strategies), key events, scroll, scan (ax tree + full), screenshot, navigate, vision Layer 2.5, recipes, network capture, TOTP autofill, profile import/export, stealth flags, React/Redux/AUI/Backbone awareness, touch events, direct XHR upload, playbook learning
+- Ships with 77 tools covering: click, fill, type (3 modes), upload (4 strategies), key events, scroll, scan (ax tree + full), screenshot, navigate, vision Layer 2.5, recipes, network capture, TOTP autofill, profile import/export, stealth flags, React/Redux/AUI/Backbone awareness, touch events, direct XHR upload, playbook learning
 - **No real-cursor / pyautogui ever.** Layer 3 permanently disabled. If DOM/CDP/vision fail, hand off to user.
 - Stays focused. Site-specific complexity goes into Threads.
 
@@ -116,7 +116,7 @@ WebLoom supports two browser-control modes:
 
 ### 5.1 Debug Chrome mode (current, v0)
 - User launches Chrome via `launch_session` — WebLoom spawns it with `--remote-debugging-port` and `--user-data-dir=<their profile>`
-- Full CDP power, isTrusted events, all 50 tools work
+- Full CDP power, isTrusted events, all 77 tools work
 - Friction: requires closing existing Chrome before launching the debug instance
 - Target audience: power users, agents, Thread creators, dev workflows
 

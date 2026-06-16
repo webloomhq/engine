@@ -31,74 +31,10 @@ sys.path.insert(0, str(HERE))
 import server  # noqa: E402
 
 
-# ── framework detection probe ─────────────────────────────────────────────────
-FRAMEWORK_PROBE_JS = r"""(function() {
-    const findFiberKey = (node) => {
-        if (!node) return null;
-        for (const k of Object.keys(node)) {
-            if (k.startsWith('__reactFiber')) return 'react-17+';
-            if (k.startsWith('__reactInternalInstance')) return 'react-16';
-            if (k.startsWith('__reactProps')) return 'react-props';
-        }
-        return null;
-    };
-    // Walk multiple candidate nodes — fiber keys live on mounted children,
-    // not always document.body. Hit common SPA roots first.
-    const candidates = [
-        document.querySelector('#__next'),
-        document.querySelector('#root'),
-        document.querySelector('#app'),
-        document.querySelector('#__nuxt'),
-        document.querySelector('[data-reactroot]'),
-        document.body,
-        document.documentElement,
-    ];
-    // Also try the first 50 deep elements (some React apps mount into arbitrary divs)
-    const allEls = document.querySelectorAll('div, main, section, article');
-    for (let i = 0; i < Math.min(50, allEls.length); i++) candidates.push(allEls[i]);
-
-    const detected = [];
-    for (const c of candidates) {
-        const r = findFiberKey(c);
-        if (r) { detected.push(r); break; }
-    }
-    // React DevTools global hook is the most reliable signal
-    if (window.__REACT_DEVTOOLS_GLOBAL_HOOK__) {
-        const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-        if (hook.renderers && hook.renderers.size > 0) detected.push('react-devtools-renderer');
-    }
-    if (document.querySelector('#__next')) detected.push('nextjs-root');
-    if (document.querySelector('#__nuxt')) detected.push('nuxt-root');
-    if (window.__REDUX_DEVTOOLS_EXTENSION__) detected.push('redux-devtools-installed');
-    if (window.store && typeof window.store.dispatch === 'function') detected.push('redux-global-store');
-    if (window.A && (window.A.declarative || window.A.version)) detected.push('amazon-aui');
-    if (window.Backbone) detected.push('backbone-' + (window.Backbone.VERSION || '?'));
-    if (window.Vue) detected.push('vue');
-    if (document.querySelector('[ng-version]')) {
-        detected.push('angular-' + document.querySelector('[ng-version]').getAttribute('ng-version'));
-    }
-    if (document.querySelector('[data-radix-popper-content-wrapper], [data-state]')) detected.push('radix');
-    if (document.querySelector('[data-headlessui-state], [data-headlessui-portal]')) detected.push('headlessui');
-    // Tighter Svelte check: real svelte builds have hashed class prefixes like svelte-abc123
-    if (Array.from(document.querySelectorAll('[class*="svelte-"]')).filter(el => /\bsvelte-[a-z0-9]{6,}/.test(el.className.toString())).length > 3) detected.push('svelte');
-    if (document.querySelector('[data-server-rendered]')) detected.push('nuxt-or-vue-ssr');
-    if (document.querySelector('next-route-announcer')) detected.push('nextjs');
-    if (window.__NEXT_DATA__) detected.push('nextjs-data');
-    if (window.__NUXT__) detected.push('nuxt');
-    if (window.P && window.P.when && window.P.modules) detected.push('amazon-p-module-loader');
-    return JSON.stringify({
-        frameworks: detected,
-        title: document.title,
-        url: location.href,
-        ready: document.readyState,
-        has_password_input: !!document.querySelector('input[type=password]'),
-        has_file_input: !!document.querySelector('input[type=file]'),
-        has_label_wrapped_file: !!document.querySelector('label input[type=file][hidden], label input[type=file].sr-only'),
-        has_drop_zone: !!document.querySelector('[ondrop], [data-dropzone], .dropzone'),
-        has_iframe_count: document.querySelectorAll('iframe').length,
-    });
-})()"""
-
+# NOTE: A historical FRAMEWORK_PROBE_JS module-level constant used to live
+# here. It was never called — crawl_one() uses server.FRAMEWORK_DETECT_JS as
+# the authoritative version. Removed 2026-06-14 after external review flagged
+# it as drift.
 
 # Generic visible-element scan reused from server.SCAN_AX_JS
 def _free_port() -> int:
@@ -295,6 +231,15 @@ async def crawl_one(port: int, url: str, wait_seconds: float = 4.0) -> dict | No
             "default_strategy": default_strategy,
             "notes": notes,
             "quirks": quirks,
+            # ── Authored fields (named maps) — empty at seed time; an
+            #    author/AI fills these in by interpreting the raw harvest
+            #    below. Engine merge consumes them as first-class.
+            "selectors": {},
+            "endpoints": {},
+            "actions": {},
+            "helpers": {},
+            # ── Raw harvest fields — first-class merge surface. Engine
+            #    helpers consult these as hints when no named entry matches.
             "ax_snapshot": ax_lines,
             "captured_endpoints": endpoints,
             "page_indicators": {
@@ -324,8 +269,22 @@ async def main_async(args):
     if args.sites:
         for line in Path(args.sites).read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
-                sites.append(_normalize_site(line))
+            if not line or line.startswith("#"):
+                continue
+            # Inline tags like '#anti-bot' or '#api-native' after the domain
+            # are honored by default: skip anti-bot (would yield empty Thread)
+            # and skip api-native (better served by official SDK).
+            domain_part = line.split("#")[0].strip()
+            tags = {t.strip() for t in line.split("#")[1:] if t.strip()}
+            if not domain_part:
+                continue
+            if "anti-bot" in tags and not args.include_anti_bot:
+                print(f"[seed] skip {domain_part} (tag: anti-bot — needs real Chrome session)")
+                continue
+            if "api-native" in tags and not args.include_api_native:
+                print(f"[seed] skip {domain_part} (tag: api-native — use their SDK)")
+                continue
+            sites.append(_normalize_site(domain_part))
     for s in args.site or []:
         sites.append(_normalize_site(s))
     sites = [s for s in sites if s]
@@ -362,17 +321,24 @@ async def main_async(args):
         print("[seed] Chrome did not start.")
         proc.terminate()
         return 1
+    skipped = 0
     try:
         for url in sites:
             domain = _domain_from(url)
+            out_path = out_dir / f"{domain}.thread.json"
+            if args.skip_existing and out_path.exists():
+                skipped += 1
+                print(f"[seed] skip {domain} (already exists)")
+                continue
             print(f"[seed] crawling {domain} ...")
             t = await crawl_one(port, url, wait_seconds=args.wait_seconds)
             if t is None or "error" in t:
                 print(f"  failed: {t.get('error') if t else 'unknown'}")
                 continue
-            out_path = out_dir / f"{domain}.thread.json"
             out_path.write_text(json.dumps(t, indent=2), encoding="utf-8")
             print(f"  wrote {out_path}  framework={t['framework']}  notes={len(t['notes'])}")
+        if skipped:
+            print(f"[seed] {skipped} domain(s) skipped (--skip-existing)")
     finally:
         try:
             for u, conn in list(server._cdp_pool.items()):
@@ -392,6 +358,9 @@ def main():
     p.add_argument("--sites", help="Path to a text file with one site per line")
     p.add_argument("--out-dir", help="Output directory (default: ~/.webloom/threads)")
     p.add_argument("--wait-seconds", type=float, default=4.0, help="Max seconds to wait for each page to load")
+    p.add_argument("--skip-existing", action="store_true", help="Skip domains that already have a .thread.json in the output dir. Lets you resume after a crash without re-crawling completed sites.")
+    p.add_argument("--include-anti-bot", action="store_true", help="Include sites tagged '#anti-bot' in the seed list. Off by default — these yield near-empty Threads in headless and need a real Chrome session.")
+    p.add_argument("--include-api-native", action="store_true", help="Include sites tagged '#api-native'. Off by default — these are better served by the site's official SDK.")
     args = p.parse_args()
     sys.exit(asyncio.run(main_async(args)))
 
