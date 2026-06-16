@@ -7266,20 +7266,64 @@ async def _execute_tool_action(name: str, arguments: dict):
         steps.append(f"caption filled (readback={rc_parsed.get('readback_len')} of {rc_parsed.get('expected')})")
         await asyncio.sleep(1)
 
-        # 5. Optional privacy toggle (skip if public — that's default)
-        if privacy != "public":
-            priv_js = """(function(p) {
-                const want = p === 'friends' ? 'Friends' : 'Only you';
-                // TikTok privacy selector pattern: radio role with text content
-                const items = Array.from(document.querySelectorAll('[role=radio], button, label'));
-                const target = items.find(el => (el.innerText||'').trim() === want);
-                if (!target) return JSON.stringify({ok:false, error:'no privacy radio with text '+want});
-                target.click();
-                return JSON.stringify({ok:true});
-            })(""" + json.dumps(privacy) + ")"
-            await eval_in_tab(ws_url, priv_js)
-            steps.append(f"privacy → {privacy}")
-            await asyncio.sleep(0.5)
+        # 5. Privacy toggle — ALWAYS run, because TikTok Studio's UI default
+        # varies by account (some default to "Only me", others to "Everyone").
+        # Set explicitly BEFORE Post; if you set it AFTER, the video lands in
+        # "Content under review" and TikTok's backend rejects further privacy
+        # changes for up to 12h. Verified live on @auralalchemy 2026-06-16.
+        want_label = {"public": "Everyone", "friends": "Friends", "private": "Only me"}.get(privacy, "Everyone")
+        priv_js = """(async function(want) {
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            // 1. Find the current privacy trigger — a button whose text matches one of the 3 privacy labels
+            const labels = ['Everyone', 'Friends', 'Only me'];
+            const buttons = Array.from(document.querySelectorAll('button')).filter(b => b.offsetWidth > 0);
+            const trigger = buttons.find(b => labels.includes((b.innerText || '').trim()));
+            if (!trigger) return JSON.stringify({ok:false, error:'no privacy trigger button visible — upload form may still be loading'});
+            const currentLabel = (trigger.innerText || '').trim();
+            if (currentLabel === want) {
+                return JSON.stringify({ok:true, already:want, skipped:true});
+            }
+            // 2. Click trigger with full event sequence (TUX dropdowns gate on pointerdown)
+            const fireSeq = (el) => {
+                const r = el.getBoundingClientRect();
+                const cx = r.left + r.width/2, cy = r.top + r.height/2;
+                for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+                    el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, composed:true, view:window, clientX:cx, clientY:cy, button:0, buttons:1}));
+                }
+            };
+            trigger.scrollIntoView({block:'center'});
+            fireSeq(trigger);
+            await sleep(400);
+            // 3. Find the opened dropdown/dialog and click the desired option inside it
+            const dlg = document.querySelector('[role=dialog]:not([aria-hidden=true])') || document.querySelector('.Dropdown__content');
+            if (!dlg) return JSON.stringify({ok:false, error:'dropdown did not open after clicking trigger', current:currentLabel});
+            let optionTarget = null;
+            for (const el of dlg.querySelectorAll('*')) {
+                if (el.children.length === 0 && (el.innerText||'').trim() === want) {
+                    let p = el;
+                    while (p && p !== dlg && p.tagName !== 'BUTTON' && getComputedStyle(p).cursor !== 'pointer') p = p.parentElement;
+                    if (p && p !== dlg) { optionTarget = p; break; }
+                }
+            }
+            if (!optionTarget) return JSON.stringify({ok:false, error:'option '+want+' not in opened dropdown', dialog_text:dlg.innerText.slice(0,200)});
+            fireSeq(optionTarget);
+            await sleep(500);
+            // 4. Verify — find the trigger again, check its label
+            const newTrigger = Array.from(document.querySelectorAll('button')).filter(b => b.offsetWidth > 0).find(b => labels.includes((b.innerText || '').trim()));
+            const verified = newTrigger && (newTrigger.innerText || '').trim() === want;
+            return JSON.stringify({ok:!!verified, was:currentLabel, now: newTrigger ? newTrigger.innerText.trim() : null, target:want});
+        })(""" + json.dumps(want_label) + ")"
+        rpv = await eval_in_tab(ws_url, priv_js)
+        rpv_val = rpv.get("result", {}).get("value", "{}")
+        try:
+            rpv_parsed = json.loads(rpv_val) if isinstance(rpv_val, str) else rpv_val
+        except Exception:
+            rpv_parsed = {"ok": False}
+        if rpv_parsed.get("ok"):
+            steps.append(f"privacy set: {rpv_parsed.get('was')} → {rpv_parsed.get('now') or want_label}")
+        else:
+            steps.append(f"privacy toggle returned: {rpv_parsed.get('error') or 'unknown'} — proceeding (will post at current setting)")
+        await asyncio.sleep(1)
 
         # 6. Click Post
         post_js = """(function(sel) {
