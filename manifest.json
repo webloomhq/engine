@@ -1,0 +1,29 @@
+{
+  "manifest_version": "0.2",
+  "name": "webloom",
+  "display_name": "WebLoom",
+  "description": "77 browser-control tools that drive YOUR real Chrome via CDP. Real session, real cookies, real fingerprint. Multi-strategy fallback ladders (5 upload paths, framework-aware setters for React/Lexical/Draft.js/Quill). Per-site protocol cracks (X transaction-id, TikTok signer). Optional marketplace of community-authored Thread packs at webloom.run. Telemetry off by default.",
+  "version": "0.3.0",
+  "author": { "name": "MarStudio", "email": "nanomarche@gmail.com" },
+  "license": "MIT",
+  "homepage": "https://webloom.run",
+  "repository": { "type": "git", "url": "https://github.com/webloomhq/engine" },
+  "documentation": "https://webloom.run/docs",
+  "support": "https://github.com/webloomhq/engine/issues",
+  "keywords": [
+    "browser", "browser-automation", "chrome", "cdp", "mcp",
+    "claude", "claude-code", "cursor", "ai-agents",
+    "web-automation", "marketplace", "threads"
+  ],
+  "server": {
+    "type": "python",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "python",
+      "args": ["${__dirname}/server.py"],
+      "env": {
+        "WEBLOOM_TELEMETRY": "off"
+      }
+    }
+  }
+}
