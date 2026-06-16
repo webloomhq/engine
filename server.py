@@ -16,7 +16,7 @@ shared, and sold without touching engine code.
 import json
 import os
 import re
-import base64
+pass  # base64 imported at module level
 import asyncio
 import subprocess
 import urllib.request
@@ -3486,7 +3486,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         # synthetic events. The native HTMLInputElement.files setter is the
         # path React DOES track via its descriptor-injection magic.
         if react_input:
-            import base64, mimetypes
+            import mimetypes
             file_blobs = []
             total = 0
             for fp in abs_files:
@@ -3622,7 +3622,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         # a real picker-supplied File, which is enough to make Amazon's
         # multipart upload succeed in most cases.
         if inject_input:
-            import base64, mimetypes
+            import mimetypes
             file_payloads = []
             total_bytes = 0
             for f in abs_files:
@@ -3794,7 +3794,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         # Beats React-controlled inputs that ignore programmatically-set FileList.
         # Use this when Strategy A drops CDP on Windows and Strategy B doesn't wake React.
         if drop_target:
-            import base64, mimetypes
+            import mimetypes
             file_payloads = []
             total_bytes = 0
             for f in abs_files:
@@ -5471,7 +5471,7 @@ async def _execute_tool_action(name: str, arguments: dict):
 
     # ── #1 VISION FALLBACK ──────────────────────────────────────────────
     if name == "vision_check":
-        import base64
+        pass  # base64 imported at module level
         question = arguments["question"]
         include_coords = bool(arguments.get("include_coords", True))
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -5848,7 +5848,7 @@ async def _execute_tool_action(name: str, arguments: dict):
 
     # ── SWARM_RUN — 2-role multi-agent (Driver + Watcher) ──────────────
     if name == "swarm_run":
-        import base64, time as _t
+        import time as _t
         goal = arguments["goal"]
         thread_domain = arguments.get("thread_domain") or ""
         max_minutes = int(arguments.get("max_minutes", 8))
@@ -6125,7 +6125,7 @@ async def _execute_tool_action(name: str, arguments: dict):
 
     # ── VISUAL DIFF PREFLIGHT ────────────────────────────────────────────
     if name == "visual_diff_preflight":
-        import base64
+        pass  # base64 imported at module level
         selector = arguments["selector"]
         anchor_name = arguments["anchor_name"]
         threshold = float(arguments.get("threshold", 0.85))
@@ -7356,7 +7356,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}))]
 
     if name == "xhr_upload":
-        import base64, mimetypes
+        import mimetypes
         url = arguments["url"]
         files = arguments.get("files", [])
         fields = arguments.get("fields", {}) or {}
