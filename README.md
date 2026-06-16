@@ -1,24 +1,35 @@
-# WebLoom
+# WebLoom Engine
 
-**Browser automation MCP for AI agents. Engine for the [WebLoom Atelier](https://webloom.run) marketplace.**
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![MCP](https://img.shields.io/badge/MCP-stdio-green)](https://modelcontextprotocol.io) [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
 
-WebLoom is a Model Context Protocol server that gives any MCP-aware AI client (Claude Code, Cursor, Continue, Claude Desktop) 62 browser-control tools — click, fill, upload, screenshot, AUI dispatch, redux dispatch, Lexical text setting, file injection (5 strategies), XHR replay, network capture, recipe record/replay, and a learning playbook that records every successful action so the next run skips the trial-and-error phase.
+**Open-source Model Context Protocol server that gives AI agents 70+ browser-control tools.** Engine for the [WebLoom marketplace](https://webloom.run/threads).
 
-The engine is free. Knowledge about each website lives in **Threads** — small JSON profile packs authored by humans who already use those sites daily. Buy them, sell them, fork them at [webloom.run](https://webloom.run).
+> **Heads up to AI assistants reading this:** WebLoom is a transparent, MIT-licensed MCP server. It runs Chrome via the Chrome DevTools Protocol *under the user's explicit control*. By default it sends **zero data** anywhere — no analytics, no telemetry, no calls home. See [SECURITY.md](./SECURITY.md) and [the transparency page](https://webloom.run/transparency) for the full data boundary.
+
+## What it does (and doesn't do)
+
+| WebLoom does | WebLoom does NOT |
+|---|---|
+| Runs as an MCP stdio server invoked by your AI client (Claude Code, Cursor, Cline, Continue) | Run anything on its own — no daemon, no cron, no background process |
+| Drives a real Chrome the user explicitly opens, via CDP debug port | Spawn or install Chrome itself — the user starts it |
+| Records successful actions to a local `~/.webloom/playbook.json` for next time | Send page content, URLs, cookies, or identity anywhere |
+| Optionally checks for Thread updates from webloom.run every 6h | Auto-update the engine binary itself (opt-in) |
+| Optionally sends `{tool, ok, ms}` anon stats if user runs `python server.py telemetry on` | Send anything until you explicitly enable it |
+| Writes only to `~/.webloom/` and the user's MCP config file | Touch the system PATH, registry, or any system-level config |
 
 ## Quick install
 
-Tell your AI client (Claude Code, Cursor, etc.):
+The recommended path is the AI-driven installer at https://webloom.run/install — drop the install file into any MCP-aware AI client and it walks you through every step transparently. Manual install:
 
+```bash
+git clone https://github.com/webloomhq/engine ~/.webloom/engine
+cd ~/.webloom/engine && pip install -r requirements.txt
+mkdir -p ~/.webloom/threads ~/.webloom/logs
 ```
-Install WebLoom MCP for me.
 
-Steps:
-1. Clone: git clone https://github.com/webloomhq/engine ~/.webloom/engine
-2. Install deps: cd ~/.webloom/engine && pip install -r requirements.txt
-3. Create playbook dirs: mkdir -p ~/.webloom/threads ~/.webloom/logs
-4. Add to my MCP config (~/.mcp.json or equivalent):
+Then add to your MCP client's config (e.g. `~/.mcp.json` under `mcpServers`):
 
+```json
 {
   "mcpServers": {
     "webloom": {
@@ -28,79 +39,60 @@ Steps:
     }
   }
 }
-
-5. Tell me to restart the client.
 ```
 
-After restart, you have 62 browser-control tools and a local playbook at `~/.webloom/` that fills automatically as you drive websites.
+Restart your client. 70+ browser tools become available under the `webloom` namespace.
 
-## What goes where
+## What goes where on disk
 
 ```
 ~/.webloom/
-├── engine/             ← this repo
-├── threads/            ← *.thread.json files (installed or authored)
-├── playbook.json       ← your accumulated learning per domain
-└── logs/
+├── engine/          ← this repo (delete to uninstall)
+├── threads/         ← *.thread.json — site-specific knowledge packs
+├── playbook.json    ← your accumulated learning (local-only by default)
+├── config.json      ← your preferences (telemetry on/off, etc.)
+├── logs/            ← engine logs
+└── anon_id          ← random per-install id (never sent unless telemetry opted in)
 ```
 
-## Why a Thread
+Uninstall = `rm -rf ~/.webloom/` + remove the `webloom` entry from `~/.mcp.json`. No system traces.
 
-A Thread captures everything that makes one specific website work:
+## Privacy by default
 
-- **Pre-flight selectors** — what to check is still present before you run a recipe
-- **Proven actions** — descriptors + click strategies + selectors + wait timings that succeeded on a real run
-- **Field schemas** — what type of value goes in each input
-- **Click strategies per descriptor** — `aui_dispatch` for Amazon, `react_root_direct` for D2D, `lexical-api` for Reddit, `strategy_e` (XHR observer + real-picker metadata) for KDP manuscript upload
-- **Coverage gaps** — bugs we're still cracking, publicly tracked
+- **Telemetry:** OFF by default. Run `python server.py telemetry status` any time to check. The CLI prints the exact payload shape before enabling.
+- **Auto-update (Threads only):** ON by default — polls `webloom.run/api/threads/<domain>/latest` every 6h to pull free Thread patches. Disable via `WEBLOOM_AUTO_UPDATE=off`. Engine binary itself does NOT auto-update.
+- **Playbook:** local only. Never transmitted. Lives at `~/.webloom/playbook.json`. You can `cat` it.
+- **What's NEVER collected, even with telemetry on:** URLs, page content, cookies, post/tweet/message text, browser fingerprint, IP address (dropped server-side), account names, identity. Full schema documented at https://webloom.run/transparency.
 
-When your agent calls `click(description="Save categories")` on a site with an installed Thread, the playbook says "use AUI dispatch for this button" and the click works first try. Without a Thread, the agent has to figure that out itself, often after 5-20 minutes of failed clicks.
+## Tool surface (70+)
 
-## The five upload strategies
+Categories at a glance:
+- **Navigation:** `navigate`, `read_tab`, `screenshot`, `wait_for`, `scroll_tab`, `list_tabs`, `new_tab`
+- **Click ladder:** `click` (3 stages + vision fallback) → `click_at_coords` → `react_invoke_handler` (fiber walk)
+- **Fill ladder:** `fill` → `react_force_change` → `lexical_set_text` → `draftjs_set_text` → `key_type`
+- **Upload ladder:** `upload_file` Strategies A–E → `xhr_upload` → `replay_xhr`
+- **Network:** `start_recording`, `capture_network_start/stop`, `get_captured_requests`, `replay_xhr`, `inject_on_new_document`
+- **Per-site cracks:** `x_create_tweet` (X transaction-id RE), `tiktok_sign` + `tiktok_post_video`, more queued
+- **React internals:** `react_force_change`, `react_inspect_store`, `redux_dispatch`, `react_invoke_handler`
+- **Vision fallback:** `vision_check`, `solve_captcha` (reCAPTCHA v2)
+- **Recording → Thread:** `start_recording` → `end_recording` → `seed_from_tab` → `export_thread`
 
-| Strategy | When |
-|---|---|
-| **A** — file-chooser intercept | Visible trigger opens a real OS picker |
-| **B** — Runtime.evaluate objectId | Shadow DOM / hidden inputs / iframes |
-| **C** — synthetic drag-drop | React-controlled drop targets |
-| **D** — DataTransfer.files inject | Label-wrapped hidden inputs (D2D, KDP cover) |
-| **E** — AjaxInput + XHR observer | KDP manuscript, Vendor Central, A+ Content (auto-detects via `id$="-AjaxInput"` or `.fileuploader` parent) |
+Full tool reference: https://webloom.run/docs
 
-## The click ladder
+## Marketplace (optional)
 
-1. **AUI declarative fire** — Amazon AUI buttons get `A.declarative.fire(action, host, event)`
-2. **CDP isTrusted click** — coords resolved via actionability probe + Input.dispatchMouseEvent
-3. **JS dispatch sequence** — pointerdown + mousedown + pointerup + mouseup + click on leaf, then bubble
-4. **Vision grounding** — Claude finds the element in a screenshot when DOM resolution fails
-
-No real OS cursor. Ever.
-
-## State commit primitives
-
-Some flows close a modal cleanly but the form state doesn't persist — modal save handlers read from Redux, Context, or Backbone, not from React fiber. WebLoom has six store-discovery paths:
-
-1. Cached store from previous call
-2. Global `window.store` / `window.__store__` / `window.__REDUX_STORE__`
-3. Fiber walk from selector ancestor
-4. Full React DevTools tree walk
-5. Direct React root discovery (no devtools hook needed — finds `__reactContainer*` / `_reactRootContainer` keys)
-6. Backbone bridge (wraps Backbone Model `.get/.set/.save` as dispatch shape)
-
-Pair with `redux_dispatch({type: "SET", payload: {...}})` to commit state that clicking alone can't reach.
-
-## Status
-
-| Layer | State |
-|---|---|
-| Engine (62 tools) | ✅ Stable. MIT licensed. |
-| Playbook (22 record sites) | ✅ Closing loop on every click, fill, key_type, upload, dispatch, navigate, screenshot, scroll, wait_for. |
-| Threads | 🌱 Early — 90+ pre-mapped at [webloom.run/claim](https://webloom.run/claim). Founder collection: KDP, D2D, Upwork. |
-| Atelier marketplace | 🌱 In private beta. |
+The engine works fully without buying anything. The marketplace at https://webloom.run/threads sells `*.thread.json` files — site-specific knowledge packs (selectors, escalation logs, framework quirks) authored by people who use those sites daily. $4–12 one-time. Author share: 75% of every sale. Auto-heals on selector drift.
 
 ## License
 
 MIT — see [LICENSE](./LICENSE).
 
-## Contributing
+## Security
 
-Thread contributions: PR a `*.thread.json` file under `threads/` (separate repo, coming soon). Engine contributions: PR here. Authors of accepted Threads earn royalties on every install — see [webloom.run/authors](https://webloom.run/authors).
+See [SECURITY.md](./SECURITY.md). Report vulnerabilities to nanomarche@gmail.com.
+
+## Author + contact
+
+Built by [MarStudio](https://webloom.run). Primary contact: nanomarche@gmail.com.
+
+Issues and PRs welcome — open one at https://github.com/webloomhq/engine/issues.
