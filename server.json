@@ -1,0 +1,63 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.webloomhq/engine",
+  "title": "WebLoom",
+  "description": "Open-source MCP server giving AI agents 70+ browser-control tools. Drives YOUR real Chrome with YOUR cookies, your session, your fingerprint (CDP attach, no headless spawn). Per-site protocol cracks (X transaction-id, TikTok signer). Multi-strategy fallback ladders for click, fill, upload across React/Lexical/Draft.js/Quill. Optional marketplace of community-authored Thread packs at webloom.run. Telemetry off by default.",
+  "version": "0.3.0",
+  "websiteUrl": "https://webloom.run",
+  "repository": {
+    "url": "https://github.com/webloomhq/engine",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "source",
+      "registryBaseUrl": "https://github.com",
+      "identifier": "webloomhq/engine",
+      "version": "0.3.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "python",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "server.py",
+          "valueHint": "server.py",
+          "isRequired": true
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "WEBLOOM_TELEMETRY",
+          "description": "Optional override for the telemetry pref. Default OFF. Values: on|off",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "WEBLOOM_AUTO_UPDATE",
+          "description": "Optional override for Thread auto-update tick. Default ON. Values: on|off",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "WEBLOOM_PLAYBOOK",
+          "description": "Optional override for playbook file path. Default ~/.webloom/playbook.json",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "tool": "manual-cli",
+      "version": "0.3.0",
+      "license": "MIT",
+      "homepage": "https://webloom.run",
+      "documentation": "https://webloom.run/docs",
+      "transparency": "https://webloom.run/transparency",
+      "security_policy": "https://github.com/webloomhq/engine/blob/main/SECURITY.md"
+    }
+  }
+}
