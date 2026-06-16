@@ -120,23 +120,13 @@ async def get_exact_screen_coords(ws_url: str, text: str) -> tuple[float, float]
             pass
     return None
 
-def real_cursor_click(screen_x: float, screen_y: float, hwnd=None):
-    """Move the actual Windows cursor and click — undetectable to any website."""
-    import pyautogui, win32gui, time
-    pyautogui.PAUSE = 0.05
-
-    # If window isn't foreground, click its title bar first to activate it
-    if hwnd and win32gui.GetForegroundWindow() != hwnd:
-        rect = win32gui.GetWindowRect(hwnd)
-        title_x = (rect[0] + rect[2]) // 2
-        title_y = rect[1] + 15  # title bar
-        pyautogui.moveTo(title_x, title_y, duration=0.15)
-        pyautogui.click()
-        time.sleep(0.4)  # wait for window to activate
-
-    pyautogui.moveTo(int(screen_x), int(screen_y), duration=0.2)
-    time.sleep(0.1)
-    pyautogui.click()
+# NOTE: The historical real_cursor_click() function used to live here and could
+# move the actual Windows cursor via pyautogui. It is intentionally removed.
+# WebLoom NEVER moves the OS cursor — see WEBLOOM_SPEC.md §15. If a click can't
+# land via CDP/JS/vision, the engine reports the failure and the caller must
+# escalate (react_invoke_handler, key_press, vision_check) or hand off to the
+# user. Removed alongside pyautogui dependency 2026-06-14 after external review
+# flagged server_fastmcp.py was still able to reach this path.
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server

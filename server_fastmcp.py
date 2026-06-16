@@ -15,11 +15,14 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-# Import all helpers from the original server (keeps computer-mcp imports working)
+# Import helpers from the original server. NOTE: real_cursor_click and
+# find_and_focus_chrome_window are intentionally NOT imported here. The
+# locked spec rule is "No Layer 3 / pyautogui, ever" (WEBLOOM_SPEC.md §15).
+# server.py already disables that path on the canonical entrypoint; this
+# alternate FastMCP entrypoint enforces the same boundary.
 from server import (
     get_tabs, find_tab, eval_in_tab, screenshot_tab,
     cdp_send, cdp_real_click, get_element_center, get_exact_screen_coords,
-    find_and_focus_chrome_window, real_cursor_click,
     load_sessions, resolve_session, load_playbook, save_playbook_data, domain_from_url,
     CLICK_JS, FILL_JS, READ_JS, SCAN_JS, CHROME_EXE,
 )
@@ -130,14 +133,12 @@ async def click(session: str, description: str, tab: str = "") -> str:
     if coords:
         await cdp_real_click(ws_url, coords[0], coords[1])
         await asyncio.sleep(0.3)
-    screen_coords = await get_exact_screen_coords(ws_url, description)
-    if screen_coords:
-        hwnd = find_and_focus_chrome_window(port)
-        real_cursor_click(screen_coords[0], screen_coords[1], hwnd=hwnd)
-        return f"clicked (real cursor) '{description}' at screen {screen_coords[0]:.0f},{screen_coords[1]:.0f}"
-    if coords:
-        return f"clicked (CDP) '{description}' — real cursor coords unavailable"
-    return f"not found: '{description}'"
+        return f"clicked (CDP) '{description}'"
+    # NEVER fall through to OS-level cursor movement. WebLoom does not move
+    # the physical mouse — see WEBLOOM_SPEC.md §15. If CDP cannot click it,
+    # surface the failure so the caller can escalate via react_invoke_handler
+    # or hand off to the user.
+    return f"not found via CDP: '{description}' — escalate to react_invoke_handler / vision / human"
 
 
 @mcp.tool()
