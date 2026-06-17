@@ -7240,30 +7240,47 @@ async def _execute_tool_action(name: str, arguments: dict):
         steps.append("caption editor visible")
         await asyncio.sleep(1)
 
-        # 4. Fill caption — use Lexical/contentEditable path
-        cap_js = """(async function(sel, text) {
-            const el = document.querySelector(sel);
-            if (!el) return JSON.stringify({ok:false, error:'no caption editor'});
-            el.focus();
-            // Try contentEditable text insert via beforeinput chunks
-            const CHUNK = 24;
-            let i = 0;
-            while (i < text.length) {
-                const ev = new InputEvent('beforeinput', {bubbles:true, cancelable:true, composed:true, inputType:'insertText', data: text.slice(i, i+CHUNK)});
-                el.dispatchEvent(ev);
-                i += CHUNK;
-                await new Promise(r => setTimeout(r, 30));
-            }
-            const len = (el.innerText || el.textContent || '').length;
-            return JSON.stringify({ok: len >= Math.min(text.length, 5), readback_len: len, expected: text.length});
-        })(""" + json.dumps(caption_sel) + "," + json.dumps(caption_text) + ")"
-        rc = await eval_in_tab(ws_url, cap_js)
-        rc_val = rc.get("result", {}).get("value", "{}")
-        try:
-            rc_parsed = json.loads(rc_val) if isinstance(rc_val, str) else rc_val
-        except Exception:
-            rc_parsed = {"ok": False}
-        steps.append(f"caption filled (readback={rc_parsed.get('readback_len')} of {rc_parsed.get('expected')})")
+        # 4. Fill caption via REAL CDP keystrokes — fiber walk + synthetic
+        # beforeinput events update the editor's VISIBLE text but TikTok's
+        # form-state binding (which controls Post button + serializes the
+        # caption to the published video) doesn't sync. Real keystrokes go
+        # through Chrome's native input pipeline → Draft.js's keypress
+        # handler → TikTok's form binding. Verified live 2026-06-16:
+        # goldenbreath upload posted with FILENAME as caption when we used
+        # the fiber-walk path; only real keystrokes serialize properly.
+        #
+        # Sequence: click into editor → select all (Ctrl+A) → backspace clear
+        # → type the caption per-char via Input.dispatchKeyEvent.
+        await eval_in_tab(ws_url, "(function(){const e=document.querySelector(" + json.dumps(caption_sel) + ");if(e)e.focus();return 'ok'})()")
+        await asyncio.sleep(0.2)
+        # Ctrl+A
+        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Control", "code": "ControlLeft", "modifiers": 2, "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17})
+        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2, "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65})
+        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 2, "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65})
+        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Control", "code": "ControlLeft", "modifiers": 0, "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17})
+        await asyncio.sleep(0.1)
+        # Backspace
+        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8})
+        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8})
+        await asyncio.sleep(0.2)
+        # Type each char as a real keystroke (text field carries the actual character)
+        for ch in caption_text:
+            if ch == "\n":
+                continue  # Draft.js maps Enter to handleReturn, skip line breaks
+            kc = ord(ch.upper()) if ch.isalnum() else 0
+            code = ("Key" + ch.upper()) if ch.isalpha() else (("Digit" + ch) if ch.isdigit() else ("Space" if ch == " " else "Unidentified"))
+            down = {"type": "keyDown", "key": ch, "code": code, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc, "text": ch, "unmodifiedText": ch}
+            up = {"type": "keyUp", "key": ch, "code": code, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc}
+            try:
+                await cdp_send(ws_url, "Input.dispatchKeyEvent", down)
+                await cdp_send(ws_url, "Input.dispatchKeyEvent", up)
+            except Exception:
+                pass
+            await asyncio.sleep(0.025)
+        await asyncio.sleep(0.5)
+        rb = await eval_in_tab(ws_url, "(function(){const e=document.querySelector(" + json.dumps(caption_sel) + ");return e ? (e.innerText||'').length : -1})()")
+        rb_len = rb.get("result", {}).get("value", -1)
+        steps.append(f"caption filled (readback={rb_len} of {len(caption_text)})")
         await asyncio.sleep(1)
 
         # 5. Privacy toggle — ALWAYS run, because TikTok Studio's UI default
