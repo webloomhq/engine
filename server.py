@@ -167,7 +167,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.0"
+ENGINE_VERSION = "0.3.3"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -453,7 +453,20 @@ class _CDPConn:
             pass
 
     async def _connect(self):
-        self.ws = await websockets.connect(self.ws_url, max_size=50_000_000, ping_interval=20, ping_timeout=20)
+        # ping_interval=None disables websocket-level keepalive entirely. CDP
+        # uses its own request/response protocol so we don't need ping frames,
+        # and pings fire spurious disconnects when Chrome's main thread blocks
+        # under heavy work (large form submits, big eval_js, captures during
+        # multi-MB payloads). max_queue=None prevents queue overflow on burst
+        # event traffic (e.g. network capture during a 150MB submit).
+        self.ws = await websockets.connect(
+            self.ws_url,
+            max_size=200_000_000,
+            ping_interval=None,
+            ping_timeout=None,
+            max_queue=None,
+            close_timeout=5,
+        )
         self._reader = asyncio.create_task(self._read_loop())
 
     async def _read_loop(self):
@@ -497,7 +510,11 @@ class _CDPConn:
     def is_alive(self) -> bool:
         return self.ws is not None and not getattr(self.ws, "closed", True)
 
-    async def send(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+    async def send(self, method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
+        # Default timeout raised from 15 -> 60s. Some legitimate CDP calls
+        # (Runtime.evaluate with big eval, network getResponseBody for a
+        # multi-MB payload, capture flush during a heavy submit) routinely
+        # take 20-45s on Windows. 15s was guaranteeing false-positive drops.
         if not self.is_alive():
             await self._connect()
         async with self.send_lock:
@@ -548,7 +565,13 @@ async def _get_conn(ws_url: str) -> _CDPConn:
         return conn
 
 
-async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int = 2) -> dict:
+async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int = 3) -> dict:
+    # 4 total attempts (retries + 1) with exponential backoff. The first retry
+    # fires immediately after dropping the dead pool entry — usually the page
+    # is responsive again the moment the heavy op finishes. Backoff covers
+    # the case where Chrome is still mid-submit and the new connect needs
+    # to wait a beat.
+    backoff = [0.3, 1.0, 2.5]
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -556,12 +579,16 @@ async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int =
             return await conn.send(method, params)
         except Exception as e:
             last_err = e
+            # Drop the dead connection so the next attempt rebuilds fresh.
             async with _pool_lock:
                 old = _cdp_pool.pop(ws_url, None)
                 if old is not None:
-                    await old.close()
+                    try:
+                        await old.close()
+                    except Exception:
+                        pass
             if attempt < retries:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(backoff[min(attempt, len(backoff) - 1)])
     raise last_err
 
 
@@ -2344,6 +2371,84 @@ async def list_tools():
             "caption_selector": {"type": "string", "description": "Override the caption editor selector if TikTok rotates."},
             "post_button_selector": {"type": "string", "description": "Override the Post-button selector."},
         }, "required": ["session", "video_path", "caption"]}),
+        # ── Marketplace (in-chat) ──────────────────────────────────────
+        # Browse / install / claim Threads from webloom.run without leaving
+        # chat. All seven tools talk to webloom.run with a paired session
+        # token stored locally at ~/.webloom/auth.json (mode 0600). The
+        # engine never holds payment data — install returns a checkout URL
+        # the user opens in their own browser after confirming the price.
+        Tool(name="webloom_pair", description=(
+            "Link this engine install to the user's webloom.run account so they can browse, buy, install, and manage Threads from inside chat. "
+            "Prints a short code + a URL, opens the URL in their browser, and polls until they confirm. Saves the session token to ~/.webloom/auth.json. "
+            "Idempotent: if already paired, returns the existing user_email and does nothing."
+        ), inputSchema={"type": "object", "properties": {
+            "poll_seconds": {"type": "integer", "default": 180, "description": "How long to block waiting for the user to confirm in the browser (max 600)."},
+            "open_browser": {"type": "boolean", "default": True, "description": "Open the pair URL in the default browser. Set false if running headless."},
+        }}),
+        Tool(name="webloom_browse", description=(
+            "Browse the WebLoom marketplace catalog. Filter by query / tier (battle_hard, proven, mapped, stub, bounty) / framework (react, backbone+redux, amazon-aui, ...) / category (publishing, affiliate, crypto, email, landing, side_hustle, hosting, dev_tools, ai_infra, forms, content, daily_driver, social, other). "
+            "Returns a ranked list with domain, name, tier, framework, author, proven_action count, recipe count, brief note. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "q": {"type": "string", "description": "Substring filter over domain/name/notes."},
+            "tier": {"type": "string", "description": "battle_hard | proven | mapped | stub | bounty"},
+            "framework": {"type": "string", "description": "react | backbone+redux | amazon-aui | etc."},
+            "category": {"type": "string", "description": "publishing | affiliate | crypto | email | landing | side_hustle | hosting | dev_tools | ai_infra | forms | content | daily_driver | social | other"},
+            "limit": {"type": "integer", "default": 20, "description": "Max 50."},
+        }}),
+        Tool(name="webloom_thread_info", description=(
+            "Get the full pre-purchase detail for one Thread by domain: tier, framework, price, proven actions, escalation lessons, session recipe summaries, notes. "
+            "Use this before webloom_install so you can show the user what they're getting + the price + a quick summary. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain key, e.g. 'tiktok.com', 'kdp.amazon.com'."},
+        }, "required": ["domain"]}),
+        Tool(name="webloom_install", description=(
+            "Install a Thread into ~/.webloom/threads/. Three outcomes: "
+            "(a) free → writes the Thread file and returns its path. "
+            "(b) already owned (the paired user previously purchased) → writes the Thread file. "
+            "(c) paywall → returns { price, checkout_url }. STOP, show the user the price, ask for confirmation, then call webloom_install again with confirm_paywall=true to open the checkout in their browser. The user pays on webloom.run/Polar; the engine NEVER takes payment. After payment, run webloom_install once more — you'll get { status: 'owned', installed_to }. "
+            "Requires pairing. NEVER call with confirm_paywall=true without explicit user consent in chat first."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain key, e.g. 'kdp.amazon.com'."},
+            "confirm_paywall": {"type": "boolean", "default": False, "description": "Set ONLY after the user has been shown the price and explicitly agreed to proceed to checkout."},
+            "open_checkout": {"type": "boolean", "default": True, "description": "When confirm_paywall=true, open the checkout URL in the default browser."},
+        }, "required": ["domain"]}),
+        Tool(name="webloom_library", description=(
+            "List every paid Thread the paired user already owns. Use this so the user can re-install on a new machine without paying again. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {}}),
+        Tool(name="webloom_open_bounties", description=(
+            "List Thread bounties currently open — domains where the structure has been mapped but no proven actions are recorded yet. "
+            "Authors can claim and ship one to start earning. Returns domain, name, category, framework, preflight count, first note, and a claim_url. Read-only in v0; claim flow is still on the website. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "category": {"type": "string", "description": "Filter to one category (publishing, affiliate, crypto, ...)."},
+            "framework": {"type": "string", "description": "Filter by framework substring."},
+            "limit": {"type": "integer", "default": 25, "description": "Max 50."},
+        }}),
+        Tool(name="webloom_my_threads", description=(
+            "Show the paired user's authored Threads + per-Thread sales + total owed/paid. Read-only in v0. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {}}),
+        Tool(name="webloom_claim_bounty", description=(
+            "Claim an open bounty (a 'stub' or 'mapped' Thread with no proven actions yet) for the paired user. "
+            "After claiming, the user owns that domain — only they can publish updates to it, and they earn 75% of every sale. "
+            "Returns 409 if the bounty is already claimed (yours or someone else's). Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact open-bounty domain key, e.g. 'monday.com'."},
+        }, "required": ["domain"]}),
+        Tool(name="webloom_engine_status", description=(
+            "Show the running engine version + whether a newer version is on the MCP Registry. "
+            "Use this if the user asks 'is my WebLoom up to date?' or before troubleshooting a tool failure. "
+            "When force_check=true, hits webloom.run for a fresh check (default reads the cached notice from ~/.webloom/update_available.json, refreshed every 24h). "
+            "If an update is available, includes the .mcpb URL + reinstall instruction. Engine NEVER self-updates (Chrome + filesystem access is too sensitive) — the human decides."
+        ), inputSchema={"type": "object", "properties": {
+            "force_check": {"type": "boolean", "default": False, "description": "Hit webloom.run right now instead of reading the cached notice."},
+        }}),
+        Tool(name="webloom_publish_thread", description=(
+            "Submit a Thread JSON to webloom.run for admin review. The Thread must be at ~/.webloom/threads/<domain>.thread.json (or pass thread_path explicitly). "
+            "Author must already own the domain (run webloom_claim_bounty first). The submission lands in the admin review queue and merges into the canonical catalog after approval (typically <24h). "
+            "Returns a draft_id + review URL. Use webloom_my_threads to check approval state. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain key. Must match thread.domain."},
+            "thread_path": {"type": "string", "description": "Optional absolute path. Defaults to ~/.webloom/threads/<domain>.thread.json."},
+        }, "required": ["domain"]}),
     ]
 
 def resolve_session(session_str: str) -> int:
@@ -2387,6 +2492,71 @@ def _start_auto_update_timer():
     t0.daemon = True
     t0.start()
 _start_auto_update_timer()
+
+
+# ── Engine version check ────────────────────────────────────────────────
+# On startup, ask webloom.run what the latest engine version is. If newer than
+# this binary, persist the notice to ~/.webloom/update_available.json. The
+# user (or their AI) reads it via the webloom_engine_status tool. We NEVER
+# self-update silently — engine touches Chrome + filesystem, the human must
+# decide. Errors swallowed.
+_UPDATE_CHECK_URL = os.environ.get("WEBLOOM_UPDATE_CHECK_URL", "https://webloom.run/api/engine/latest")
+_UPDATE_NOTICE_PATH = Path.home() / ".webloom" / "update_available.json"
+
+
+def _check_engine_update_once() -> dict:
+    import urllib.request, urllib.parse
+    try:
+        url = f"{_UPDATE_CHECK_URL}?current={urllib.parse.quote(ENGINE_VERSION)}"
+        req = urllib.request.Request(url, headers={"User-Agent": f"webloom-engine/{ENGINE_VERSION}"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            d = json.loads(r.read().decode())
+        if not d.get("ok"):
+            return {"ok": False, "error": d.get("error", "unknown")}
+        if d.get("update_available"):
+            try:
+                _UPDATE_NOTICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _UPDATE_NOTICE_PATH.write_text(json.dumps({
+                    "checked_at": int(__import__("time").time()),
+                    "current": ENGINE_VERSION,
+                    "latest": d.get("latest"),
+                    "mcpb_url": d.get("mcpb_url"),
+                    "sha256": d.get("sha256"),
+                    "release_url": d.get("release_url"),
+                    "install_hint": d.get("install_hint"),
+                }, indent=2))
+            except Exception:
+                pass
+        else:
+            # No update — clean up any stale notice
+            try:
+                if _UPDATE_NOTICE_PATH.exists():
+                    _UPDATE_NOTICE_PATH.unlink()
+            except Exception:
+                pass
+        return d
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _start_update_check_timer():
+    import threading
+    def _tick():
+        try:
+            _check_engine_update_once()
+        except Exception:
+            pass
+        # Re-check every 24h — engine releases are rare; daily is plenty
+        t = threading.Timer(24 * 3600, _tick)
+        t.daemon = True
+        t.start()
+    # First fire 45 seconds after import (after thread sweep, before any tool use)
+    t0 = threading.Timer(45.0, _tick)
+    t0.daemon = True
+    t0.start()
+
+
+_start_update_check_timer()
 # Detection/probe/idle tools don't require login — they're discovery-tier
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
 
@@ -7691,6 +7861,79 @@ async def _execute_tool_action(name: str, arguments: dict):
         except Exception:
             pass
         return [TextContent(type="text", text=f"Timeout: {selector} not found after {timeout_ms}ms")]
+
+    # ── Marketplace tools (in-chat browse/install/library/bounties) ──
+    if name == "webloom_engine_status":
+        force = bool(arguments.get("force_check", False))
+        if force:
+            d = _check_engine_update_once()
+        else:
+            try:
+                d = json.loads(_UPDATE_NOTICE_PATH.read_text()) if _UPDATE_NOTICE_PATH.exists() else None
+            except Exception:
+                d = None
+            if d is None:
+                d = _check_engine_update_once()
+        result = {
+            "ok": True,
+            "running_version": ENGINE_VERSION,
+            "latest_version": d.get("latest") if d else None,
+            "update_available": bool(d and d.get("latest") and d.get("latest") != ENGINE_VERSION),
+            "mcpb_url": d.get("mcpb_url") if d else None,
+            "release_url": d.get("release_url") if d else None,
+            "install_hint": (d.get("install_hint") if d else "Could not reach webloom.run. Check your internet."),
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name in ("webloom_pair", "webloom_browse", "webloom_thread_info",
+                "webloom_install", "webloom_library", "webloom_open_bounties",
+                "webloom_my_threads", "webloom_claim_bounty", "webloom_publish_thread"):
+        try:
+            from . import webloom_marketplace as wm  # type: ignore
+        except Exception:
+            import webloom_marketplace as wm  # type: ignore
+        if name == "webloom_pair":
+            result = wm.tool_pair(
+                anon_id=_get_anon_id(),
+                poll_seconds=int(arguments.get("poll_seconds", 180) or 180),
+                open_browser=bool(arguments.get("open_browser", True)),
+            )
+        elif name == "webloom_browse":
+            result = wm.tool_browse(
+                q=str(arguments.get("q", "") or ""),
+                tier=str(arguments.get("tier", "") or ""),
+                framework=str(arguments.get("framework", "") or ""),
+                category=str(arguments.get("category", "") or ""),
+                limit=int(arguments.get("limit", 20) or 20),
+            )
+        elif name == "webloom_thread_info":
+            result = wm.tool_thread_info(domain=str(arguments.get("domain", "")))
+        elif name == "webloom_install":
+            result = wm.tool_install(
+                domain=str(arguments.get("domain", "")),
+                confirm_paywall=bool(arguments.get("confirm_paywall", False)),
+                open_checkout=bool(arguments.get("open_checkout", True)),
+            )
+        elif name == "webloom_library":
+            result = wm.tool_library()
+        elif name == "webloom_open_bounties":
+            result = wm.tool_open_bounties(
+                category=str(arguments.get("category", "") or ""),
+                framework=str(arguments.get("framework", "") or ""),
+                limit=int(arguments.get("limit", 25) or 25),
+            )
+        elif name == "webloom_my_threads":
+            result = wm.tool_my_threads()
+        elif name == "webloom_claim_bounty":
+            result = wm.tool_claim_bounty(domain=str(arguments.get("domain", "")))
+        elif name == "webloom_publish_thread":
+            result = wm.tool_publish_thread(
+                domain=str(arguments.get("domain", "")),
+                thread_path=(str(arguments["thread_path"]) if arguments.get("thread_path") else None),
+            )
+        else:
+            result = {"ok": False, "error": "unreachable"}
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 

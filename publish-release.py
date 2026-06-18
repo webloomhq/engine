@@ -72,6 +72,7 @@ def build_mcpb(version: str) -> tuple[pathlib.Path, str]:
     out.unlink(missing_ok=True)
     include_files = [
         "manifest.json", "server.json", "server.py", "recording.py",
+        "webloom_marketplace.py",
         "requirements.txt", "README.md", "LICENSE", "SECURITY.md",
         "thread-schema.json", "launch.ps1",
     ]

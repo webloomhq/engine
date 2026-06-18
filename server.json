@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.webloomhq/engine",
   "title": "WebLoom",
-  "description": "77 browser-control tools that drive YOUR real Chrome via CDP. Marketplace at webloom.run.",
-  "version": "0.3.0",
+  "description": "86 tools: drive YOUR real Chrome via CDP + browse/install/publish Threads in chat. webloom.run.",
+  "version": "0.3.3",
   "websiteUrl": "https://webloom.run",
   "repository": {
     "url": "https://github.com/webloomhq/engine",
@@ -12,9 +12,9 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/webloomhq/engine/releases/download/v0.3.0/webloom-0.3.0.mcpb",
-      "version": "0.3.0",
-      "fileSha256": "b4b1b942e201ab14a4807c99c162c8585c7f307fbb7e85eafb71dd6f6fb56800",
+      "identifier": "https://github.com/webloomhq/engine/releases/download/v0.3.3/webloom-0.3.3.mcpb",
+      "version": "0.3.3",
+      "fileSha256": "32d8e4e2060ffdbb1c2bae70f03510ec89307780d28cb7382276552b1dc1d27d",
       "transport": {
         "type": "stdio"
       }
@@ -23,7 +23,7 @@
   "_meta": {
     "io.modelcontextprotocol.registry/publisher-provided": {
       "tool": "manual-cli",
-      "version": "0.3.0",
+      "version": "0.3.3",
       "license": "MIT",
       "homepage": "https://webloom.run",
       "documentation": "https://webloom.run/docs",
