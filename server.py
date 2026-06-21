@@ -16,7 +16,7 @@ shared, and sold without touching engine code.
 import json
 import os
 import re
-pass  # base64 imported at module level
+import base64
 import asyncio
 import subprocess
 import urllib.request
@@ -26,6 +26,7 @@ import websockets
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent))
 import recording  # noqa: E402
+import auto_record  # noqa: E402
 
 _replaying = False  # suppresses log_action during replay_recipe
 
@@ -167,7 +168,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.3"
+ENGINE_VERSION = "0.3.4"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -2433,6 +2434,14 @@ async def list_tools():
         ), inputSchema={"type": "object", "properties": {
             "domain": {"type": "string", "description": "Exact open-bounty domain key, e.g. 'monday.com'."},
         }, "required": ["domain"]}),
+        Tool(name="webloom_capture_session", description=(
+            "Convert recent engine activity on a domain into a draft Thread JSON. The engine auto-logs EVERY action tool call (click, fill, eval_js, upload_file, etc) to a rolling local file as you work — no need to remember start_recording. "
+            "Call this when you (or the user) just finished a workflow against a site that should become a sellable Thread. Default time window = last 60 min. "
+            "Writes the draft to ~/.webloom/thread_drafts/<domain>.draft.json. The user reviews + parameterizes + moves it to ~/.webloom/threads/ and ships with webloom_publish_thread()."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain (e.g. 'distrokid.com')."},
+            "last_minutes": {"type": "integer", "default": 60, "description": "How far back to slice the rolling log. Default 60."},
+        }, "required": ["domain"]}),
         Tool(name="webloom_engine_status", description=(
             "Show the running engine version + whether a newer version is on the MCP Registry. "
             "Use this if the user asks 'is my WebLoom up to date?' or before troubleshooting a tool failure. "
@@ -2706,18 +2715,31 @@ async def call_tool(name: str, arguments: dict):
             except Exception:
                 pass
 
-    # Auto-log to current recipe if recording (and not replaying)
+    # Pull summary once for both recorders
+    _summary = "ok"
+    try:
+        if result and isinstance(result, list):
+            for item in result:
+                if hasattr(item, "text"):
+                    _summary = item.text[:120]
+                    break
+    except Exception:
+        pass
+
+    # Manual recording (only when active via start_recording)
     if not _replaying and recording.is_recording() and name in recording.ACTION_TOOLS:
-        summary = "ok"
+        recording.log_action(name, arguments, result_summary=_summary)
+
+    # Auto-record EVERY action tool call to the rolling JSONL — opt-out via
+    # WEBLOOM_AUTO_RECORD=off. Cracks no longer disappear when the author
+    # forgets to call start_recording. webloom_capture_session(domain) builds
+    # a draft Thread from any time window.
+    if not _replaying:
         try:
-            if result and isinstance(result, list):
-                for item in result:
-                    if hasattr(item, "text"):
-                        summary = item.text[:120]
-                        break
+            auto_record.log_action(name, arguments, result_summary=_summary)
         except Exception:
             pass
-        recording.log_action(name, arguments, result_summary=summary)
+
     return result
 
 
@@ -7863,6 +7885,13 @@ async def _execute_tool_action(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Timeout: {selector} not found after {timeout_ms}ms")]
 
     # ── Marketplace tools (in-chat browse/install/library/bounties) ──
+    if name == "webloom_capture_session":
+        result = auto_record.capture_session(
+            domain=str(arguments.get("domain", "")).lower().strip(),
+            last_minutes=int(arguments.get("last_minutes", 60) or 60),
+        )
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
     if name == "webloom_engine_status":
         force = bool(arguments.get("force_check", False))
         if force:
