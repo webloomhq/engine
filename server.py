@@ -2470,7 +2470,15 @@ def resolve_session(session_str: str) -> int:
     except ValueError:
         raise ValueError(f"Unknown session '{session_str}'. Available: {list(sessions.keys())}")
 
-_STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_playbook", "note", "save_playbook", "find_tab_by_selector", "start_recording", "end_recording", "list_recipes", "replay_recipe", "confirm_login", "detect_blocker", "auth_totp", "pause_for_human", "export_profile", "import_profile", "list_threads", "install_thread", "export_thread", "reddit_check_shadowban"}
+_STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_playbook", "note", "save_playbook", "find_tab_by_selector", "start_recording", "end_recording", "list_recipes", "replay_recipe", "confirm_login", "detect_blocker", "auth_totp", "pause_for_human", "export_profile", "import_profile", "list_threads", "install_thread", "export_thread", "reddit_check_shadowban",
+    # Marketplace + engine-status + auto-record tools — pure HTTP + local file
+    # ops, no Chrome session needed. Without these here the session-pick gate
+    # traps every call (reported by other tab 2026-06-21).
+    "webloom_pair", "webloom_browse", "webloom_thread_info",
+    "webloom_install", "webloom_library", "webloom_open_bounties",
+    "webloom_my_threads", "webloom_claim_bounty", "webloom_publish_thread",
+    "webloom_engine_status", "webloom_capture_session",
+}
 
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
@@ -3233,23 +3241,45 @@ async def _execute_tool_action(name: str, arguments: dict):
         )
         return [TextContent(type="text", text=msg)]
 
-    # All other tools need a session
-    port = resolve_session(arguments["session"])
-    tabs = get_tabs(port)
-    if not tabs:
-        return [TextContent(type="text", text=f"Session '{arguments['session']}' is offline. Launch Chrome first:\n  .\\launch.ps1 -Session {arguments['session']}")]
+    # Marketplace + engine-status + auto-record + capture tools are pure HTTP
+    # + local file ops — they do NOT take a `session` arg and must skip the
+    # Chrome session resolution below. Without this guard, line `port =
+    # resolve_session(arguments["session"])` raises KeyError 'session' and the
+    # tool result reads "error: 'session'" (reported by other tab 2026-06-21).
+    _NO_SESSION_TOOLS = {
+        "webloom_pair", "webloom_browse", "webloom_thread_info",
+        "webloom_install", "webloom_library", "webloom_open_bounties",
+        "webloom_my_threads", "webloom_claim_bounty", "webloom_publish_thread",
+        "webloom_engine_status", "webloom_capture_session",
+    }
+    if name in _NO_SESSION_TOOLS:
+        port = None
+        tabs = []
+    else:
+        # All other tools need a session
+        port = resolve_session(arguments["session"])
+        tabs = get_tabs(port)
+        if not tabs:
+            return [TextContent(type="text", text=f"Session '{arguments['session']}' is offline. Launch Chrome first:\n  .\\launch.ps1 -Session {arguments['session']}")]
 
     if name == "list_tabs":
         visible = real_tabs(tabs)
         lines = [f"**{i}. {t.get('title','(no title)')}**\n   {t.get('url','')}\n   id: {t['id']}" for i, t in enumerate(visible)]
         return [TextContent(type="text", text="\n\n".join(lines))]
 
-    # Resolve tab
-    tab_ref = arguments.get("tab", "")
-    tab = find_tab(tabs, tab_ref)
-    if not tab:
-        return [TextContent(type="text", text="No tabs found in this session.")]
-    ws_url = tab["webSocketDebuggerUrl"]
+    # Marketplace + status + capture tools never touch a tab — skip tab
+    # resolution so they reach their late dispatch handlers cleanly. Same
+    # reason as the session-resolution guard above.
+    if name in _NO_SESSION_TOOLS:
+        tab = None
+        ws_url = None
+    else:
+        # Resolve tab
+        tab_ref = arguments.get("tab", "")
+        tab = find_tab(tabs, tab_ref)
+        if not tab:
+            return [TextContent(type="text", text="No tabs found in this session.")]
+        ws_url = tab["webSocketDebuggerUrl"]
 
     # Resolve @eN references — any arg that holds a selector pointing into the
     # last AX scan gets expanded to a real CSS selector before downstream use.

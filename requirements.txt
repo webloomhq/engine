@@ -1,4 +1,3 @@
-fastmcp
 mcp
 uvicorn
 python-dotenv
