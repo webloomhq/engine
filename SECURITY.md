@@ -67,6 +67,70 @@ WebLoom is for users automating their **own** browser sessions on sites they're 
 
 The engine has no opinions about what you do with it — but the **community Threads** on the marketplace are author-gated, and Threads that document abuse pattern get rejected at review.
 
+## Scanner audit posture
+
+Third-party security scanners (MCP Marketplace, code-review bots, supply-chain trackers) sometimes flag WebLoom for patterns that look risky in isolation but are intentional product behaviour. Here's what each flag actually means in our case, and what we've hardened against.
+
+### Subprocess execution
+
+WebLoom launches Chrome via `subprocess.Popen([...args])` (list-form, never `shell=True`). The only user-controlled string ever passed to `Popen` is the `--url` argument, and even that is passed as a separate list element (not concatenated into a shell command). No injection vector.
+
+We also call PowerShell once on Windows to bring a Chrome window to the foreground; the only interpolated value is an integer HWND from `ctypes.EnumWindows`, never user input.
+
+### Path traversal
+
+`install_thread` reads a `.thread.json` from any user-supplied path. The threat: a malicious `.thread.json` could carry a `"domain": "../../etc/evil"` field to escape `~/.webloom/threads/`. Hardened (2026-06-23): we now (a) validate the domain matches `[a-z0-9.\-]+` (DNS-shape, no slashes), max 253 chars, and (b) resolve the destination path and verify it stays inside `THREADS_DIR.resolve()`. Anything that escapes is refused.
+
+`export_profile` and `import_profile` accept full user-supplied paths because the user is explicitly choosing where to write/read their own cookie export. That's not a traversal vector — it's the user choosing their own filesystem location.
+
+### Auto-record log (`~/.webloom/auto_recording.jsonl`)
+
+The engine records every action tool call to a local rolling JSONL (rotating at 10k entries) so authors can convert any session window into a draft Thread. Naive logging would put `fill`/`key_type` text + `xhr_upload` headers on disk in plaintext. Hardened (2026-06-23):
+
+- Top-level args whose key matches `(password|passwd|secret|token|api_key|apikey|authorization|auth|cookie|session|private_key|credential|bearer|passphrase)` are replaced with `[REDACTED]` before write.
+- Nested dicts (e.g. `fill.fields`, `xhr_upload.headers`) are walked the same way — any matching key gets `[REDACTED]`.
+- On POSIX, the log file is `chmod 0600` after each write so other local users can't read it. (Windows uses NTFS ACLs; the default user profile permissions already exclude other users.)
+- Opt-out: `WEBLOOM_AUTO_RECORD=off` disables auto-record entirely.
+
+Authors should still avoid typing real passwords through automation — for credential entry, use the browser's password manager or `pause_for_human` and let the user type directly.
+
+### API key handling
+
+`vision_check`, `weave`, and `swarm_run` use **the user's own `ANTHROPIC_API_KEY`** read from environment. The key is sent in the `x-api-key` header **directly to Anthropic's API** (`api.anthropic.com`). It never touches webloom.run, the engine's telemetry endpoints, or any third party. Never logged, never in telemetry payloads, never in the auto-record log (its env-only lifetime means it never appears in a tool argument).
+
+`solve_captcha` uses the user's own `CAPTCHA_API_KEY` (2Captcha or similar). Same posture: env-only, sent direct to the captcha provider, never logged.
+
+### Telemetry
+
+Telemetry is **opt-in, off by default**. When enabled, two payload types ship:
+
+1. Per-tool engine telemetry: `{tool, ok, error_class, duration_ms, engine_version, anon_id, ts}` — no URLs, no content, no creds.
+2. Per-action marketplace telemetry: `{anon_id, domain, action_descriptor, strategy, confidence, ok, verified, verify_kind, ms, engine_version}` — domain is the site name (e.g. `kdp.amazon.com`), descriptor is a selector hint (e.g. `click:button[type=submit]`), strategy is the named strategy that worked. No credentials, no cookies, no page content.
+
+The `anon_id` is a random per-install UUID never linked to identity.
+
+### Network timeouts
+
+All `urllib.request.urlopen` calls have explicit timeouts (range: 3-30 seconds depending on operation). No infinite-hang vectors.
+
+### Supply chain
+
+Dependencies pinned to lower-bound versions known to be CVE-clean as of 2026-06-23:
+
+```
+mcp>=1.0.0
+python-dotenv>=1.0.0
+websockets>=12.0
+pyotp>=2.9.0
+psutil>=5.9.0
+pywin32>=306; sys_platform == "win32"
+beautifulsoup4>=4.12.0
+```
+
+The `fastmcp` dependency was removed in v0.3.5 along with the vestigial `server_fastmcp.py` entrypoint. The `pyautogui` dependency was removed in v0.3.0 along with the `real_cursor_click` function. The active engine never moves the OS cursor.
+
+Vendored libs in `vendor/x_client_transaction/` are pinned to the upstream commit at vendoring time, MIT-licensed, audit-readable, no transitive deps.
+
 ## Disclosing vulnerabilities
 
 Email **nanomarche@gmail.com**. We confirm receipt within 72 hours, fix within 14 days for high-severity issues, and publish the fix + write-up in CHANGELOG.md.

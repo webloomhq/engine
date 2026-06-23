@@ -168,7 +168,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.4"
+ENGINE_VERSION = "0.3.6"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -3069,9 +3069,18 @@ async def _execute_tool_action(name: str, arguments: dict):
         data = _load_thread_file(src)
         if not data:
             return [TextContent(type="text", text=f"install_thread: invalid Thread (missing 'domain' or not JSON): {src}")]
-        domain = data["domain"]
+        domain = str(data.get("domain", "")).strip()
+        # Path-traversal guard: a malicious .thread.json could set
+        # domain="../../etc/evil" → dest would escape THREADS_DIR. Domains are
+        # DNS-shaped strings (lowercase alnum + dots + hyphens). Reject anything
+        # else outright and verify the resolved dest stays inside THREADS_DIR.
+        import re as _re
+        if not domain or len(domain) > 253 or not _re.fullmatch(r"[a-z0-9.\-]+", domain):
+            return [TextContent(type="text", text=f"install_thread: invalid domain '{domain}' — must be DNS-shaped (a-z, 0-9, dot, hyphen, <=253 chars).")]
         THREADS_DIR.mkdir(parents=True, exist_ok=True)
-        dest = THREADS_DIR / f"{domain}.thread.json"
+        dest = (THREADS_DIR / f"{domain}.thread.json").resolve()
+        if not str(dest).startswith(str(THREADS_DIR.resolve())):
+            return [TextContent(type="text", text=f"install_thread: dest path escapes THREADS_DIR (refused). domain='{domain}'")]
         if dest.exists() and not overwrite:
             return [TextContent(type="text", text=f"install_thread: {dest} already exists. Pass overwrite=true to replace.")]
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")

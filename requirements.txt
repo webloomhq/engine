@@ -1,8 +1,7 @@
-mcp
-uvicorn
-python-dotenv
-websockets
-pyotp
-psutil
-pywin32
-beautifulsoup4
+mcp>=1.0.0
+python-dotenv>=1.0.0
+websockets>=12.0
+pyotp>=2.9.0
+psutil>=5.9.0
+pywin32>=306; sys_platform == "win32"
+beautifulsoup4>=4.12.0

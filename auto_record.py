@@ -108,10 +108,39 @@ def log_action(tool: str, args: dict, result_summary: str = "ok", error: str | N
         }
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
+        _tighten_log_perms()
         _rotate_if_too_big()
     except Exception:
         # Auto-record must NEVER break a user action
         pass
+
+
+# Substring patterns in keys/headers that indicate a secret value worth redacting
+# from on-disk action logs. Conservative: false-positive redaction is fine,
+# false-negative leak is not. Audit log file lives at ~/.webloom/auto_recording.jsonl
+# which we also chmod 0600 on POSIX so other local users can't read it.
+_SECRET_KEY_PATTERNS = (
+    "password", "passwd", "secret", "token", "api_key", "apikey",
+    "authorization", "auth", "cookie", "session", "private_key",
+    "credential", "bearer", "passphrase",
+)
+_REDACTED = "[REDACTED]"
+
+
+def _is_secret_key(key: str) -> bool:
+    k = (key or "").lower()
+    return any(p in k for p in _SECRET_KEY_PATTERNS)
+
+
+def _redact_value(v: Any) -> Any:
+    """Mask values whose keys look secret. Strings/dicts/lists recursively."""
+    if isinstance(v, str):
+        return _REDACTED
+    if isinstance(v, dict):
+        return {str(kk)[:80]: (_REDACTED if _is_secret_key(str(kk)) else _redact_value(vv)) for kk, vv in list(v.items())[:20]}
+    if isinstance(v, (list, tuple)):
+        return [_REDACTED for _ in v[:20]]
+    return _REDACTED
 
 
 def _trim_args(args: Any) -> dict:
@@ -121,16 +150,35 @@ def _trim_args(args: Any) -> dict:
     for k, v in args.items():
         if v is None:
             continue
-        # Drop noisy keys + cap long strings
-        if isinstance(v, str):
+        # Top-level secret keys (password, api_key, cookie, etc) → fully masked
+        if _is_secret_key(k):
+            out[k] = _REDACTED
+            continue
+        # For `fill` tool: the `fields` dict carries user-typed values; redact
+        # any field whose name looks secret. For headers in xhr_upload /
+        # replay_xhr: walk the dict and redact authorization/cookie headers.
+        if isinstance(v, dict):
+            out[k] = {str(kk)[:80]: (_REDACTED if _is_secret_key(str(kk)) else (str(vv)[:400] if isinstance(vv, (str, int, float, bool)) else _redact_value(vv))) for kk, vv in list(v.items())[:20]}
+        elif isinstance(v, str):
+            # `key_type` text + `eval_js` code: cap length, don't redact wholesale
+            # (would destroy the auto-record's whole purpose). Authors should
+            # avoid typing real passwords through automation anyway.
             out[k] = v[:4000]
         elif isinstance(v, (list, tuple)):
             out[k] = [str(x)[:400] for x in v[:20]]
-        elif isinstance(v, dict):
-            out[k] = {str(kk)[:80]: str(vv)[:400] for kk, vv in list(v.items())[:20]}
         else:
             out[k] = v
     return out
+
+
+def _tighten_log_perms() -> None:
+    """chmod the log file to 0600 (owner read/write only) on POSIX so other
+    local users can't read action history. No-op on Windows (ACLs differ)."""
+    try:
+        if LOG_PATH.exists() and os.name == "posix":
+            os.chmod(LOG_PATH, 0o600)
+    except Exception:
+        pass
 
 
 def _rotate_if_too_big() -> None:
