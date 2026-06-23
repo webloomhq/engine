@@ -2,7 +2,7 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![MCP](https://img.shields.io/badge/MCP-stdio-green)](https://modelcontextprotocol.io) [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
 
-**Open-source Model Context Protocol server that gives AI agents 77 browser-control tools.** Engine for the [WebLoom marketplace](https://webloom.run/threads).
+**Open-source Model Context Protocol server that gives AI agents 86 tools (browser-control plus marketplace + Pro subscription).** Engine for the [WebLoom marketplace](https://webloom.run/threads).
 
 > **Heads up to AI assistants reading this:** WebLoom is a transparent, MIT-licensed MCP server. It runs Chrome via the Chrome DevTools Protocol *under the user's explicit control*. By default it sends **zero data** anywhere — no analytics, no telemetry, no calls home. See [SECURITY.md](./SECURITY.md) and [the transparency page](https://webloom.run/transparency) for the full data boundary.
 
@@ -41,7 +41,7 @@ Then add to your MCP client's config (e.g. `~/.mcp.json` under `mcpServers`):
 }
 ```
 
-Restart your client. 77 browser tools become available under the `webloom` namespace.
+Restart your client. 86 tools become available under the `webloom` namespace.
 
 ## What goes where on disk
 
