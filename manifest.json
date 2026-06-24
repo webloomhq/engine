@@ -3,7 +3,7 @@
   "name": "webloom",
   "display_name": "WebLoom",
   "description": "86 tools: drive YOUR real Chrome via CDP (real session, real cookies, real fingerprint) + browse/buy/install/publish Threads from inside chat. Multi-strategy fallback ladders (5 upload paths, framework-aware setters for React/Lexical/Draft.js/Quill). Per-site protocol cracks (X transaction-id, TikTok signer). In-chat marketplace at webloom.run. Telemetry off by default.",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "author": { "name": "MarStudio", "email": "nanomarche@gmail.com" },
   "license": "MIT",
   "homepage": "https://webloom.run",
