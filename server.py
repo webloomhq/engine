@@ -575,6 +575,10 @@ async def _get_conn(ws_url: str) -> _CDPConn:
         return conn
 
 
+_CDP_CONNECT_CAP_S = float(os.environ.get("WEBLOOM_CDP_CONNECT_CAP_S", "20"))
+_CDP_CALL_CAP_S = float(os.environ.get("WEBLOOM_CDP_CALL_CAP_S", "75"))  # above _CDPConn.send's own 60 s
+
+
 async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int = 3) -> dict:
     # 4 total attempts (retries + 1) with exponential backoff. The first retry
     # fires immediately after dropping the dead pool entry — usually the page
@@ -585,8 +589,17 @@ async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int =
     last_err = None
     for attempt in range(retries + 1):
         try:
-            conn = await _get_conn(ws_url)
-            return await conn.send(method, params)
+            # Hard caps (2026-10-03): an eval_js against a frozen tab hung the caller for 14 hours, because the
+            # connect and the per-connection lock had no limit. Each piece now has one.
+            conn = await asyncio.wait_for(_get_conn(ws_url), timeout=_CDP_CONNECT_CAP_S)
+            return await asyncio.wait_for(conn.send(method, params), timeout=_CDP_CALL_CAP_S)
+        except asyncio.TimeoutError as e:
+            # A tab that gave no answer does not come back a second later, and running a Runtime.evaluate again
+            # could repeat an action (send a message, submit a form). Drop the connection and stop here.
+            old = _cdp_pool.pop(ws_url, None)
+            if old is not None:
+                asyncio.ensure_future(old.close())
+            raise TimeoutError(f"CDP {method} gave no answer (the tab may be frozen); not retried") from e
         except Exception as e:
             last_err = e
             # Drop the dead connection so the next attempt rebuilds fresh.
