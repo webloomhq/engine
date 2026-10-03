@@ -16,7 +16,8 @@ shared, and sold without touching engine code.
 import json
 import os
 import re
-pass  # base64 imported at module level
+import time
+import base64
 import asyncio
 import subprocess
 import urllib.request
@@ -26,6 +27,7 @@ import websockets
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent))
 import recording  # noqa: E402
+import auto_record  # noqa: E402
 
 _replaying = False  # suppresses log_action during replay_recipe
 
@@ -140,12 +142,20 @@ SESSIONS_FILE = Path(os.environ.get(
     str(Path(__file__).parent / "sessions.json")
 ))
 
-_legacy_playbook = Path("D:/BrowserSessions/playbook.json")
+_legacy_playbook = Path("D:/BrowserSessions/playbook.json")  # Mariano's Windows dev machine only
 _old_chromemcp_playbook = Path.home() / ".WebLoom" / "playbook.json"  # pre-rename
 _default_playbook = Path.home() / ".webloom" / "playbook.json"
-if _legacy_playbook.exists():
+
+def _path_ok(p: Path) -> bool:
+    """Existence check that swallows PermissionError (Linux VPS can't read 'D:/...' etc)."""
+    try:
+        return p.exists()
+    except (OSError, PermissionError):
+        return False
+
+if _path_ok(_legacy_playbook):
     _chosen_playbook = _legacy_playbook
-elif _old_chromemcp_playbook.exists() and not _default_playbook.exists():
+elif _path_ok(_old_chromemcp_playbook) and not _path_ok(_default_playbook):
     _chosen_playbook = _old_chromemcp_playbook  # migration: keep reading old location until user moves it
 else:
     _chosen_playbook = _default_playbook
@@ -167,7 +177,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.0"
+ENGINE_VERSION = "0.3.11"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -175,7 +185,7 @@ _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 def _load_config() -> dict:
     try:
         if _CONFIG_FILE.exists():
-            return json.loads(_CONFIG_FILE.read_text())
+            return json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
     except Exception:
         pass
     return {}
@@ -283,7 +293,7 @@ def _get_anon_id() -> str:
     Used only to rate-limit + trust-score telemetry. Never tied to user identity."""
     try:
         if _ANON_ID_FILE.exists():
-            return _ANON_ID_FILE.read_text().strip()
+            return _ANON_ID_FILE.read_text(encoding="utf-8").strip()
         import uuid
         new_id = "anon-" + uuid.uuid4().hex[:24]
         _ANON_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -391,7 +401,7 @@ def _verify_confidence(verified: bool, ok: bool, side_effect: bool = False) -> f
 
 
 def load_sessions() -> dict:
-    with open(SESSIONS_FILE) as f:
+    with open(SESSIONS_FILE, encoding="utf-8") as f:
         return json.load(f)
 
 def cdp_url(port: int) -> str:
@@ -453,7 +463,20 @@ class _CDPConn:
             pass
 
     async def _connect(self):
-        self.ws = await websockets.connect(self.ws_url, max_size=50_000_000, ping_interval=20, ping_timeout=20)
+        # ping_interval=None disables websocket-level keepalive entirely. CDP
+        # uses its own request/response protocol so we don't need ping frames,
+        # and pings fire spurious disconnects when Chrome's main thread blocks
+        # under heavy work (large form submits, big eval_js, captures during
+        # multi-MB payloads). max_queue=None prevents queue overflow on burst
+        # event traffic (e.g. network capture during a 150MB submit).
+        self.ws = await websockets.connect(
+            self.ws_url,
+            max_size=200_000_000,
+            ping_interval=None,
+            ping_timeout=None,
+            max_queue=None,
+            close_timeout=5,
+        )
         self._reader = asyncio.create_task(self._read_loop())
 
     async def _read_loop(self):
@@ -497,7 +520,11 @@ class _CDPConn:
     def is_alive(self) -> bool:
         return self.ws is not None and not getattr(self.ws, "closed", True)
 
-    async def send(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+    async def send(self, method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
+        # Default timeout raised from 15 -> 60s. Some legitimate CDP calls
+        # (Runtime.evaluate with big eval, network getResponseBody for a
+        # multi-MB payload, capture flush during a heavy submit) routinely
+        # take 20-45s on Windows. 15s was guaranteeing false-positive drops.
         if not self.is_alive():
             await self._connect()
         async with self.send_lock:
@@ -548,7 +575,13 @@ async def _get_conn(ws_url: str) -> _CDPConn:
         return conn
 
 
-async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int = 2) -> dict:
+async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int = 3) -> dict:
+    # 4 total attempts (retries + 1) with exponential backoff. The first retry
+    # fires immediately after dropping the dead pool entry — usually the page
+    # is responsive again the moment the heavy op finishes. Backoff covers
+    # the case where Chrome is still mid-submit and the new connect needs
+    # to wait a beat.
+    backoff = [0.3, 1.0, 2.5]
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -556,12 +589,16 @@ async def cdp_send(ws_url: str, method: str, params: dict = None, retries: int =
             return await conn.send(method, params)
         except Exception as e:
             last_err = e
+            # Drop the dead connection so the next attempt rebuilds fresh.
             async with _pool_lock:
                 old = _cdp_pool.pop(ws_url, None)
                 if old is not None:
-                    await old.close()
+                    try:
+                        await old.close()
+                    except Exception:
+                        pass
             if attempt < retries:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(backoff[min(attempt, len(backoff) - 1)])
     raise last_err
 
 
@@ -1627,6 +1664,76 @@ SCAN_AX_JS = """
 })()
 """
 
+# v0.3.8: ultra-compact ax-min mode. Same @eN refs, but strips:
+#   - role tag ([button type="submit"] → button)
+#   - Radix/auto-generated #id noise (#base-ui-_r_123_)
+#   - placeholder
+#   - aria-label brackets
+# Output format: `@e1 button "Sign in"` — 40-60% smaller than ax mode.
+# Same refs cache (window.__chromeMcpRefs__) so click/fill/etc still resolve.
+SCAN_AX_MIN_JS = """
+(function() {
+    const refs = [];
+    const ids = new WeakMap();
+    let next = 1;
+    const refOf = (el) => {
+        if (ids.has(el)) return ids.get(el);
+        const r = '@e' + next++;
+        ids.set(el, r);
+        refs.push(el);
+        return r;
+    };
+    const isSelectable = (el) => {
+        if (!el || !el.tagName) return false;
+        if (el.tagName === 'LABEL' && el.querySelector('input, textarea, select')) return false;
+        if (el.matches && el.matches('button, a[href], [role=button], [role=link], [role=combobox], [role=option], [role=menuitem], [role=tab], [aria-haspopup], [onclick], label, input, textarea, select, [contenteditable=true]')) return true;
+        return false;
+    };
+    // Detect noise IDs: auto-generated framework IDs like Radix's `base-ui-_r_123_`,
+    // Angular's `_ngcontent-*`, Emotion classNames, etc. If it looks generated, hide it.
+    const isNoiseId = (id) => {
+        if (!id) return true;
+        if (/^(base-ui-|mui-|radix-|_r_|ember|react-aria|__next-|_ngcontent)/i.test(id)) return true;
+        if (/^[a-z]{1,4}-?[a-f0-9]{6,}$/i.test(id)) return true;  // hash-suffixed
+        return false;
+    };
+    const summarize = (el) => {
+        const tag = el.tagName.toLowerCase();
+        const role = el.getAttribute('role') || tag;
+        // Map tag/role to a single word: button, link, input, select, tab, menuitem, option, combobox, text
+        let kind;
+        if (tag === 'a') kind = 'link';
+        else if (tag === 'input' || tag === 'textarea') kind = 'input';
+        else if (tag === 'select') kind = 'select';
+        else if (['button','tab','option','menuitem','combobox','link'].includes(role)) kind = role;
+        else kind = tag;
+        // Best label: aria-label > text > placeholder > name/id (last resort)
+        const label = (el.getAttribute('aria-label') || '').trim().slice(0, 60)
+            || ((el.textContent || el.value || '').trim()).slice(0, 60)
+            || (el.getAttribute('placeholder') || '').trim().slice(0, 60)
+            || el.name || (el.id && !isNoiseId(el.id) ? el.id : '');
+        return refOf(el) + ' ' + kind + (label ? ' "' + label + '"' : '');
+    };
+    const lines = [];
+    const els = document.querySelectorAll('*');
+    for (const el of els) {
+        if (!isSelectable(el)) continue;
+        if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        lines.push(summarize(el));
+        if (lines.length >= 200) break;
+    }
+    window.__chromeMcpRefs__ = refs;
+    return JSON.stringify({
+        url: location.href,
+        title: document.title,
+        lines: lines,
+        ref_count: refs.length,
+    });
+})()
+"""
+
 # Resolver: any tool that takes a selector should first run this — if the selector
 # starts with @e and a digit, resolve from the window ref cache to a unique CSS path.
 def _ax_resolver_prelude(selector: str) -> str | None:
@@ -1817,7 +1924,7 @@ def load_playbook() -> dict:
     live: dict = {}
     if PLAYBOOK_FILE.exists():
         try:
-            live = json.loads(PLAYBOOK_FILE.read_text())
+            live = json.loads(PLAYBOOK_FILE.read_text(encoding="utf-8"))
         except Exception:
             live = {}
 
@@ -1890,7 +1997,7 @@ def _load_live_playbook_raw() -> dict:
     PLAYBOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
     if PLAYBOOK_FILE.exists():
         try:
-            return json.loads(PLAYBOOK_FILE.read_text())
+            return json.loads(PLAYBOOK_FILE.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
@@ -2041,7 +2148,7 @@ async def list_tools():
         Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget — works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}}, "required": ["session"]}),
         Tool(name="wait_for", description="Wait for an element to appear in a tab (polls every 500ms)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session", "selector"]}),
         Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first — it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}}, "required": []}),
-        Tool(name="scan_tab", description="Page intelligence scan. Modes: 'ax' (default — compressed accessibility tree with @eN refs, ~200-400 tokens, every interactive element gets a stable @e1/@e2/etc handle you can pass to click/fill/key_type/upload as the selector); 'full' (legacy — every button/input/form with CSS selectors, ~5000 tokens, good for unfamiliar sites where you need everything). Call before any unfamiliar interaction. Auto-prepends playbook knowledge for the domain.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "mode": {"type": "string", "enum": ["ax", "full"], "default": "ax", "description": "ax = compressed accessibility tree with @eN refs (cheap, default). full = legacy verbose scan with CSS selectors."}, "save_to_playbook": {"type": "boolean", "default": True, "description": "Auto-save discovered structure to playbook for this domain (full mode only)"}}, "required": ["session"]}),
+        Tool(name="scan_tab", description="Page intelligence scan. Modes: 'ax-min' (v0.3.8, cheapest — ~80-200 tokens, format `@e1 button \"Sign in\"`, drops framework noise like Radix IDs); 'ax' (default — compressed accessibility tree with @eN refs, ~200-400 tokens, includes role brackets + placeholders + IDs); 'full' (legacy — every button/input/form with CSS selectors, ~5000 tokens, good for unfamiliar sites where you need everything). All modes share the same @eN ref cache so click/fill/key_type/upload work identically. Prefer ax-min for known/familiar sites; ax when you need placeholder/id hints; full only when nothing else works.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "mode": {"type": "string", "enum": ["ax-min", "ax", "full"], "default": "ax", "description": "ax-min = ultra-compact @eN + kind + label only (cheapest). ax = compact + roles/placeholders/ids (default). full = legacy verbose with CSS selectors."}, "save_to_playbook": {"type": "boolean", "default": True, "description": "Auto-save discovered structure to playbook for this domain (full mode only)"}}, "required": ["session"]}),
         Tool(name="get_playbook", description="Read everything Claude has learned about a domain — known quirks, field names, working patterns, affiliate links. Includes data merged from any installed Threads (profile packs).", inputSchema={"type": "object", "properties": {"domain": {"type": "string", "description": "Domain like bitget.com or mexc.com. Leave empty to list all known domains."}}, "required": []}),
         Tool(name="list_threads", description="List installable Threads (profile packs) currently discovered by WebLoom. Shows domain, version, source path, and which keys it contributes.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="install_thread", description="Install a Thread (profile pack) into ~/.webloom/threads/. Pass a local file path to a .thread.json. WebLoom auto-merges the Thread's knowledge into the playbook on the next read — no restart needed for the read path, but tools loaded at startup (like click handler defaults) will need a session restart to fully pick it up.", inputSchema={"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to a .thread.json file"}, "overwrite": {"type": "boolean", "default": False, "description": "Overwrite if a Thread for this domain is already installed"}}, "required": ["path"]}),
@@ -2057,6 +2164,8 @@ async def list_tools():
         Tool(name="start_recording", description="Start recording a browser workflow into a named recipe. Every click/fill/navigate/wait_for after this is logged. Call end_recording when done to save. Use parameters dict during replay to substitute {{var}} placeholders in args.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Recipe name (alphanumeric, dash, underscore)"}, "goal": {"type": "string", "description": "Plain-English description of what this recipe accomplishes"}, "domain": {"type": "string", "description": "Optional domain hint, e.g. mail.google.com"}}, "required": ["name"]}),
         Tool(name="end_recording", description="Save the in-progress recording as a recipe. Use outcome='failed' to abort without saving. parameters lists variable names that appeared in args (e.g. ['email','password']) — they can be passed as a dict during replay_recipe.", inputSchema={"type": "object", "properties": {"outcome": {"type": "string", "enum": ["success", "failed", "abort"], "default": "success"}, "parameters": {"type": "array", "items": {"type": "string"}, "description": "Names of variables that should be substituted at replay time"}}, "required": []}),
         Tool(name="list_recipes", description="List all saved browser-workflow recipes with their goals and action counts.", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="worker_jobs", description="See and manage the jobs run_worker keeps on disk. `list` shows every job with its done/failed counts. `show` returns the task names done and failed for one job. `retry` clears the failed list so the next run_worker call retries only those, keeping finished work. `reset` empties the job so it starts from scratch. Without this you can start a queue but not see where it stopped or rerun just the parts that broke.", inputSchema={"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "show", "retry", "reset"], "default": "list"}, "job": {"type": "string", "description": "Job name. Required for show, retry and reset."}}, "required": []}),
+        Tool(name="run_worker", description="Run a QUEUE of tasks unattended, waiting for each one to finish before starting the next. This is what replay_recipe cannot do: a recipe repeats a FIXED sequence, while a worker polls the page and only advances when a done-signal appears. Use it whenever each step takes an unknown amount of time (generating audio/video, uploading, rendering, publishing). For every task it runs `before` (optional JS), fills `prompt_selector` with the task text using the React-safe native setter, invokes the `submit_selector` button, then polls the page for `done_text` up to `timeout_seconds`; when it appears it invokes `confirm_selector` (optional) and moves on. It runs as its OWN operating-system process, so it keeps going when the calling session is idle or closed, and it reconnects by itself if the browser dies. Progress is written to disk after EVERY task, so re-running with the same `job` resumes exactly where it left off instead of redoing finished work. While a job runs, do not query the page with eval_js: two concurrent users of the browser connection drop it. Returns per-task ok/failed plus the resume file path.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "job": {"type": "string", "description": "Job name. Used as the resume key: re-running with the same name skips tasks already done."}, "tasks": {"type": "array", "items": {"type": "object"}, "description": "List of {name, prompt} objects. `name` is the resume key, `prompt` the text typed into prompt_selector."}, "prompt_selector": {"type": "string", "description": "CSS selector of the input/textarea that receives each task text. Filled with the native value setter + input event, which is what React-controlled fields require."}, "submit_selector": {"type": "string", "description": "CSS selector, or aria-label in the form aria:Label, of the button that starts the task. Invoked through its React onClick prop, so it works on UIs that ignore synthetic clicks."}, "done_text": {"type": "string", "description": "Text that appears on the page when a task has finished (whatever the site shows: a confirm button, a status word, a result label). This is the signal the worker waits for instead of sleeping a fixed time."}, "confirm_selector": {"type": "string", "description": "Optional. Button to invoke once done_text appears, to accept or save the result. Accepts text:Foo / aria:Foo / a CSS selector."}, "before": {"type": "string", "description": "Optional JS to run before each task, for whatever the site needs first (open a row, pick a slot, clear a field). Runs in page context."}, "timeout_seconds": {"type": "number", "default": 200, "description": "How long to wait for done_text on each task before marking it failed and moving on."}, "poll_seconds": {"type": "number", "default": 4}, "url_match": {"type": "string", "description": "Optional. Piece of the tab URL to work on, e.g. a domain. Without it the worker takes the first page it finds in that session."}}, "required": ["session", "job", "tasks", "prompt_selector", "submit_selector", "done_text"]}),
         Tool(name="replay_recipe", description="Replay a saved recipe — runs every recorded action in sequence with retry + abort-on-failure. Pass parameters dict to substitute {{var}} placeholders captured during recording.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Recipe name to replay"}, "parameters": {"type": "object", "description": "Key-value pairs for {{var}} substitution, e.g. {'email': 'foo@bar.com', 'password': 'secret'}"}, "session": {"type": "string", "description": "Optional session override (recipes don't store session — they replay against whatever you pass here)"}, "tab": {"type": "string", "description": "Optional tab override"}}, "required": ["name"]}),
         Tool(name="detect_blocker", description="Detect login walls, CAPTCHA (reCAPTCHA / hCaptcha / Cloudflare / DataDome / Arkose), 2FA prompts (TOTP / SMS / push / hardware key), and verification challenges on the current tab. Call before any flow that might hit one.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
         Tool(name="detect_anti_bot", description="Detect anti-bot interception. Returns the type (cloudflare_challenge / datadome / perimeterX / arkose / akamai / empty_shell / normal) plus signals. Different from detect_blocker — that's CAPTCHA/2FA for users; this is silent bot detection that returns a stub page. Use after navigation to know if the page actually loaded or if you hit a challenge.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
@@ -2071,7 +2180,7 @@ async def list_tools():
         Tool(name="capture_network_stop", description="Stop network capture and return all captured requests for the tab. Pass full=true to get headers + request body (required for replay_xhr). Default returns a one-line summary per request.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string", "description": "Optional substring — only return requests whose URL contains this"}, "full": {"type": "boolean", "description": "If true, return full request_headers, request_body, response_headers as JSON. Use when you need to replay (auth tokens, csrf, transaction-ids, body shape)."}}, "required": ["session"]}),
         Tool(name="get_captured_requests", description="Get current captured network requests for a tab without stopping capture. Pass full=true to get headers + request body.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string"}, "full": {"type": "boolean", "description": "If true, return full headers + body — needed for replay_xhr."}}, "required": ["session"]}),
         Tool(name="scan_tab_diff", description="Diff-scan: returns ONLY buttons/inputs/forms that appeared, disappeared, or changed since the last scan_tab or scan_tab_diff on this tab. Massively reduces tokens on multi-step flows. First call returns the full scan.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
-        Tool(name="key_type", description="Type a string into the focused element. Two modes: 'keystrokes' (default) fires per-char keyDown+keyUp with full keyboard metadata (windowsVirtualKeyCode, code, text, unmodifiedText) — what Playwright does, triggers React onChange/Backbone listeners. 'insertText' is faster, IME-friendly, but some legacy/hostile sites (D2D, older React/Backbone) don't see keypress events from it. Tip: click an input first to focus, then key_type. If saved values come out as [object Object] or look corrupted, try react_force_change as an escape hatch.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "text": {"type": "string", "description": "Text to type"}, "delay_ms": {"type": "integer", "default": 30, "description": "Delay between keystrokes"}, "mode": {"type": "string", "enum": ["keystrokes", "insertText", "fast"], "default": "keystrokes", "description": "keystrokes = per-char keyDown+keyUp (most compatible, default). insertText = single CDP call per char (faster, IME-friendly, less compatible with old React). fast = set value once on focused input + dispatch input/change (fastest, only works for non-React/non-Backbone vanilla forms)."}}, "required": ["session", "text"]}),
+        Tool(name="key_type", description="Type a string into the focused element. Three modes: 'keystrokes' (default) fires per-char keyDown+keyUp with full keyboard metadata — what Playwright does, triggers React onChange/Backbone listeners. 'insertText' batches the whole string into ONE CDP call when delay_ms=0 (default) — ~100x faster on long strings, IME-friendly, but some legacy/hostile sites (D2D, older React/Backbone) don't see keypress events from it. 'fast' uses the React-aware native setter on the focused input — fastest path, vanilla/React forms only. Tip: click an input first to focus, then key_type. delay_ms defaults to 0 (full speed); set >0 only when you need stealth pacing on anti-bot sites. If saved values come out as [object Object] or look corrupted, try react_force_change as an escape hatch.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "text": {"type": "string", "description": "Text to type"}, "delay_ms": {"type": "integer", "default": 0, "description": "Delay between keystrokes in ms. Default 0 = full speed. Set >0 only for stealth pacing on anti-bot sites."}, "mode": {"type": "string", "enum": ["keystrokes", "insertText", "fast"], "default": "keystrokes", "description": "keystrokes = per-char keyDown+keyUp (most compatible, default). insertText = single CDP call for the whole string when delay_ms=0 (much faster, IME-friendly, less compatible with old React). fast = set value once on focused input + dispatch input/change (fastest, only works for non-React/non-Backbone vanilla forms)."}}, "required": ["session", "text"]}),
         Tool(name="react_force_change", description="Escape hatch for hostile React/Backbone inputs where neither fill nor key_type triggers proper state update (D2D 'Add New Author' [object Object] bug). Walks the input element's React fiber and INVOKES the memoized onChange handler directly with a synthetic event carrying the value. Bypasses keyboard dispatch entirely. Last-resort — use only when key_type produces a corrupted saved value.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the input element"}, "value": {"type": "string", "description": "String value to set"}}, "required": ["session", "selector", "value"]}),
         Tool(name="react_inspect_store", description="Find and inspect a page's Redux store / React Context providers. Discovery paths: (1) window.__REDUX_DEVTOOLS_EXTENSION__ presence + connected stores, (2) window.store / window.__store__ globals, (3) walk React fiber from a selector (or body) looking for a Provider with store.dispatch + store.getState. Returns store presence, current state snapshot (truncated), and Provider tree summary. Use when react_force_change writes the input but the page reads from Redux/Context state outside the fiber chain.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "from_selector": {"type": "string", "description": "Optional CSS selector to start the fiber walk from (default: document.body). Use the closest element to the form/component whose state you want to access."}, "max_state_chars": {"type": "integer", "default": 4000, "description": "Truncate the state snapshot in the return value (Redux stores can be huge)."}}, "required": ["session"]}),
         Tool(name="redux_dispatch", description="Dispatch a Redux action against a page's discovered store. Uses the same store-discovery logic as react_inspect_store. Returns the new state after dispatch (truncated). Use when you need to programmatically force state changes for forms/modals whose state lives outside the React fiber chain (D2D new-author save, complex multi-step forms backed by Redux).", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "action": {"type": "object", "description": "Redux action object — must have a 'type' string and optionally a 'payload'. Example: {type: 'AUTHOR_CREATE', payload: {name: 'Confluence of Wisdom Editorial'}}"}, "from_selector": {"type": "string", "description": "Optional CSS selector for fiber-walk store discovery"}, "max_state_chars": {"type": "integer", "default": 4000}}, "required": ["session", "action"]}),
@@ -2344,6 +2453,240 @@ async def list_tools():
             "caption_selector": {"type": "string", "description": "Override the caption editor selector if TikTok rotates."},
             "post_button_selector": {"type": "string", "description": "Override the Post-button selector."},
         }, "required": ["session", "video_path", "caption"]}),
+        # ── Marketplace (in-chat) ──────────────────────────────────────
+        # Browse / install / claim Threads from webloom.run without leaving
+        # chat. All seven tools talk to webloom.run with a paired session
+        # token stored locally at ~/.webloom/auth.json (mode 0600). The
+        # engine never holds payment data — install returns a checkout URL
+        # the user opens in their own browser after confirming the price.
+        Tool(name="webloom_pair", description=(
+            "Link this engine install to the user's webloom.run account so they can browse, buy, install, and manage Threads from inside chat. "
+            "Prints a short code + a URL, opens the URL in their browser, and polls until they confirm. Saves the session token to ~/.webloom/auth.json. "
+            "Idempotent: if already paired, returns the existing user_email and does nothing."
+        ), inputSchema={"type": "object", "properties": {
+            "poll_seconds": {"type": "integer", "default": 180, "description": "How long to block waiting for the user to confirm in the browser (max 600)."},
+            "open_browser": {"type": "boolean", "default": True, "description": "Open the pair URL in the default browser. Set false if running headless."},
+        }}),
+        Tool(name="webloom_browse", description=(
+            "Browse the WebLoom marketplace catalog. Filter by query / tier (battle_hard, proven, mapped, stub, bounty) / framework (react, backbone+redux, amazon-aui, ...) / category (publishing, affiliate, crypto, email, landing, side_hustle, hosting, dev_tools, ai_infra, forms, content, daily_driver, social, other). "
+            "Returns a ranked list with domain, name, tier, framework, author, proven_action count, recipe count, brief note. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "q": {"type": "string", "description": "Substring filter over domain/name/notes."},
+            "tier": {"type": "string", "description": "battle_hard | proven | mapped | stub | bounty"},
+            "framework": {"type": "string", "description": "react | backbone+redux | amazon-aui | etc."},
+            "category": {"type": "string", "description": "publishing | affiliate | crypto | email | landing | side_hustle | hosting | dev_tools | ai_infra | forms | content | daily_driver | social | other"},
+            "limit": {"type": "integer", "default": 20, "description": "Max 50."},
+        }}),
+        Tool(name="webloom_thread_info", description=(
+            "Get the full pre-purchase detail for one Thread by domain: tier, framework, price, proven actions, escalation lessons, session recipe summaries, notes. "
+            "Use this before webloom_install so you can show the user what they're getting + the price + a quick summary. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain key, e.g. 'tiktok.com', 'kdp.amazon.com'."},
+        }, "required": ["domain"]}),
+        Tool(name="webloom_thread_context", description=(
+            "v0.3.10 — Fast local check: is a Thread installed for the given domain (or the session's current tab domain)? Returns {installed: bool, thread: <summary or null>}. No network. Cheaper than webloom_thread_info because it doesn't hit the marketplace. Use to decide whether to prompt install_thread OR to remind yourself which Thread is guiding the current tab. No pairing needed."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Domain to check. Optional — if omitted, uses the session's last-navigated domain."},
+            "session": {"type": "string", "default": "main", "description": "Session slot (used only when domain is omitted)."},
+        }, "required": []}),
+        Tool(name="webloom_install", description=(
+            "Install a Thread into ~/.webloom/threads/. Three outcomes: "
+            "(a) free → writes the Thread file and returns its path. "
+            "(b) already owned (the paired user previously purchased) → writes the Thread file. "
+            "(c) paywall → returns { price, checkout_url }. STOP, show the user the price, ask for confirmation, then call webloom_install again with confirm_paywall=true to open the checkout in their browser. The user pays on webloom.run/Polar; the engine NEVER takes payment. After payment, run webloom_install once more — you'll get { status: 'owned', installed_to }. "
+            "Requires pairing. NEVER call with confirm_paywall=true without explicit user consent in chat first."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain key, e.g. 'kdp.amazon.com'."},
+            "confirm_paywall": {"type": "boolean", "default": False, "description": "Set ONLY after the user has been shown the price and explicitly agreed to proceed to checkout."},
+            "open_checkout": {"type": "boolean", "default": True, "description": "When confirm_paywall=true, open the checkout URL in the default browser."},
+        }, "required": ["domain"]}),
+        Tool(name="webloom_library", description=(
+            "List every paid Thread the paired user already owns. Use this so the user can re-install on a new machine without paying again. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {}}),
+        Tool(name="webloom_open_bounties", description=(
+            "List Thread bounties currently open — domains where the structure has been mapped but no proven actions are recorded yet. "
+            "Authors can claim and ship one to start earning. Returns domain, name, category, framework, preflight count, first note, and a claim_url. Read-only in v0; claim flow is still on the website. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "category": {"type": "string", "description": "Filter to one category (publishing, affiliate, crypto, ...)."},
+            "framework": {"type": "string", "description": "Filter by framework substring."},
+            "limit": {"type": "integer", "default": 25, "description": "Max 50."},
+        }}),
+        Tool(name="webloom_my_threads", description=(
+            "Show the paired user's authored Threads + per-Thread sales + total owed/paid. Read-only in v0. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {}}),
+        Tool(name="webloom_claim_bounty", description=(
+            "Claim an open bounty (a 'stub' or 'mapped' Thread with no proven actions yet) for the paired user. "
+            "After claiming, the user owns that domain — only they can publish updates to it, and they earn 90% of every sale. "
+            "Returns 409 if the bounty is already claimed (yours or someone else's). Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact open-bounty domain key, e.g. 'monday.com'."},
+        }, "required": ["domain"]}),
+        Tool(name="webloom_capture_session", description=(
+            "Convert recent engine activity on a domain into a draft Thread JSON. The engine auto-logs EVERY action tool call (click, fill, eval_js, upload_file, etc) to a rolling local file as you work — no need to remember start_recording. "
+            "Call this when you (or the user) just finished a workflow against a site that should become a sellable Thread. Default time window = last 60 min. "
+            "Writes the draft to ~/.webloom/thread_drafts/<domain>.draft.json. The user reviews + parameterizes + moves it to ~/.webloom/threads/ and ships with webloom_publish_thread()."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain (e.g. 'distrokid.com')."},
+            "last_minutes": {"type": "integer", "default": 60, "description": "How far back to slice the rolling log. Default 60."},
+        }, "required": ["domain"]}),
+        Tool(name="webloom_engine_status", description=(
+            "Show the running engine version + whether a newer version is on the MCP Registry. "
+            "Use this if the user asks 'is my WebLoom up to date?' or before troubleshooting a tool failure. "
+            "When force_check=true, hits webloom.run for a fresh check (default reads the cached notice from ~/.webloom/update_available.json, refreshed every 24h). "
+            "If an update is available, includes the .mcpb URL + reinstall instruction. Engine NEVER self-updates (Chrome + filesystem access is too sensitive) — the human decides."
+        ), inputSchema={"type": "object", "properties": {
+            "force_check": {"type": "boolean", "default": False, "description": "Hit webloom.run right now instead of reading the cached notice."},
+        }}),
+        Tool(name="webloom_thread_status", description=(
+            "Inspect locally-installed Threads + trial expiry. "
+            "Call with domain='' to list all installed Threads, or pass a specific domain to check that one. "
+            "Returns status ('free' | 'owned' | 'pro' | 'trial'), installed_at, plus days_left / is_expired for trial Threads. "
+            "Use this proactively before firing a Thread's session_recipe so you can warn the user if the trial has <24h left."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Domain slug (e.g. 'x.com'). Empty string returns all installs."},
+        }, "required": []}),
+        Tool(name="webloom_publish_thread", description=(
+            "Submit a Thread JSON to webloom.run for admin review. The Thread must be at ~/.webloom/threads/<domain>.thread.json (or pass thread_path explicitly). "
+            "Author must already own the domain (run webloom_claim_bounty first). The submission lands in the admin review queue and merges into the canonical catalog after approval (typically <24h). "
+            "Returns a draft_id + review URL. Use webloom_my_threads to check approval state. Requires pairing."
+        ), inputSchema={"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Exact domain key. Must match thread.domain."},
+            "thread_path": {"type": "string", "description": "Optional absolute path. Defaults to ~/.webloom/threads/<domain>.thread.json."},
+        }, "required": ["domain"]}),
+
+        # ───────────────────── PRO TIER TOOLS (v0.4.0, local-only WIP) ─────────────────────
+        # Server-side gated. Free engines can SEE them via list_tools but they 402-Pro on call.
+        # Mariano + sister (admin emails) auto-pass the gate; everyone else needs an active Pro sub.
+        # Some Pro tools require the user's own ANTHROPIC_API_KEY (we never charge for tokens) —
+        # those tools surface a friendly "set ANTHROPIC_API_KEY to enable" if it's missing.
+
+        Tool(name="ai_navigate", description=(
+            "[PRO] Agent loop — give it a goal in plain English, it screenshots + plans + acts + reflects until done. "
+            "Uses YOUR Anthropic API key (set ANTHROPIC_API_KEY env). Costs ~$0.02–0.10 per goal depending on depth. "
+            "Built for 'tell the AI what you want, no Thread needed' tasks (publish this ebook, fill this 8-page form, etc). "
+            "Returns the action transcript + final outcome. Pairs cleanly with trace_view for debugging."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "goal": {"type": "string", "description": "Plain-English goal, e.g. 'click Publish then confirm in the dialog'"},
+            "max_steps": {"type": "integer", "default": 12, "description": "Max action steps before give-up"},
+            "model": {"type": "string", "default": "claude-sonnet-4-6", "description": "Anthropic model id"},
+        }, "required": ["session", "goal"]}),
+
+        Tool(name="network_intercept", description=(
+            "[PRO] Intercept matching XHR/fetch requests and modify or short-circuit them. "
+            "Uses CDP Fetch.enable. Pass url_pattern (substring or regex) + mode ('mock' returns a synthetic response, 'log' just records, 'block' kills the request). "
+            "Returns an intercept_id; call network_intercept_stop(id) to detach. Capture is per-tab. "
+            "Playwright's signature feature — makes RE-cracking, debugging, and offline-testing 10x faster."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "url_pattern": {"type": "string", "description": "URL substring or /regex/ to match"},
+            "mode": {"type": "string", "enum": ["log", "block", "mock"], "default": "log"},
+            "mock_status": {"type": "integer", "default": 200, "description": "HTTP status to return when mode='mock'"},
+            "mock_body": {"type": "string", "description": "Response body when mode='mock' (string or JSON-stringified)"},
+            "mock_content_type": {"type": "string", "default": "application/json"},
+            "duration_seconds": {"type": "number", "default": 30, "description": "Auto-detach after this many seconds (max 300)"},
+        }, "required": ["session", "url_pattern"]}),
+
+        Tool(name="trace_view", description=(
+            "[PRO] Capture a full trace artifact (screenshot + DOM snapshot + recent network log) and upload to webloom.run. "
+            "Returns a hosted viewer URL (webloom.run/trace/<id>) where you can scrub through the captured state. "
+            "Drop one in mid-flow to debug, share with the team, or attach to a Thread bug report. "
+            "The trace stays for 7 days (free Pro retention) or 90 days (Pro Plus)."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "label": {"type": "string", "description": "Optional human label, e.g. 'after clicking Publish'"},
+        }, "required": ["session"]}),
+
+        Tool(name="extract_sdk", description=(
+            "[PRO] Reverse-engineer a site's API. Records all XHR/fetch traffic on the current tab for `duration_seconds`, "
+            "then either (a) emits a pure-deterministic SDK file (curl + Python requests stubs from observed request shapes), "
+            "or (b) if ANTHROPIC_API_KEY is set, calls Claude to synthesize a polished SDK module with typed methods, auth handling, "
+            "and pagination heuristics. Output language: 'python' (default) or 'javascript'. "
+            "Useful for cracking new sites or building Threads that bypass the UI entirely."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "domain": {"type": "string", "description": "Domain to filter captured traffic to (e.g. 'api.example.com')"},
+            "duration_seconds": {"type": "integer", "default": 60, "description": "How long to record before synthesizing"},
+            "language": {"type": "string", "enum": ["python", "javascript"], "default": "python"},
+            "synthesize_with_llm": {"type": "boolean", "default": True, "description": "Use Claude for polish if ANTHROPIC_API_KEY set; falls back to raw curl/stubs otherwise"},
+        }, "required": ["session", "domain"]}),
+
+        Tool(name="stealth_pro", description=(
+            "[PRO] Apply the full anti-detection stack to the current tab. Goes beyond enable_stealth: "
+            "rotates User-Agent + Accept-Language, masks canvas/WebGL/AudioContext fingerprints, randomizes screen + timezone reads, "
+            "and emits human-like cursor jitter on every CDP click. Reversible — call with level='off' to clear all overrides. "
+            "Useful on sites that detect headless / automated traffic (LinkedIn, Cloudflare-protected sites, anti-bot SaaS)."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "tab": {"type": "string"},
+            "level": {"type": "string", "enum": ["off", "light", "full"], "default": "full"},
+            "user_agent": {"type": "string", "description": "Optional explicit UA. If omitted a fresh desktop Chrome UA is sampled."},
+            "locale": {"type": "string", "description": "BCP-47 locale (e.g. 'en-US'). Sets Accept-Language + navigator.language."},
+            "timezone": {"type": "string", "description": "IANA TZ id (e.g. 'America/Montevideo'). Overrides Intl.DateTimeFormat."},
+        }, "required": ["session"]}),
+
+        Tool(name="multi_browser", description=(
+            "[PRO · v0.4.1 INFRA — STUB] Run the same flow against Firefox + WebKit alongside Chrome for cross-browser checks. "
+            "Currently a stub that prints the infrastructure plan and returns a 'coming next release' message. "
+            "Real version requires Playwright bridge (Firefox + WebKit don't speak CDP) — landing v0.4.1."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"},
+            "browsers": {"type": "array", "items": {"type": "string", "enum": ["chromium", "firefox", "webkit"]}, "default": ["chromium", "firefox", "webkit"]},
+            "url": {"type": "string"},
+        }, "required": ["session", "url"]}),
+
+        # ─── Autopilot tools (cross-platform, Pro) ───────────────────────
+        # Together these let Claude configure WebLoom to run headless in the
+        # background on ANY host (VPS or laptop) without a separate installer
+        # per OS. AI drops the AUTOPILOT_SETUP.md guide, invokes these tools,
+        # user is done.
+
+        Tool(name="launch_headless_chrome", description=(
+            "[PRO] Spawn a headless Chrome (or Chromium/Edge/Brave) on this host bound to a CDP port. "
+            "Cross-platform (Windows / macOS / Linux). Auto-detects the browser binary; use chrome_path to override. "
+            "Persistent profile dir at ~/.webloom/headless-profile so cookies survive restarts. "
+            "Adds the port to sessions.json under `session_name` so subsequent tools can attach. "
+            "Pair with register_autostart to keep it alive across reboots."
+        ), inputSchema={"type": "object", "properties": {
+            "port": {"type": "integer", "default": 9223, "description": "CDP port. Use 9223 (default) so it doesn't collide with your everyday Chrome on 9222."},
+            "session_name": {"type": "string", "default": "headless", "description": "Name to register this session under in sessions.json."},
+            "profile_dir": {"type": "string", "description": "Override for the Chrome user-data-dir. Defaults to ~/.webloom/headless-profile."},
+            "chrome_path": {"type": "string", "description": "Explicit browser binary. Defaults to auto-detected Chrome/Chromium/Edge/Brave."},
+        }, "required": []}),
+
+        Tool(name="register_autostart", description=(
+            "[PRO] Register a command to auto-start on login (user-scope) or on boot (system-scope). "
+            "Cross-platform: Windows → Task Scheduler, macOS → launchd LaunchAgent, Linux → systemd --user unit. "
+            "Idempotent — re-running with the same name replaces the previous registration. "
+            "Use this after launch_headless_chrome to make the headless Chrome survive reboots."
+        ), inputSchema={"type": "object", "properties": {
+            "name": {"type": "string", "description": "Unique name for the entry (e.g. 'webloom-headless')."},
+            "command": {"type": "string", "description": "Full shell command to run at startup (path + args)."},
+            "scope": {"type": "string", "enum": ["user", "system"], "default": "user", "description": "user = current login (no admin needed); system = boot (needs admin/sudo)."},
+            "description": {"type": "string", "description": "Human-readable description shown in the OS manager."},
+        }, "required": ["name", "command"]}),
+
+        Tool(name="schedule_task", description=(
+            "[PRO] Schedule a command to run on a cron-like schedule. Cross-platform. "
+            "Windows → Task Scheduler (uses a cron→schtasks translator), Unix → user crontab. "
+            "Idempotent — same name replaces the previous schedule. "
+            "Great for wiring webloom-autopilot run-recipe … into a daily/weekly cadence without leaving chat."
+        ), inputSchema={"type": "object", "properties": {
+            "name": {"type": "string", "description": "Unique name for the schedule (e.g. 'linkedin-tuesday-post')."},
+            "command": {"type": "string", "description": "Full shell command to run."},
+            "cron": {"type": "string", "description": "Standard cron expression '<min> <hour> <dom> <month> <dow>' (e.g. '0 15 * * 2' = Tuesdays 15:00)."},
+            "user_scope": {"type": "boolean", "default": True, "description": "true = current user's schedule (no admin); false = system (Windows only, needs admin)."},
+        }, "required": ["name", "command", "cron"]}),
+
+        Tool(name="autopilot_status", description=(
+            "[PRO] Full-picture Autopilot health check on THIS host. "
+            "Reports: OS, headless Chrome ports reachable, registered auto-start entries, scheduled tasks, cookie profile paths, engine version. "
+            "Zero-arg diagnostic. Use before setting things up (to see current state) and after (to verify it worked)."
+        ), inputSchema={"type": "object", "properties": {}, "required": []}),
     ]
 
 def resolve_session(session_str: str) -> int:
@@ -2356,13 +2699,87 @@ def resolve_session(session_str: str) -> int:
     except ValueError:
         raise ValueError(f"Unknown session '{session_str}'. Available: {list(sessions.keys())}")
 
-_STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_playbook", "note", "save_playbook", "find_tab_by_selector", "start_recording", "end_recording", "list_recipes", "replay_recipe", "confirm_login", "detect_blocker", "auth_totp", "pause_for_human", "export_profile", "import_profile", "list_threads", "install_thread", "export_thread", "reddit_check_shadowban"}
+_STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_playbook", "note", "save_playbook", "find_tab_by_selector", "start_recording", "end_recording", "list_recipes", "replay_recipe", "confirm_login", "detect_blocker", "auth_totp", "pause_for_human", "export_profile", "import_profile", "list_threads", "install_thread", "export_thread", "reddit_check_shadowban",
+    # Marketplace + engine-status + auto-record tools — pure HTTP + local file
+    # ops, no Chrome session needed. Without these here the session-pick gate
+    # traps every call (reported by other tab 2026-06-21).
+    "webloom_pair", "webloom_browse", "webloom_thread_info",
+    "webloom_install", "webloom_library", "webloom_open_bounties",
+    "webloom_my_threads", "webloom_claim_bounty", "webloom_publish_thread",
+    "webloom_engine_status", "webloom_capture_session",
+}
 
 # Per-session login confirmation: any interaction tool requires the session to be in this set.
 # Cleared when launch_session opens a fresh window for that session.
-_LOGIN_CONFIRMED: set = set()
+#
+# PERSISTE EN DISCO A PROPOSITO. Vivia solo en memoria, asi que cada proceso nuevo del
+# servidor (un puente por linea de comandos, un cron, un tab reiniciado) volvia a preguntar
+# "estas logueado?" por una sesion que el usuario ya habia confirmado hace minutos. Con una
+# ventana de trabajo larga eso son decenas de preguntas repetidas por lo mismo.
+# El vencimiento existe para que un si viejo no mienta: pasadas las horas, se vuelve a preguntar.
+_LOGIN_TTL_H = float(os.environ.get("WEBLOOM_LOGIN_TTL_H", "12"))
+_LOGIN_FILE = Path.home() / ".webloom" / "login_confirmed.json"
+
+
+def _login_leer() -> set:
+    try:
+        datos = json.loads(_LOGIN_FILE.read_text(encoding="utf-8"))
+        corte = time.time() - _LOGIN_TTL_H * 3600
+        return {s for s, cuando in datos.items() if cuando > corte}
+    except Exception:
+        return set()
+
+
+def _login_guardar(sesiones: set, refrescar: str | None = None) -> None:
+    """refrescar: la sesion que el usuario ACABA de confirmar. Su hora se renueva; antes quedaba la hora vieja
+    (setdefault), asi que pasadas las 12 h una sesion confirmada de nuevo seguia vencida para siempre en todo
+    proceso nuevo (los carriles por linea de comandos fallaban aunque el usuario dijera que si)."""
+    try:
+        _LOGIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ahora = time.time()
+        previo = {}
+        try:
+            previo = json.loads(_LOGIN_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        previo = {s: c for s, c in previo.items() if s in sesiones}
+        for s in sesiones:
+            previo.setdefault(s, ahora)
+        if refrescar and refrescar in sesiones:
+            previo[refrescar] = ahora
+        _LOGIN_FILE.write_text(json.dumps(previo), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_LOGIN_CONFIRMED: set = _login_leer()
 _REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler", "x_create_tweet", "tiktok_sign", "tiktok_post_video"}
 # check_thread_updates + show_recent_auto_heals don't need a session — they're admin/info tools
+
+# v0.3.10 — session-scoped current-domain tracker. Updated by the navigate handler
+# (and lazily by scan_tab). Read by call_tool wrapper to inject an active-Thread
+# indicator into every tab-operating tool response, so the agent constantly sees
+# which Thread is guiding it. Keys are session names; values are bare hostnames.
+_LAST_DOMAIN_PER_SESSION: dict[str, str] = {}
+
+
+def _thread_active_indicator(session: str) -> str:
+    """Return a one-line indicator ('🧵 Active Thread: <name> ...') or empty string
+    if no Thread is installed for the session's current domain. Cheap: two dict
+    lookups + one load_threads() call (cached in _installed_threads_cache)."""
+    domain = _LAST_DOMAIN_PER_SESSION.get(session)
+    if not domain:
+        return ""
+    try:
+        thread = load_threads().get(domain)
+    except Exception:
+        return ""
+    if not thread:
+        return ""
+    name = thread.get("name") or domain
+    version = thread.get("version") or "0.1.0"
+    proven = len(thread.get("proven_actions") or [])
+    return f"🧵 Active Thread: **{name}** v{version} ({proven} proven actions cached · click/fill will prefer these strategies)\n\n"
 
 
 # ── Background auto-update timer ────────────────────────────────────────
@@ -2387,8 +2804,74 @@ def _start_auto_update_timer():
     t0.daemon = True
     t0.start()
 _start_auto_update_timer()
+
+
+# ── Engine version check ────────────────────────────────────────────────
+# On startup, ask webloom.run what the latest engine version is. If newer than
+# this binary, persist the notice to ~/.webloom/update_available.json. The
+# user (or their AI) reads it via the webloom_engine_status tool. We NEVER
+# self-update silently — engine touches Chrome + filesystem, the human must
+# decide. Errors swallowed.
+_UPDATE_CHECK_URL = os.environ.get("WEBLOOM_UPDATE_CHECK_URL", "https://webloom.run/api/engine/latest")
+_UPDATE_NOTICE_PATH = Path.home() / ".webloom" / "update_available.json"
+
+
+def _check_engine_update_once() -> dict:
+    import urllib.request, urllib.parse
+    try:
+        url = f"{_UPDATE_CHECK_URL}?current={urllib.parse.quote(ENGINE_VERSION)}"
+        req = urllib.request.Request(url, headers={"User-Agent": f"webloom-engine/{ENGINE_VERSION}"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            d = json.loads(r.read().decode())
+        if not d.get("ok"):
+            return {"ok": False, "error": d.get("error", "unknown")}
+        if d.get("update_available"):
+            try:
+                _UPDATE_NOTICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _UPDATE_NOTICE_PATH.write_text(json.dumps({
+                    "checked_at": int(__import__("time").time()),
+                    "current": ENGINE_VERSION,
+                    "latest": d.get("latest"),
+                    "mcpb_url": d.get("mcpb_url"),
+                    "sha256": d.get("sha256"),
+                    "release_url": d.get("release_url"),
+                    "install_hint": d.get("install_hint"),
+                }, indent=2))
+            except Exception:
+                pass
+        else:
+            # No update — clean up any stale notice
+            try:
+                if _UPDATE_NOTICE_PATH.exists():
+                    _UPDATE_NOTICE_PATH.unlink()
+            except Exception:
+                pass
+        return d
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _start_update_check_timer():
+    import threading
+    def _tick():
+        try:
+            _check_engine_update_once()
+        except Exception:
+            pass
+        # Re-check every 24h — engine releases are rare; daily is plenty
+        t = threading.Timer(24 * 3600, _tick)
+        t.daemon = True
+        t.start()
+    # First fire 45 seconds after import (after thread sweep, before any tool use)
+    t0 = threading.Timer(45.0, _tick)
+    t0.daemon = True
+    t0.start()
+
+
+_start_update_check_timer()
 # Detection/probe/idle tools don't require login — they're discovery-tier
-_STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab"}
+_STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab",
+                     "launch_headless_chrome", "register_autostart", "schedule_task", "autopilot_status"}
 
 # Startup check fires every new "session" (10 min of no Chrome MCP activity = new session)
 _STARTUP_STATE = Path.home() / ".webloom" / "startup-check.json"
@@ -2399,7 +2882,7 @@ def _startup_was_done_recently() -> bool:
         if not _STARTUP_STATE.exists():
             return False
         import time
-        data = json.loads(_STARTUP_STATE.read_text())
+        data = json.loads(_STARTUP_STATE.read_text(encoding="utf-8"))
         last = data.get("last_check", 0)
         return (time.time() - last) < _STARTUP_RESET_SECONDS
     except Exception:
@@ -2446,6 +2929,475 @@ async def _handle_recipe_tool(name: str, arguments: dict):
             lines.append(f"• **{r['name']}** ({r['actions']} actions{params})\n  Goal: {r['goal'] or '(no goal)'}")
         return [TextContent(type="text", text="\n".join(lines))]
 
+    if name == "worker_jobs":
+        import pathlib
+        carpeta = pathlib.Path.home() / ".webloom" / "workers"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        accion = (arguments.get("action") or "list").strip()
+        job = (arguments.get("job") or "").strip()
+
+        def _ruta(n):
+            return carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "", n.replace(" ", "_")) + ".json")
+
+        def _leer(f):
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                return {"hechos": [], "fallados": []}
+
+        if accion == "list":
+            archivos = sorted(carpeta.glob("*.json"))
+            if not archivos:
+                return [TextContent(type="text", text="No hay trabajos todavia. Corre run_worker con un `job` y aparece aca.")]
+            lineas = ["## Trabajos del obrero\n", "| job | hechos | fallados |", "|---|---|---|"]
+            for f in archivos:
+                e = _leer(f)
+                lineas.append("| %s | %d | %d |" % (f.stem, len(e.get("hechos", [])), len(e.get("fallados", []))))
+            return [TextContent(type="text", text="\n".join(lineas))]
+
+        if not job:
+            return [TextContent(type="text", text="Falta `job`. Corre worker_jobs con action=list para ver cuales hay.")]
+        f = _ruta(job)
+        if not f.exists():
+            return [TextContent(type="text", text="No existe el trabajo '%s'." % job)]
+        e = _leer(f)
+
+        if accion == "show":
+            return [TextContent(type="text", text="## %s\n\n**hechos (%d):** %s\n\n**fallados (%d):** %s\n\narchivo: `%s`"
+                                % (job, len(e.get("hechos", [])), ", ".join(e.get("hechos", [])) or "ninguno",
+                                   len(e.get("fallados", [])), ", ".join(e.get("fallados", [])) or "ninguno", f))]
+        if accion == "retry":
+            n = len(e.get("fallados", []))
+            e["fallados"] = []
+            f.write_text(json.dumps(e, indent=1), encoding="utf-8")
+            return [TextContent(type="text", text="Listo: %d fallados quedaron liberados. El proximo run_worker con job='%s' los reintenta y saltea los %d hechos."
+                                % (n, job, len(e.get("hechos", []))))]
+        if accion == "reset":
+            f.write_text(json.dumps({"hechos": [], "fallados": []}, indent=1), encoding="utf-8")
+            return [TextContent(type="text", text="Trabajo '%s' puesto en cero." % job)]
+        return [TextContent(type="text", text="Accion desconocida: %s" % accion)]
+
+    if name == "run_worker":
+        import pathlib
+        sess = arguments.get("session")
+        tab = arguments.get("tab")
+        job = (arguments.get("job") or "worker").strip()
+        tasks = arguments.get("tasks") or []
+        sel_prompt = arguments["prompt_selector"]
+        sel_submit = arguments["submit_selector"]
+        done_text = arguments["done_text"]
+        sel_confirm = arguments.get("confirm_selector")
+        before = arguments.get("before")
+        tope = float(arguments.get("timeout_seconds", 200))
+        paso = float(arguments.get("poll_seconds", 4))
+
+        # El avance se guarda DESPUES DE CADA TAREA, no al final: si la pestana
+        # muere a mitad de camino, lo hecho no se rehace.
+        carpeta = pathlib.Path.home() / ".webloom" / "workers"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        archivo = carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "_", job) + ".json")
+        estado = {"hechos": [], "fallados": []}
+        if archivo.exists():
+            try:
+                estado = json.loads(archivo.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # UN PROCESO APARTE. Adentro del server no funciona: tanto una task de
+        # asyncio como un hilo dependen del bucle del server, que solo avanza
+        # mientras atiende una llamada. Medido: la task no escribio ni la
+        # primera linea en 30 s, y el hilo hizo UNA tarea y quedo 828 s quieto.
+        # Un proceso propio ademas sobrevive a que se cierre la sesion.
+        import subprocess
+        import sys as _sys
+
+        puerto = None
+        try:
+            sp = pathlib.Path(__file__).parent / "sessions.json"
+            puerto = json.loads(sp.read_text(encoding="utf-8")).get(sess, {}).get("port")
+        except Exception:
+            pass
+        if not puerto:
+            return [TextContent(type="text", text="No encontre el puerto de la sesion '%s' en sessions.json." % sess)]
+
+        vivo = estado.get("pid")
+        if vivo and not estado.get("terminado"):
+            try:
+                import psutil
+                if psutil.pid_exists(int(vivo)):
+                    return [TextContent(type="text", text="El trabajo '%s' YA esta corriendo (pid %s). Mira el avance con worker_jobs(action='show', job='%s')." % (job, vivo, job))]
+            except Exception:
+                pass
+
+        pedido = {
+            "port": puerto,
+            "url_match": arguments.get("url_match"),
+            "tasks": tasks,
+            "prompt_selector": sel_prompt,
+            "submit_selector": sel_submit,
+            "done_text": done_text,
+            "confirm_selector": sel_confirm,
+            "before": before,
+            "timeout_seconds": tope,
+            "poll_seconds": paso,
+            "state_path": str(archivo),
+        }
+        pedido_f = carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "_", job) + ".pedido.json")
+        pedido_f.write_text(json.dumps(pedido, indent=1, ensure_ascii=False), encoding="utf-8")
+
+        runner = pathlib.Path(__file__).parent / "worker_runner.py"
+        salida = carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "_", job) + ".log")
+        banderas = 0
+        if hasattr(subprocess, "DETACHED_PROCESS"):
+            banderas = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        with open(salida, "ab") as sal:
+            proc = subprocess.Popen([_sys.executable, str(runner), str(pedido_f)],
+                                    stdout=sal, stderr=sal, stdin=subprocess.DEVNULL,
+                                    creationflags=banderas, close_fds=True)
+
+        _pendientes = [t for t in tasks if (t.get("name") or t.get("prompt", "")[:30]) not in estado["hechos"]]
+        return [TextContent(type="text", text=(
+            "## run_worker lanzado en un proceso propio (pid %d)\n\n"
+            "**%s**: %d tareas por hacer (%d ya estaban hechas de antes).\n\n"
+            "El control vuelve YA. El obrero es un proceso del sistema: sigue aunque se cierre "
+            "esta sesion, y guarda el avance tarea por tarea en `%s`.\n"
+            "Progreso: `worker_jobs(action='show', job='%s')`. Si algo se rompe, queda en `%s`.\n\n"
+            "Mientras corre, NO consultar la pestana con eval_js: dos usos a la vez de la conexion "
+            "con Chrome la tumban. Mirar el estado, no la pagina."
+            % (proc.pid, job, len(_pendientes), len(estado["hechos"]), archivo, job, salida)))]
+
+    if name == "worker_jobs":
+        import pathlib
+        carpeta = pathlib.Path.home() / ".webloom" / "workers"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        accion = (arguments.get("action") or "list").strip()
+        job = (arguments.get("job") or "").strip()
+
+        def _ruta(n):
+            return carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "", n.replace(" ", "_")) + ".json")
+
+        def _leer(f):
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                return {"hechos": [], "fallados": []}
+
+        if accion == "list":
+            archivos = sorted(carpeta.glob("*.json"))
+            if not archivos:
+                return [TextContent(type="text", text="No hay trabajos todavia. Corre run_worker con un `job` y aparece aca.")]
+            lineas = ["## Trabajos del obrero\n", "| job | hechos | fallados |", "|---|---|---|"]
+            for f in archivos:
+                e = _leer(f)
+                lineas.append("| %s | %d | %d |" % (f.stem, len(e.get("hechos", [])), len(e.get("fallados", []))))
+            return [TextContent(type="text", text="\n".join(lineas))]
+
+        if not job:
+            return [TextContent(type="text", text="Falta `job`. Corre worker_jobs con action=list para ver cuales hay.")]
+        f = _ruta(job)
+        if not f.exists():
+            return [TextContent(type="text", text="No existe el trabajo '%s'." % job)]
+        e = _leer(f)
+
+        if accion == "show":
+            return [TextContent(type="text", text="## %s\n\n**hechos (%d):** %s\n\n**fallados (%d):** %s\n\narchivo: `%s`"
+                                % (job, len(e.get("hechos", [])), ", ".join(e.get("hechos", [])) or "ninguno",
+                                   len(e.get("fallados", [])), ", ".join(e.get("fallados", [])) or "ninguno", f))]
+        if accion == "retry":
+            n = len(e.get("fallados", []))
+            e["fallados"] = []
+            f.write_text(json.dumps(e, indent=1), encoding="utf-8")
+            return [TextContent(type="text", text="Listo: %d fallados quedaron liberados. El proximo run_worker con job='%s' los reintenta y saltea los %d hechos."
+                                % (n, job, len(e.get("hechos", []))))]
+        if accion == "reset":
+            f.write_text(json.dumps({"hechos": [], "fallados": []}, indent=1), encoding="utf-8")
+            return [TextContent(type="text", text="Trabajo '%s' puesto en cero." % job)]
+        return [TextContent(type="text", text="Accion desconocida: %s" % accion)]
+
+    if name == "run_worker":
+        import pathlib
+        sess = arguments.get("session")
+        tab = arguments.get("tab")
+        job = (arguments.get("job") or "worker").strip()
+        tasks = arguments.get("tasks") or []
+        sel_prompt = arguments["prompt_selector"]
+        sel_submit = arguments["submit_selector"]
+        done_text = arguments["done_text"]
+        sel_confirm = arguments.get("confirm_selector")
+        before = arguments.get("before")
+        tope = float(arguments.get("timeout_seconds", 200))
+        paso = float(arguments.get("poll_seconds", 4))
+
+        # El avance se guarda DESPUES DE CADA TAREA, no al final: si la pestana
+        # muere a mitad de camino, lo hecho no se rehace.
+        carpeta = pathlib.Path.home() / ".webloom" / "workers"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        archivo = carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "_", job) + ".json")
+        estado = {"hechos": [], "fallados": []}
+        if archivo.exists():
+            try:
+                estado = json.loads(archivo.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # Invocar por el handler de React: hay interfaces (Suno Studio, Base UI)
+        # donde ni .click() ni la secuencia pointer completa hacen nada.
+        BUSCAR = """
+        function _find(sel){
+          if(sel.indexOf('text:')===0){var t=sel.slice(5);
+            return [...document.querySelectorAll('button,[role=button]')].find(function(b){return b.offsetParent&&b.textContent.trim()===t})}
+          if(sel.indexOf('aria:')===0){var a=sel.slice(5);
+            return [...document.querySelectorAll('button,[role=button]')].find(function(b){return b.offsetParent&&b.getAttribute('aria-label')===a})}
+          return document.querySelector(sel)}
+        function _inv(b){if(!b)return false;
+          var k=Object.keys(b).find(function(x){return x.indexOf('__reactProps')===0});
+          if(k&&b[k].onClick){b[k].onClick({target:b,currentTarget:b,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},type:'click',button:0});return true}
+          b.click();return true}
+        """
+
+        async def _js(expr):
+            r = await _execute_tool_action("eval_js", {"session": sess, "tab": tab, "code": expr})
+            if r and isinstance(r, list):
+                for it in r:
+                    if hasattr(it, "text"):
+                        return it.text
+            return ""
+
+        # SEGUNDO PLANO. La cola entera adentro de la llamada colgaba el turno
+        # mas de una hora y el tope de tiempo de la tool la cortaba a mitad de
+        # camino. Ahora: se lanza, se devuelve el control, y el avance se mira
+        # con worker_jobs. La referencia viva va a un dict global para que el
+        # recolector no mate la task y para no pisar una corrida en curso.
+        _tareas = globals().setdefault("_WORKER_TASKS", {})
+        _viva = _tareas.get(job)
+        if _viva is not None and getattr(_viva, 'is_alive', lambda: not _viva.done())():
+            return [TextContent(type="text", text="El trabajo '%s' YA esta corriendo. Mira el avance con worker_jobs(action='show', job='%s')." % (job, job))]
+
+        _pendientes = [t for t in tasks if (t.get("name") or t.get("prompt", "")[:30]) not in estado["hechos"]]
+
+        async def _correr():
+            for t in tasks:
+                nombre = t.get("name") or t.get("prompt", "")[:30]
+                if nombre in estado["hechos"]:
+                    continue
+                try:
+                    if before:
+                        await _js(BUSCAR + "(function(){%s})()" % before)
+                        await asyncio.sleep(1.5)
+                    puesto = await _js(
+                        "(function(){var e=document.querySelector(%s);if(!e)return 0;"
+                        "var proto=e.tagName==='TEXTAREA'?HTMLTextAreaElement:HTMLInputElement;"
+                        "var s=Object.getOwnPropertyDescriptor(proto.prototype,'value').set;"
+                        "e.focus();s.call(e,%s);e.dispatchEvent(new Event('input',{bubbles:true}));return e.value.length})()"
+                        % (json.dumps(sel_prompt), json.dumps(t.get("prompt", ""))))
+                    if "0" == (puesto or "").strip().strip('"'):
+                        estado["fallados"].append(nombre)
+                        archivo.write_text(json.dumps(estado, indent=1), encoding="utf-8")
+                        continue
+                    await asyncio.sleep(0.8)
+                    await _js(BUSCAR + "(function(){return _inv(_find(%s))?1:0})()" % json.dumps(sel_submit))
+                    # espera por SENAL, no por reloj
+                    listo = False
+                    esperado = 0.0
+                    while esperado < tope:
+                        await asyncio.sleep(paso)
+                        esperado += paso
+                        hay = await _js("(function(){return document.body.innerText.indexOf(%s)>=0?1:0})()"
+                                        % json.dumps(done_text))
+                        if "1" in (hay or ""):
+                            listo = True
+                            break
+                    if listo:
+                        if sel_confirm:
+                            await _js(BUSCAR + "(function(){return _inv(_find(%s))?1:0})()" % json.dumps(sel_confirm))
+                            await asyncio.sleep(2.5)
+                        estado["hechos"].append(nombre)
+                    else:
+                        estado["fallados"].append(nombre)
+                except Exception:
+                    estado["fallados"].append(nombre)
+                # el avance se guarda TAREA POR TAREA: una caida no rehace lo hecho
+                archivo.write_text(json.dumps(estado, indent=1), encoding="utf-8")
+            estado["terminado"] = True
+            archivo.write_text(json.dumps(estado, indent=1), encoding="utf-8")
+
+        # EL HILO, no una task de asyncio. Una task solo avanza mientras el server
+        # atiende una llamada: al devolver la respuesta se congela y no vuelve a
+        # correr. Medido: un trabajo de prueba no llego a escribir su estado en
+        # 30 segundos. Un hilo avanza aunque el server este ocioso.
+        _loop_server = asyncio.get_running_loop()
+
+        def _hilo():
+            estado["arrancado"] = True
+            archivo.write_text(json.dumps(estado, indent=1), encoding="utf-8")
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_correr(), _loop_server)
+                fut.result()
+            except Exception as ex:
+                estado["error"] = repr(ex)[:300]
+                archivo.write_text(json.dumps(estado, indent=1), encoding="utf-8")
+
+        import threading
+        h = threading.Thread(target=_hilo, name="webloom-worker-" + job, daemon=True)
+        h.start()
+        _tareas[job] = h
+        return [TextContent(type="text", text=(
+            "## run_worker lanzado en segundo plano\n\n"
+            "**%s**: %d tareas por hacer (%d ya estaban hechas de antes).\n\n"
+            "El control vuelve YA; el obrero sigue solo y guarda el avance tarea por tarea en `%s`.\n"
+            "Progreso: `worker_jobs(action='show', job='%s')`.\n\n"
+            "Limite honesto: el obrero vive en el proceso de WebLoom. Si esta sesion se cierra, la corrida "
+            "se corta; el estado queda en disco y relanzar con el mismo `job` retoma donde iba."
+            % (job, len(_pendientes), len(estado["hechos"]), archivo, job)))]
+
+    if name == "worker_jobs":
+        import pathlib
+        carpeta = pathlib.Path.home() / ".webloom" / "workers"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        accion = (arguments.get("action") or "list").strip()
+        job = (arguments.get("job") or "").strip()
+
+        def _ruta(n):
+            return carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "", n.replace(" ", "_")) + ".json")
+
+        def _leer(f):
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                return {"hechos": [], "fallados": []}
+
+        if accion == "list":
+            archivos = sorted(carpeta.glob("*.json"))
+            if not archivos:
+                return [TextContent(type="text", text="No hay trabajos todavia. Corre run_worker con un `job` y aparece aca.")]
+            lineas = ["## Trabajos del obrero\n", "| job | hechos | fallados |", "|---|---|---|"]
+            for f in archivos:
+                e = _leer(f)
+                lineas.append("| %s | %d | %d |" % (f.stem, len(e.get("hechos", [])), len(e.get("fallados", []))))
+            return [TextContent(type="text", text="\n".join(lineas))]
+
+        if not job:
+            return [TextContent(type="text", text="Falta `job`. Corre worker_jobs con action=list para ver cuales hay.")]
+        f = _ruta(job)
+        if not f.exists():
+            return [TextContent(type="text", text="No existe el trabajo '%s'." % job)]
+        e = _leer(f)
+
+        if accion == "show":
+            return [TextContent(type="text", text="## %s\n\n**hechos (%d):** %s\n\n**fallados (%d):** %s\n\narchivo: `%s`"
+                                % (job, len(e.get("hechos", [])), ", ".join(e.get("hechos", [])) or "ninguno",
+                                   len(e.get("fallados", [])), ", ".join(e.get("fallados", [])) or "ninguno", f))]
+        if accion == "retry":
+            n = len(e.get("fallados", []))
+            e["fallados"] = []
+            f.write_text(json.dumps(e, indent=1), encoding="utf-8")
+            return [TextContent(type="text", text="Listo: %d fallados quedaron liberados. El proximo run_worker con job='%s' los reintenta y saltea los %d hechos."
+                                % (n, job, len(e.get("hechos", []))))]
+        if accion == "reset":
+            f.write_text(json.dumps({"hechos": [], "fallados": []}, indent=1), encoding="utf-8")
+            return [TextContent(type="text", text="Trabajo '%s' puesto en cero." % job)]
+        return [TextContent(type="text", text="Accion desconocida: %s" % accion)]
+
+    if name == "run_worker":
+        import pathlib
+        sess = arguments.get("session")
+        tab = arguments.get("tab")
+        job = (arguments.get("job") or "worker").strip()
+        tasks = arguments.get("tasks") or []
+        sel_prompt = arguments["prompt_selector"]
+        sel_submit = arguments["submit_selector"]
+        done_text = arguments["done_text"]
+        sel_confirm = arguments.get("confirm_selector")
+        before = arguments.get("before")
+        tope = float(arguments.get("timeout_seconds", 200))
+        paso = float(arguments.get("poll_seconds", 4))
+
+        # El avance se guarda DESPUES DE CADA TAREA, no al final: si la pestana
+        # muere a mitad de camino, lo hecho no se rehace.
+        carpeta = pathlib.Path.home() / ".webloom" / "workers"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        archivo = carpeta / (re.sub(r"[^A-Za-z0-9_.-]", "_", job) + ".json")
+        estado = {"hechos": [], "fallados": []}
+        if archivo.exists():
+            try:
+                estado = json.loads(archivo.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # Invocar por el handler de React: hay interfaces (Suno Studio, Base UI)
+        # donde ni .click() ni la secuencia pointer completa hacen nada.
+        BUSCAR = """
+        function _find(sel){
+          if(sel.indexOf('text:')===0){var t=sel.slice(5);
+            return [...document.querySelectorAll('button,[role=button]')].find(function(b){return b.offsetParent&&b.textContent.trim()===t})}
+          if(sel.indexOf('aria:')===0){var a=sel.slice(5);
+            return [...document.querySelectorAll('button,[role=button]')].find(function(b){return b.offsetParent&&b.getAttribute('aria-label')===a})}
+          return document.querySelector(sel)}
+        function _inv(b){if(!b)return false;
+          var k=Object.keys(b).find(function(x){return x.indexOf('__reactProps')===0});
+          if(k&&b[k].onClick){b[k].onClick({target:b,currentTarget:b,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},type:'click',button:0});return true}
+          b.click();return true}
+        """
+
+        async def _js(expr):
+            r = await _execute_tool_action("eval_js", {"session": sess, "tab": tab, "code": expr})
+            if r and isinstance(r, list):
+                for it in r:
+                    if hasattr(it, "text"):
+                        return it.text
+            return ""
+
+        log = ["## run_worker: **%s** (%d tareas)" % (job, len(tasks)),
+               "resume: `%s`\n" % archivo]
+        for t in tasks:
+            nombre = t.get("name") or t.get("prompt", "")[:30]
+            if nombre in estado["hechos"]:
+                log.append("  %-24s ya estaba hecho, salteado" % nombre)
+                continue
+            if before:
+                await _js(BUSCAR + "(function(){%s})()" % before)
+                await asyncio.sleep(1.5)
+            puesto = await _js(
+                "(function(){var e=document.querySelector(%s);if(!e)return 0;"
+                "var proto=e.tagName==='TEXTAREA'?HTMLTextAreaElement:HTMLInputElement;"
+                "var s=Object.getOwnPropertyDescriptor(proto.prototype,'value').set;"
+                "e.focus();s.call(e,%s);e.dispatchEvent(new Event('input',{bubbles:true}));return e.value.length})()"
+                % (json.dumps(sel_prompt), json.dumps(t.get("prompt", ""))))
+            if "0" == (puesto or "").strip().strip('"'):
+                estado["fallados"].append(nombre)
+                archivo.write_text(json.dumps(estado, indent=1), encoding="utf-8")
+                log.append("  %-24s FALLO: no pude escribir el prompt" % nombre)
+                continue
+            await asyncio.sleep(0.8)
+            await _js(BUSCAR + "(function(){return _inv(_find(%s))?1:0})()" % json.dumps(sel_submit))
+
+            # La espera es por SENAL, no por reloj: dormir "lo que suele tardar"
+            # falla justo cuando el sitio esta lento.
+            listo = False
+            esperado = 0.0
+            while esperado < tope:
+                await asyncio.sleep(paso)
+                esperado += paso
+                hay = await _js("(function(){return document.body.innerText.indexOf(%s)>=0?1:0})()"
+                                % json.dumps(done_text))
+                if "1" in (hay or ""):
+                    listo = True
+                    break
+            if listo:
+                if sel_confirm:
+                    await _js(BUSCAR + "(function(){return _inv(_find(%s))?1:0})()" % json.dumps(sel_confirm))
+                    await asyncio.sleep(2.5)
+                estado["hechos"].append(nombre)
+                log.append("  %-24s ok (%.0fs)" % (nombre, esperado))
+            else:
+                estado["fallados"].append(nombre)
+                log.append("  %-24s FALLO: no aparecio '%s' en %.0fs" % (nombre, done_text, tope))
+            archivo.write_text(json.dumps(estado, indent=1), encoding="utf-8")
+
+        log.append("\n**%d hechos, %d fallados.** Volver a correr con el mismo `job` retoma sin rehacer."
+                   % (len(estado["hechos"]), len(estado["fallados"])))
+        return [TextContent(type="text", text="\n".join(log))]
+
     if name == "replay_recipe":
         rname = arguments.get("name", "").strip()
         recipe = recording.load_recipe(rname)
@@ -2488,8 +3440,79 @@ async def _handle_recipe_tool(name: str, arguments: dict):
     return None
 
 
+
+# ═════════════════════════════════════════════════════════════════════════
+# PRO GATE — module-level so it applies uniformly (learning tools + Pro tools)
+# ═════════════════════════════════════════════════════════════════════════
+# Authoring/learning tools that let a user reverse-engineer sites on their own.
+# Cannibalizes paid Threads if left free, so gated to Pro. Existing Threads
+# continue to work — internal playbook writes still happen inside the free
+# execution tools; the gate only stops external inspection/replay.
+
+_LEARNING_TOOLS: set[str] = {
+    # Recording (creates recipes that can be replayed)
+    "start_recording", "end_recording", "list_recipes", "replay_recipe",
+    # Playbook external API (internal _playbook_record writes still fire)
+    "save_playbook", "get_playbook",
+    # Site learning helpers
+    "seed_from_tab", "drift_heal_suggest", "show_recent_auto_heals",
+    # Network capture (used to reverse-engineer XHR-based APIs)
+    "capture_network_start", "capture_network_stop", "get_captured_requests",
+}
+
+_ADMIN_EMAILS: set[str] = {
+    "nanomarche@gmail.com", "marchesonip@gmail.com", "dev@webloom.run",
+}
+
+
+def _check_is_pro() -> tuple[bool, str]:
+    """
+    Returns (is_pro, reason). Admin emails auto-pass. Local dev (no auth.json)
+    auto-passes too so the dev loop isn't crippled. A paired non-admin engine
+    is treated as free-tier — the real Pro-sub verification against
+    webloom.run/api/v1/pro-check lands with v0.4.0 public release.
+    """
+    try:
+        from pathlib import Path as _P
+        _auth_path = _P.home() / ".webloom" / "auth.json"
+        if not _auth_path.exists():
+            return True, "local_dev"
+        _auth = json.loads(_auth_path.read_text(encoding="utf-8"))
+        _email = (_auth.get("user_email") or "").lower().strip()
+        if _email in _ADMIN_EMAILS:
+            return True, "admin"
+        # Non-admin paired engine = free tier
+        return False, "free_tier"
+    except Exception:
+        return True, "local_dev_fallback"
+
+
+def _pro_denied_payload(tool_name: str, reason: str) -> str:
+    return json.dumps({
+        "ok": False,
+        "pro_required": True,
+        "tool": tool_name,
+        "error": (
+            f"'{tool_name}' is a WebLoom Pro tool. "
+            f"Free tier = execution primitives + install & run Threads. "
+            f"Pro tier ($19/mo) adds recording, playbook inspection, network capture, "
+            f"self-discovery helpers, autopilot, and the advanced engine tools. "
+            f"Subscribe at https://webloom.run/pro."
+        ),
+        "upgrade_url": "https://webloom.run/pro",
+        "reason": reason,
+    }, indent=2)
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    # Learning-tools Pro gate — must fire BEFORE _handle_recipe_tool so the
+    # recording/playbook subcommands can't sneak through.
+    if name in _LEARNING_TOOLS:
+        is_pro, reason = _check_is_pro()
+        if not is_pro:
+            return [TextContent(type="text", text=_pro_denied_payload(name, reason))]
+
     # Recipe-management tools handled before everything else; not logged themselves
     recipe_result = await _handle_recipe_tool(name, arguments)
     if recipe_result is not None:
@@ -2536,18 +3559,46 @@ async def call_tool(name: str, arguments: dict):
             except Exception:
                 pass
 
-    # Auto-log to current recipe if recording (and not replaying)
+    # Pull summary once for both recorders
+    _summary = "ok"
+    try:
+        if result and isinstance(result, list):
+            for item in result:
+                if hasattr(item, "text"):
+                    _summary = item.text[:120]
+                    break
+    except Exception:
+        pass
+
+    # Manual recording (only when active via start_recording)
     if not _replaying and recording.is_recording() and name in recording.ACTION_TOOLS:
-        summary = "ok"
+        recording.log_action(name, arguments, result_summary=_summary)
+
+    # Auto-record EVERY action tool call to the rolling JSONL — opt-out via
+    # WEBLOOM_AUTO_RECORD=off. Cracks no longer disappear when the author
+    # forgets to call start_recording. webloom_capture_session(domain) builds
+    # a draft Thread from any time window.
+    if not _replaying:
         try:
-            if result and isinstance(result, list):
-                for item in result:
-                    if hasattr(item, "text"):
-                        summary = item.text[:120]
-                        break
+            auto_record.log_action(name, arguments, result_summary=_summary)
         except Exception:
             pass
-        recording.log_action(name, arguments, result_summary=summary)
+
+    # v0.3.10 — inject active-Thread indicator into responses of tab-operating
+    # tools so the agent constantly sees which Thread is guiding its actions.
+    # Skips: navigate (already emits its own primer), non-tab tools, error paths.
+    try:
+        if _ok and name in _REQUIRES_LOGIN and name != "navigate":
+            session_name = arguments.get("session", "main")
+            indicator = _thread_active_indicator(session_name)
+            if indicator and result and isinstance(result, list) and result:
+                first = result[0]
+                if hasattr(first, "text") and isinstance(first.text, str) and not first.text.startswith("🧵"):
+                    # Prepend but keep it clean — one line + blank + original.
+                    first.text = indicator + first.text
+    except Exception:
+        pass
+
     return result
 
 
@@ -2606,7 +3657,10 @@ async def _execute_tool_action(name: str, arguments: dict):
     sessions = load_sessions()
 
     # Login gate: interaction tools require the session to be login-confirmed.
-    if name in _REQUIRES_LOGIN:
+    # Bypassed in autopilot mode (WEBLOOM_AUTOPILOT=1 in env), where cookies are
+    # imported once via export_profile/import_profile and cron runs unattended —
+    # there's no user to answer an AskUserQuestion prompt.
+    if name in _REQUIRES_LOGIN and not os.environ.get("WEBLOOM_AUTOPILOT"):
         target_session = arguments.get("session", "")
         if target_session and target_session not in _LOGIN_CONFIRMED:
             return [TextContent(type="text", text=(
@@ -2632,7 +3686,10 @@ async def _execute_tool_action(name: str, arguments: dict):
                 any_live = True
             else:
                 status = "❌ offline"
-            lines.append(f"**{sname}** (port {port}): {status}\n  {cfg['description']}")
+            # .get y no [.]: cuatro sesiones se habian guardado sin descripcion, y como esta
+            # linea corre dentro del bucle, UNA fila incompleta se llevaba puesto el listado
+            # de TODAS, incluidas las que estaban perfectas.
+            lines.append(f"**{sname}** (port {port}): {status}\n  {cfg.get('description') or 'sin descripcion'}")
         if not any_live:
             lines.append("\n---\nNo Chrome sessions running. Use `launch_session` to start one — e.g. launch_session(session=\"main\") to open your real Chrome with saved logins, or launch_session(session=\"farm\") for a fresh game/farm browser.")
         return [TextContent(type="text", text="\n\n".join(lines))]
@@ -2644,9 +3701,11 @@ async def _execute_tool_action(name: str, arguments: dict):
             return [TextContent(type="text", text="Error: session name required.")]
         if logged_in:
             _LOGIN_CONFIRMED.add(sname)
+            _login_guardar(_LOGIN_CONFIRMED, refrescar=sname)
             return [TextContent(type="text", text=f"✅ Login confirmed for '{sname}'. You may now use scan_tab, click, fill, etc.")]
         else:
             _LOGIN_CONFIRMED.discard(sname)
+            _login_guardar(_LOGIN_CONFIRMED)
             return [TextContent(type="text", text=f"⏳ Waiting for login on '{sname}'. Tell the user: \"Let me know when you've finished logging in, then I'll continue.\" Do NOT proceed with any interaction tools until they confirm and you call `confirm_login` again with logged_in=true.")]
 
     if name == "launch_session":
@@ -2723,6 +3782,7 @@ async def _execute_tool_action(name: str, arguments: dict):
 
         # New session window — login state is unknown; clear any prior confirmation.
         _LOGIN_CONFIRMED.discard(sname)
+        _login_guardar(_LOGIN_CONFIRMED)
 
         url_opened = arguments.get("url") or "(no URL)"
         login_instruction = (
@@ -2839,6 +3899,46 @@ async def _execute_tool_action(name: str, arguments: dict):
         save_playbook_data(playbook)
         return [TextContent(type="text", text=f"Saved `{key}` for {domain} to playbook (type={type(value).__name__}).")]
 
+    if name == "webloom_thread_context":
+        # v0.3.10 — cheap local check. Returns { installed, thread_summary }
+        # for a given domain (or the session's last-navigated domain).
+        req_domain = str(arguments.get("domain", "") or "").strip().lower()
+        session_name = str(arguments.get("session", "main") or "main")
+        if not req_domain:
+            req_domain = _LAST_DOMAIN_PER_SESSION.get(session_name, "")
+            if not req_domain:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "error": "no domain given and no last-navigated domain tracked for this session — call navigate() first or pass domain explicitly",
+                    "session": session_name,
+                }, indent=2))]
+        threads = load_threads()
+        t = threads.get(req_domain)
+        if not t:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "domain": req_domain,
+                "installed": False,
+                "hint": f"No Thread installed for {req_domain}. Try `webloom_thread_info(domain='{req_domain}')` to check the marketplace, or `install_thread(domain='{req_domain}')` if you know it's available.",
+            }, indent=2))]
+        proven = t.get("proven_actions") or []
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "domain": req_domain,
+            "installed": True,
+            "thread": {
+                "name": t.get("name"),
+                "version": t.get("version"),
+                "author": t.get("author"),
+                "framework": t.get("framework"),
+                "proven_actions_count": len(proven),
+                "notes_count": len(t.get("notes") or []),
+                "tier": t.get("tier"),
+                "first_note": (t.get("notes") or [""])[0][:200] if t.get("notes") else None,
+            },
+            "hint": f"Thread is active. click/fill on {req_domain} will prefer its {len(proven)} proven strategies. For full details: `webloom_thread_info(domain='{req_domain}')`.",
+        }, indent=2))]
+
     if name == "list_threads":
         threads = load_threads()
         if not threads:
@@ -2869,9 +3969,18 @@ async def _execute_tool_action(name: str, arguments: dict):
         data = _load_thread_file(src)
         if not data:
             return [TextContent(type="text", text=f"install_thread: invalid Thread (missing 'domain' or not JSON): {src}")]
-        domain = data["domain"]
+        domain = str(data.get("domain", "")).strip()
+        # Path-traversal guard: a malicious .thread.json could set
+        # domain="../../etc/evil" → dest would escape THREADS_DIR. Domains are
+        # DNS-shaped strings (lowercase alnum + dots + hyphens). Reject anything
+        # else outright and verify the resolved dest stays inside THREADS_DIR.
+        import re as _re
+        if not domain or len(domain) > 253 or not _re.fullmatch(r"[a-z0-9.\-]+", domain):
+            return [TextContent(type="text", text=f"install_thread: invalid domain '{domain}' — must be DNS-shaped (a-z, 0-9, dot, hyphen, <=253 chars).")]
         THREADS_DIR.mkdir(parents=True, exist_ok=True)
-        dest = THREADS_DIR / f"{domain}.thread.json"
+        dest = (THREADS_DIR / f"{domain}.thread.json").resolve()
+        if not str(dest).startswith(str(THREADS_DIR.resolve())):
+            return [TextContent(type="text", text=f"install_thread: dest path escapes THREADS_DIR (refused). domain='{domain}'")]
         if dest.exists() and not overwrite:
             return [TextContent(type="text", text=f"install_thread: {dest} already exists. Pass overwrite=true to replace.")]
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
@@ -3041,23 +4150,49 @@ async def _execute_tool_action(name: str, arguments: dict):
         )
         return [TextContent(type="text", text=msg)]
 
-    # All other tools need a session
-    port = resolve_session(arguments["session"])
-    tabs = get_tabs(port)
-    if not tabs:
-        return [TextContent(type="text", text=f"Session '{arguments['session']}' is offline. Launch Chrome first:\n  .\\launch.ps1 -Session {arguments['session']}")]
+    # Marketplace + engine-status + auto-record + capture tools are pure HTTP
+    # + local file ops — they do NOT take a `session` arg and must skip the
+    # Chrome session resolution below. Without this guard, line `port =
+    # resolve_session(arguments["session"])` raises KeyError 'session' and the
+    # tool result reads "error: 'session'" (reported by other tab 2026-06-21).
+    _NO_SESSION_TOOLS = {
+        "webloom_pair", "webloom_browse", "webloom_thread_info",
+        "webloom_install", "webloom_library", "webloom_open_bounties",
+        "webloom_my_threads", "webloom_claim_bounty", "webloom_publish_thread",
+        "webloom_engine_status", "webloom_capture_session", "webloom_thread_status",
+        "webloom_thread_context",  # v0.3.10 — local Thread check, no session needed
+        # Autopilot tools — set up + manage headless mode without needing a Chrome yet
+        "launch_headless_chrome", "register_autostart",
+        "schedule_task", "autopilot_status",
+    }
+    if name in _NO_SESSION_TOOLS:
+        port = None
+        tabs = []
+    else:
+        # All other tools need a session
+        port = resolve_session(arguments["session"])
+        tabs = get_tabs(port)
+        if not tabs:
+            return [TextContent(type="text", text=f"Session '{arguments['session']}' is offline. Launch Chrome first:\n  .\\launch.ps1 -Session {arguments['session']}")]
 
     if name == "list_tabs":
         visible = real_tabs(tabs)
         lines = [f"**{i}. {t.get('title','(no title)')}**\n   {t.get('url','')}\n   id: {t['id']}" for i, t in enumerate(visible)]
         return [TextContent(type="text", text="\n\n".join(lines))]
 
-    # Resolve tab
-    tab_ref = arguments.get("tab", "")
-    tab = find_tab(tabs, tab_ref)
-    if not tab:
-        return [TextContent(type="text", text="No tabs found in this session.")]
-    ws_url = tab["webSocketDebuggerUrl"]
+    # Marketplace + status + capture tools never touch a tab — skip tab
+    # resolution so they reach their late dispatch handlers cleanly. Same
+    # reason as the session-resolution guard above.
+    if name in _NO_SESSION_TOOLS:
+        tab = None
+        ws_url = None
+    else:
+        # Resolve tab
+        tab_ref = arguments.get("tab", "")
+        tab = find_tab(tabs, tab_ref)
+        if not tab:
+            return [TextContent(type="text", text="No tabs found in this session.")]
+        ws_url = tab["webSocketDebuggerUrl"]
 
     # Resolve @eN references — any arg that holds a selector pointing into the
     # last AX scan gets expanded to a real CSS selector before downstream use.
@@ -3451,9 +4586,13 @@ async def _execute_tool_action(name: str, arguments: dict):
         msg = await navigate_and_wait_load(ws_url, target_url, timeout=timeout)
         # Record successful page transition. Critical for capturing multi-page flows
         # (KDP wizard /details → /content → /pricing, etc.) as sequence in playbook.
+        prev_domain = ""
+        cur_domain = ""
         try:
             from urllib.parse import urlparse
             tgt = domain_from_url(target_url)
+            prev_domain = domain_from_url(prev_url)
+            cur_domain = tgt or ""
             if tgt:
                 # Use path as descriptor so different pages on the same domain are distinct.
                 path = urlparse(target_url).path or "/"
@@ -3463,6 +4602,50 @@ async def _execute_tool_action(name: str, arguments: dict):
                 # but keep follows chain via the navigate descriptor
         except Exception:
             pass
+
+        # v0.3.8/v0.3.10 — auto-Thread-load on domain change.
+        # (1) Track the current domain per session so tab-op tools can inject an
+        #     active-Thread indicator into their responses.
+        # (2) On cross-domain navigate with an installed Thread → prime the agent
+        #     with a compact summary (v0.3.8 behavior).
+        # (3) On cross-domain navigate WITHOUT an installed Thread → suggest
+        #     install so the agent doesn't drive the site blind (v0.3.10).
+        try:
+            session_name = arguments.get("session", "main")
+            if cur_domain:
+                _LAST_DOMAIN_PER_SESSION[session_name] = cur_domain
+            if cur_domain and cur_domain != prev_domain:
+                installed = load_threads()
+                thread = installed.get(cur_domain)
+                if thread:
+                    proven = thread.get("proven_actions") or []
+                    notes = thread.get("notes") or []
+                    prime = [
+                        "",
+                        f"═══ 🧵 Thread available for {cur_domain}: **{thread.get('name', cur_domain)}** ═══",
+                    ]
+                    if notes:
+                        prime.append(f"  • {notes[0][:200]}")
+                    if len(proven) > 0:
+                        prime.append(f"  • {len(proven)} proven actions cached — click/fill will prefer these strategies")
+                    if thread.get("framework"):
+                        prime.append(f"  • Framework: {thread['framework']}")
+                    prime.append("  • Full Thread details: call `webloom_thread_info` with domain=" + cur_domain)
+                    msg = msg + "\n".join(prime)
+                else:
+                    # v0.3.10 — no Thread installed for this domain. Suggest install
+                    # so the agent doesn't drive blind + user can decide.
+                    hint = [
+                        "",
+                        f"═══ 🧵 No Thread installed for **{cur_domain}** ═══",
+                        f"  • Marketplace may have one. Check: `webloom_thread_info(domain=\"{cur_domain}\")`",
+                        f"  • Install if available: `install_thread(domain=\"{cur_domain}\")` (3-day free trial per Thread)",
+                        f"  • Or drive the site raw — the engine still works, just without site-specific recipes.",
+                    ]
+                    msg = msg + "\n".join(hint)
+        except Exception:
+            pass
+
         return [TextContent(type="text", text=msg)]
 
     if name == "upload_file":
@@ -4235,7 +5418,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         in_path = Path(arguments["in_path"])
         if not in_path.is_file():
             return [TextContent(type="text", text=f"import_profile: file not found: {in_path}")]
-        data = json.loads(in_path.read_text())
+        data = json.loads(in_path.read_text(encoding="utf-8"))
         cookies = data.get("cookies", [])
         if not cookies:
             return [TextContent(type="text", text="import_profile: no cookies in file.")]
@@ -4404,15 +5587,17 @@ async def _execute_tool_action(name: str, arguments: dict):
 
     if name == "scan_tab":
         mode = arguments.get("mode", "ax")
-        if mode == "ax":
-            r = await eval_in_tab(ws_url, SCAN_AX_JS)
+        if mode in ("ax", "ax-min"):
+            scan_js = SCAN_AX_MIN_JS if mode == "ax-min" else SCAN_AX_JS
+            r = await eval_in_tab(ws_url, scan_js)
             try:
                 data = json.loads(r.get("result", {}).get("value", "{}"))
             except Exception:
-                return [TextContent(type="text", text="scan_tab (ax): scan failed — page may still be loading.")]
+                return [TextContent(type="text", text=f"scan_tab ({mode}): scan failed — page may still be loading.")]
             url = data.get("url", "")
             domain = domain_from_url(url)
-            lines = [f"## AX Scan: {data.get('title')}", f"**URL:** {url}", ""]
+            header = "AX-Min Scan" if mode == "ax-min" else "AX Scan"
+            lines = [f"## {header}: {data.get('title')}", f"**URL:** {url}", ""]
             existing_pb = load_playbook().get(domain, {})
             if existing_pb:
                 pb_lines = [f"### Playbook for {domain}"]
@@ -4498,7 +5683,7 @@ async def _execute_tool_action(name: str, arguments: dict):
 
     if name == "key_type":
         text = arguments["text"]
-        delay = max(0, int(arguments.get("delay_ms", 30))) / 1000.0
+        delay = max(0, int(arguments.get("delay_ms", 0))) / 1000.0
         mode = arguments.get("mode", "keystrokes")  # "keystrokes" | "insertText" | "fast"
 
         if mode == "fast":
@@ -4562,10 +5747,15 @@ async def _execute_tool_action(name: str, arguments: dict):
             return ("", ch)
 
         if mode == "insertText":
-            for ch in text:
-                await cdp_send(ws_url, "Input.insertText", {"text": ch})
-                if delay:
+            # CDP Input.insertText takes a string — one round-trip for the whole
+            # buffer when no per-char pacing is requested. Loop only when the
+            # caller explicitly asked for a delay (stealth-typing on hostile sites).
+            if delay > 0:
+                for ch in text:
+                    await cdp_send(ws_url, "Input.insertText", {"text": ch})
                     await asyncio.sleep(delay)
+            else:
+                await cdp_send(ws_url, "Input.insertText", {"text": text})
             try:
                 tab_url_r = await eval_in_tab(ws_url, "location.href")
                 tab_dom = domain_from_url(tab_url_r.get("result", {}).get("value", ""))
@@ -6413,7 +7603,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         existing = []
         if file.exists():
             try:
-                existing = json.loads(file.read_text())
+                existing = json.loads(file.read_text(encoding="utf-8"))
             except Exception:
                 existing = []
         entry = {
@@ -6436,7 +7626,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         if not file.exists():
             return [TextContent(type="text", text=json.dumps({"ok": True, "domain": dom, "episodes": [], "hint": "No episodic memory stored for this domain yet."}, indent=2))]
         try:
-            existing = json.loads(file.read_text())
+            existing = json.loads(file.read_text(encoding="utf-8"))
         except Exception:
             existing = []
         recent = existing[-limit:][::-1]  # most recent first
@@ -7692,11 +8882,1210 @@ async def _execute_tool_action(name: str, arguments: dict):
             pass
         return [TextContent(type="text", text=f"Timeout: {selector} not found after {timeout_ms}ms")]
 
+    # ── Marketplace tools (in-chat browse/install/library/bounties) ──
+    if name == "webloom_capture_session":
+        result = auto_record.capture_session(
+            domain=str(arguments.get("domain", "")).lower().strip(),
+            last_minutes=int(arguments.get("last_minutes", 60) or 60),
+        )
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name == "webloom_engine_status":
+        force = bool(arguments.get("force_check", False))
+        if force:
+            d = _check_engine_update_once()
+        else:
+            try:
+                d = json.loads(_UPDATE_NOTICE_PATH.read_text(encoding="utf-8")) if _UPDATE_NOTICE_PATH.exists() else None
+            except Exception:
+                d = None
+            if d is None:
+                d = _check_engine_update_once()
+        result = {
+            "ok": True,
+            "running_version": ENGINE_VERSION,
+            "latest_version": d.get("latest") if d else None,
+            "update_available": bool(d and d.get("latest") and d.get("latest") != ENGINE_VERSION),
+            "mcpb_url": d.get("mcpb_url") if d else None,
+            "release_url": d.get("release_url") if d else None,
+            "install_hint": (d.get("install_hint") if d else "Could not reach webloom.run. Check your internet."),
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name in ("webloom_pair", "webloom_browse", "webloom_thread_info",
+                "webloom_install", "webloom_library", "webloom_open_bounties",
+                "webloom_my_threads", "webloom_claim_bounty", "webloom_publish_thread",
+                "webloom_thread_status"):
+        try:
+            from . import webloom_marketplace as wm  # type: ignore
+        except Exception:
+            import webloom_marketplace as wm  # type: ignore
+        if name == "webloom_pair":
+            result = wm.tool_pair(
+                anon_id=_get_anon_id(),
+                poll_seconds=int(arguments.get("poll_seconds", 180) or 180),
+                open_browser=bool(arguments.get("open_browser", True)),
+            )
+        elif name == "webloom_browse":
+            result = wm.tool_browse(
+                q=str(arguments.get("q", "") or ""),
+                tier=str(arguments.get("tier", "") or ""),
+                framework=str(arguments.get("framework", "") or ""),
+                category=str(arguments.get("category", "") or ""),
+                limit=int(arguments.get("limit", 20) or 20),
+            )
+        elif name == "webloom_thread_info":
+            result = wm.tool_thread_info(domain=str(arguments.get("domain", "")))
+        elif name == "webloom_install":
+            result = wm.tool_install(
+                domain=str(arguments.get("domain", "")),
+                confirm_paywall=bool(arguments.get("confirm_paywall", False)),
+                open_checkout=bool(arguments.get("open_checkout", True)),
+            )
+        elif name == "webloom_library":
+            result = wm.tool_library()
+        elif name == "webloom_open_bounties":
+            result = wm.tool_open_bounties(
+                category=str(arguments.get("category", "") or ""),
+                framework=str(arguments.get("framework", "") or ""),
+                limit=int(arguments.get("limit", 25) or 25),
+            )
+        elif name == "webloom_my_threads":
+            result = wm.tool_my_threads()
+        elif name == "webloom_claim_bounty":
+            result = wm.tool_claim_bounty(domain=str(arguments.get("domain", "")))
+        elif name == "webloom_publish_thread":
+            result = wm.tool_publish_thread(
+                domain=str(arguments.get("domain", "")),
+                thread_path=(str(arguments["thread_path"]) if arguments.get("thread_path") else None),
+            )
+        elif name == "webloom_thread_status":
+            result = wm.tool_thread_status(domain=str(arguments.get("domain", "") or ""))
+        else:
+            result = {"ok": False, "error": "unreachable"}
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PRO TIER TOOLS (v0.4.0 WIP — local dev only, not in published .mcpb yet)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    if name in ("ai_navigate", "network_intercept", "trace_view",
+                "extract_sdk", "stealth_pro", "multi_browser",
+                "launch_headless_chrome", "register_autostart",
+                "schedule_task", "autopilot_status"):
+
+        # --- Pro-gate. Admin emails auto-pass; everyone else checks subscription. ---
+        # During local dev (no engine session paired) we treat the caller as Pro too.
+        _ADMIN_EMAILS = {"nanomarche@gmail.com", "marchesonip@gmail.com", "dev@webloom.run"}
+        _is_pro = True
+        _pro_reason = "local_dev"
+        try:
+            from pathlib import Path as _P
+            _auth_path = _P.home() / ".webloom" / "auth.json"
+            if _auth_path.exists():
+                _auth = json.loads(_auth_path.read_text(encoding="utf-8"))
+                _email = (_auth.get("user_email") or "").lower().strip()
+                if _email in _ADMIN_EMAILS:
+                    _is_pro = True
+                    _pro_reason = "admin"
+                else:
+                    # Real Pro-sub check would call webloom.run/api/v1/pro-check?session_token=...
+                    # For now: any paired non-admin = NOT Pro (matches "free tier" reality).
+                    _is_pro = False
+                    _pro_reason = "non_admin_unpaired_to_pro"
+        except Exception:
+            pass
+
+        if not _is_pro:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False,
+                "pro_required": True,
+                "error": "This is a WebLoom Pro tool. Subscribe at https://webloom.run/pro ($14.97/mo) to unlock.",
+                "upgrade_url": "https://webloom.run/pro",
+                "reason": _pro_reason,
+            }, indent=2))]
+
+        # --- multi_browser stub ---
+        if name == "multi_browser":
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "status": "stub",
+                "message": "multi_browser is the v0.4.1 infrastructure release. Requires Playwright bridge (Firefox + WebKit don't speak CDP). Shipping after v0.4.0.",
+                "plan": [
+                    "Bundle Playwright Python alongside engine",
+                    "Mirror current CDP click/fill/upload primitives over Playwright's API",
+                    "Parallelize the same Thread across chromium/firefox/webkit",
+                    "Aggregate trace artifacts under one trace_view URL",
+                ],
+            }, indent=2))]
+
+        # --- network_intercept ---
+        if name == "network_intercept":
+            tab_ref = arguments.get("tab")
+            tabs = get_tabs(port)
+            tab = find_tab(tabs, tab_ref)
+            if not tab:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "no tab found"}, indent=2))]
+            ws_url = tab["webSocketDebuggerUrl"]
+            pattern = str(arguments.get("url_pattern", ""))
+            mode = str(arguments.get("mode", "log"))
+            mock_status = int(arguments.get("mock_status", 200))
+            mock_body = arguments.get("mock_body", "")
+            mock_ct = str(arguments.get("mock_content_type", "application/json"))
+            duration = min(300, int(arguments.get("duration_seconds", 30) or 30))
+
+            try:
+                await cdp_send(ws_url, "Fetch.enable", {
+                    "patterns": [{"urlPattern": f"*{pattern}*", "requestStage": "Request"}],
+                })
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"Fetch.enable failed: {e}"}, indent=2))]
+
+            captured = []
+            import time as _t
+            start = _t.time()
+            intercept_id = f"int_{int(start*1000)}"
+
+            # Brief synchronous intercept loop. Returns after duration_seconds OR first 50 matches.
+            # Real impl would background this on a CDP event listener — this is the simple v0.
+            try:
+                while _t.time() - start < duration and len(captured) < 50:
+                    msg = await cdp_send(ws_url, "Fetch.takePendingRequest", {}, raw_pass=True) if False else None
+                    # Poor-man's poll: wait then break — full event listener arrives in v0.4.1
+                    await asyncio.sleep(0.5)
+                    break  # ship a v0 that just records the enable + plan; real listener next iteration
+                # For now, finalize cleanly
+                await cdp_send(ws_url, "Fetch.disable", {})
+            except Exception:
+                try: await cdp_send(ws_url, "Fetch.disable", {})
+                except Exception: pass
+
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "intercept_id": intercept_id,
+                "pattern": pattern,
+                "mode": mode,
+                "note": "v0.4.0-alpha: Fetch.enable wired; full event-driven listener with continueRequest+fulfillRequest lands v0.4.1. Use eval_js + window.fetch override for now if you need real-time interception.",
+                "mock_config": {"status": mock_status, "content_type": mock_ct, "body_preview": str(mock_body)[:120]} if mode == "mock" else None,
+                "captured_count": len(captured),
+            }, indent=2))]
+
+        # --- trace_view ---
+        if name == "trace_view":
+            tab_ref = arguments.get("tab")
+            tabs = get_tabs(port)
+            tab = find_tab(tabs, tab_ref)
+            if not tab:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "no tab found"}, indent=2))]
+            ws_url = tab["webSocketDebuggerUrl"]
+            label = str(arguments.get("label", "") or "untitled")
+
+            # Capture: screenshot + page text + url
+            try:
+                shot = await cdp_send(ws_url, "Page.captureScreenshot", {"format": "png"})
+                png_b64 = shot.get("data") or shot.get("result", {}).get("data") or ""
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"screenshot failed: {e}"}, indent=2))]
+
+            try:
+                url_r = await eval_in_tab(ws_url, "location.href")
+                page_url = url_r.get("result", {}).get("value", "")
+                title_r = await eval_in_tab(ws_url, "document.title")
+                page_title = title_r.get("result", {}).get("value", "")
+                dom_r = await eval_in_tab(ws_url, "document.documentElement.outerHTML.slice(0, 50000)")
+                dom_snip = dom_r.get("result", {}).get("value", "")
+            except Exception:
+                page_url, page_title, dom_snip = "", "", ""
+
+            # POST to webloom.run/api/v1/trace
+            import urllib.request as _req, urllib.error as _err
+            try:
+                from webloom_marketplace import WEBLOOM_BASE_URL  # type: ignore
+            except Exception:
+                WEBLOOM_BASE_URL = os.environ.get("WEBLOOM_BASE_URL", "https://webloom.run")
+            payload = {
+                "anon_id": _get_anon_id(),
+                "label": label,
+                "url": page_url,
+                "title": page_title,
+                "screenshot_b64": png_b64,
+                "dom_snippet": dom_snip,
+                "engine_version": ENGINE_VERSION,
+                "captured_at": int(__import__("time").time()),
+            }
+            try:
+                req = _req.Request(
+                    f"{WEBLOOM_BASE_URL}/api/v1/trace",
+                    data=json.dumps(payload).encode(),
+                    method="POST",
+                    headers={"Content-Type": "application/json", "User-Agent": f"webloom-engine/{ENGINE_VERSION}"},
+                )
+                with _req.urlopen(req, timeout=15) as r:
+                    body = json.loads(r.read().decode())
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": True,
+                    "trace_id": body.get("trace_id"),
+                    "viewer_url": body.get("viewer_url"),
+                    "label": label,
+                }, indent=2))]
+            except _err.HTTPError as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"trace POST failed: HTTP {e.code}", "body": e.read().decode()[:300]}, indent=2))]
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"trace POST failed: {e}"}, indent=2))]
+
+        # --- extract_sdk ---
+        if name == "extract_sdk":
+            tab_ref = arguments.get("tab")
+            tabs = get_tabs(port)
+            tab = find_tab(tabs, tab_ref)
+            if not tab:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "no tab found"}, indent=2))]
+            ws_url = tab["webSocketDebuggerUrl"]
+            domain = str(arguments.get("domain", "")).lower().strip()
+            duration = int(arguments.get("duration_seconds", 60) or 60)
+            language = str(arguments.get("language", "python"))
+            use_llm = bool(arguments.get("synthesize_with_llm", True))
+
+            # Phase 1 — enable Network domain + capture matching requests
+            try:
+                await cdp_send(ws_url, "Network.enable", {})
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"Network.enable failed: {e}"}, indent=2))]
+
+            # Poll request log for `duration` seconds. v0 uses a simple sleep+harvest;
+            # event-driven full capture lands in v0.4.1 alongside network_intercept.
+            await asyncio.sleep(min(duration, 90))
+
+            # Harvest using Network.getResponseBody on the most recent requests via Performance API.
+            # As a v0, we collect what window.performance can tell us about resource entries.
+            harvest_js = """
+            JSON.stringify((window.performance?.getEntriesByType('resource') || [])
+                .filter(e => e.name.includes(""" + json.dumps(domain) + """))
+                .slice(-25)
+                .map(e => ({url: e.name, type: e.initiatorType, duration: Math.round(e.duration), transferSize: e.transferSize, encodedBodySize: e.encodedBodySize}))
+            )
+            """
+            try:
+                h = await eval_in_tab(ws_url, harvest_js)
+                rows = json.loads(h.get("result", {}).get("value", "[]"))
+            except Exception:
+                rows = []
+
+            if not rows:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "error": f"no requests captured for domain '{domain}' in {duration}s — try a longer duration or interact with the page during capture",
+                }, indent=2))]
+
+            # Phase 2 — deterministic emit (always works) or LLM-polished (if key available)
+            anth_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if use_llm and anth_key:
+                # Hand off synthesis to webloom.run/api/v1/synthesize (uses caller's key passthrough)
+                import urllib.request as _req
+                try:
+                    from webloom_marketplace import WEBLOOM_BASE_URL  # type: ignore
+                except Exception:
+                    WEBLOOM_BASE_URL = os.environ.get("WEBLOOM_BASE_URL", "https://webloom.run")
+                try:
+                    payload = {
+                        "anon_id": _get_anon_id(),
+                        "domain": domain,
+                        "language": language,
+                        "captured_requests": rows,
+                        "engine_version": ENGINE_VERSION,
+                    }
+                    req = _req.Request(
+                        f"{WEBLOOM_BASE_URL}/api/v1/synthesize",
+                        data=json.dumps(payload).encode(),
+                        method="POST",
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Anthropic-Key": anth_key,
+                            "User-Agent": f"webloom-engine/{ENGINE_VERSION}",
+                        },
+                    )
+                    with _req.urlopen(req, timeout=60) as r:
+                        body = json.loads(r.read().decode())
+                    return [TextContent(type="text", text=json.dumps({
+                        "ok": True,
+                        "mode": "llm_synthesized",
+                        "language": language,
+                        "domain": domain,
+                        "request_count": len(rows),
+                        "sdk_code": body.get("sdk_code", ""),
+                        "note": body.get("note", ""),
+                    }, indent=2))]
+                except Exception as e:
+                    # Fall through to deterministic path
+                    pass
+
+            # Deterministic fallback — emit raw stubs (always works, no LLM needed)
+            if language == "python":
+                lines = [f"# Generated by WebLoom extract_sdk — {domain}", "import requests", "", "BASE_URL = '...'", ""]
+                for r in rows[:15]:
+                    fn = r["url"].split("/")[-1].split("?")[0] or "endpoint"
+                    fn = "".join(c if c.isalnum() else "_" for c in fn).lower().strip("_") or "endpoint"
+                    lines.append(f"def {fn}():  # {r.get('type','')} · {r.get('duration',0)}ms · {r.get('transferSize',0)}B")
+                    lines.append(f"    return requests.get('{r['url']}').json()")
+                    lines.append("")
+                sdk_code = "\n".join(lines)
+            else:  # javascript
+                lines = [f"// Generated by WebLoom extract_sdk — {domain}", "const BASE_URL = '...';", ""]
+                for r in rows[:15]:
+                    fn = r["url"].split("/")[-1].split("?")[0] or "endpoint"
+                    fn = "".join(c if c.isalnum() else "_" for c in fn).lower().strip("_") or "endpoint"
+                    lines.append(f"export async function {fn}() {{  // {r.get('type','')} · {r.get('duration',0)}ms")
+                    lines.append(f"  const r = await fetch('{r['url']}');")
+                    lines.append(f"  return r.json();")
+                    lines.append("}")
+                    lines.append("")
+                sdk_code = "\n".join(lines)
+
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "mode": "deterministic",
+                "language": language,
+                "domain": domain,
+                "request_count": len(rows),
+                "sdk_code": sdk_code,
+                "note": "Deterministic mode (no LLM). Set ANTHROPIC_API_KEY for polished SDK with typed methods + auth handling.",
+            }, indent=2))]
+
+        # --- stealth_pro ---
+        if name == "stealth_pro":
+            tab_ref = arguments.get("tab")
+            tabs = get_tabs(port)
+            tab = find_tab(tabs, tab_ref)
+            if not tab:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "no tab found"}, indent=2))]
+            ws_url = tab["webSocketDebuggerUrl"]
+            level = str(arguments.get("level", "full"))
+            user_agent = str(arguments.get("user_agent", "") or "")
+            locale = str(arguments.get("locale", "") or "en-US")
+            timezone_id = str(arguments.get("timezone", "") or "America/Montevideo")
+
+            if level == "off":
+                # Clear overrides
+                try:
+                    await cdp_send(ws_url, "Network.setUserAgentOverride", {"userAgent": ""})
+                    await cdp_send(ws_url, "Emulation.setTimezoneOverride", {"timezoneId": ""})
+                except Exception:
+                    pass
+                return [TextContent(type="text", text=json.dumps({"ok": True, "level": "off", "message": "stealth overrides cleared"}, indent=2))]
+
+            # Sample a fresh desktop Chrome UA if none provided
+            if not user_agent:
+                import hashlib, time as _t
+                seed = int(_t.time()) % 4
+                ua_pool = [
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                ]
+                user_agent = ua_pool[seed]
+
+            applied = []
+
+            # 1. UA + Accept-Language via CDP
+            try:
+                await cdp_send(ws_url, "Network.setUserAgentOverride", {
+                    "userAgent": user_agent,
+                    "acceptLanguage": locale,
+                    "platform": "Win32" if "Windows" in user_agent else ("MacIntel" if "Mac" in user_agent else "Linux x86_64"),
+                })
+                applied.append("user_agent")
+                applied.append("accept_language")
+            except Exception as e:
+                applied.append(f"ua_failed:{e}")
+
+            # 2. Timezone
+            try:
+                await cdp_send(ws_url, "Emulation.setTimezoneOverride", {"timezoneId": timezone_id})
+                applied.append("timezone")
+            except Exception:
+                pass
+
+            # 3. Locale at JS level (navigator.language)
+            try:
+                await cdp_send(ws_url, "Emulation.setLocaleOverride", {"locale": locale})
+                applied.append("locale")
+            except Exception:
+                pass
+
+            # 4. Fingerprint masking via Page.addScriptToEvaluateOnNewDocument (full level only)
+            if level == "full":
+                mask_script = """
+                (function() {
+                  // navigator.webdriver → undefined
+                  try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch(e) {}
+                  // Plugins
+                  try { Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]}); } catch(e) {}
+                  // Languages
+                  try { Object.defineProperty(navigator, 'languages', {get: () => ['""" + locale + """', 'en']}); } catch(e) {}
+                  // Canvas fingerprint jitter
+                  try {
+                    const orig = HTMLCanvasElement.prototype.toDataURL;
+                    HTMLCanvasElement.prototype.toDataURL = function(...args) {
+                      const ctx = this.getContext('2d');
+                      if (ctx) { ctx.fillStyle = 'rgba(0,0,0,0.0001)'; ctx.fillRect(0, 0, 1, 1); }
+                      return orig.apply(this, args);
+                    };
+                  } catch(e) {}
+                  // WebGL vendor / renderer randomization
+                  try {
+                    const getParam = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(p) {
+                      if (p === 37445) return 'Intel Inc.';      // UNMASKED_VENDOR_WEBGL
+                      if (p === 37446) return 'Intel Iris OpenGL Engine';
+                      return getParam.apply(this, [p]);
+                    };
+                  } catch(e) {}
+                })();
+                """
+                try:
+                    await cdp_send(ws_url, "Page.addScriptToEvaluateOnNewDocument", {"source": mask_script})
+                    applied.append("fingerprint_mask")
+                except Exception as e:
+                    applied.append(f"mask_failed:{e}")
+
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "level": level,
+                "user_agent": user_agent,
+                "locale": locale,
+                "timezone": timezone_id,
+                "applied": applied,
+                "note": "Effective on next navigation. Reload the tab to fully apply fingerprint mask.",
+            }, indent=2))]
+
+        # --- ai_navigate ---
+        if name == "ai_navigate":
+            anth_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not anth_key:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "error": "ANTHROPIC_API_KEY env var not set — ai_navigate needs Claude vision + planning. Set the var and retry. (WebLoom never bills you for tokens; the key + cost stay with you.)",
+                }, indent=2))]
+
+            tab_ref = arguments.get("tab")
+            tabs = get_tabs(port)
+            tab = find_tab(tabs, tab_ref)
+            if not tab:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "no tab found"}, indent=2))]
+            ws_url = tab["webSocketDebuggerUrl"]
+            goal = str(arguments.get("goal", "")).strip()
+            max_steps = min(20, int(arguments.get("max_steps", 12) or 12))
+            model = str(arguments.get("model", "claude-sonnet-4-6"))
+            if not goal:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "goal required"}, indent=2))]
+
+            import urllib.request as _req
+            transcript = []
+            done = False
+            final_summary = ""
+
+            for step in range(max_steps):
+                # Snapshot: screenshot + URL + small AX scan
+                try:
+                    shot = await cdp_send(ws_url, "Page.captureScreenshot", {"format": "png"})
+                    png_b64 = shot.get("data") or shot.get("result", {}).get("data") or ""
+                    url_r = await eval_in_tab(ws_url, "location.href")
+                    page_url = url_r.get("result", {}).get("value", "")
+                    title_r = await eval_in_tab(ws_url, "document.title")
+                    page_title = title_r.get("result", {}).get("value", "")
+                except Exception as e:
+                    transcript.append({"step": step, "error": f"snapshot failed: {e}"})
+                    break
+
+                history_msgs = "\n".join([f"step {t['step']}: {t.get('action','')} → {t.get('result','')[:140]}" for t in transcript[-6:]])
+                planner_prompt = (
+                    f"You are driving a real Chrome browser to accomplish a user goal.\n\n"
+                    f"GOAL: {goal}\n\n"
+                    f"Current page: {page_title} ({page_url})\n"
+                    f"Steps taken so far:\n{history_msgs or '(none)'}\n\n"
+                    f"Available actions (respond with JSON ONLY): \n"
+                    f"  - {{\"action\": \"click\", \"description\": \"<text or selector>\"}}\n"
+                    f"  - {{\"action\": \"fill\", \"fields\": {{\"<label>\": \"<value>\"}}}}\n"
+                    f"  - {{\"action\": \"navigate\", \"url\": \"<url>\"}}\n"
+                    f"  - {{\"action\": \"key_press\", \"key\": \"<Enter|Tab|Escape|...>\"}}\n"
+                    f"  - {{\"action\": \"scroll\", \"direction\": \"down|up\", \"amount\": 500}}\n"
+                    f"  - {{\"action\": \"wait\", \"seconds\": 2}}\n"
+                    f"  - {{\"action\": \"done\", \"summary\": \"<what was accomplished>\"}}\n\n"
+                    f"Look at the screenshot. Decide the NEXT action. Reply with JSON only, no prose."
+                )
+
+                body = {
+                    "model": model,
+                    "max_tokens": 600,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png_b64}},
+                            {"type": "text", "text": planner_prompt},
+                        ],
+                    }],
+                }
+                try:
+                    req = _req.Request(
+                        "https://api.anthropic.com/v1/messages",
+                        data=json.dumps(body).encode(),
+                        headers={"x-api-key": anth_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    )
+                    with _req.urlopen(req, timeout=60) as r:
+                        api_resp = json.loads(r.read().decode())
+                    plan_text = api_resp.get("content", [{}])[0].get("text", "").strip()
+                    # Strip code fences if any
+                    if plan_text.startswith("```"):
+                        plan_text = plan_text.split("```")[1]
+                        if plan_text.startswith("json"):
+                            plan_text = plan_text[4:]
+                    plan = json.loads(plan_text.strip())
+                except Exception as e:
+                    transcript.append({"step": step, "error": f"planner failed: {e}"})
+                    break
+
+                action = plan.get("action", "")
+                step_record = {"step": step, "action": action, "plan": plan, "result": ""}
+
+                if action == "done":
+                    final_summary = plan.get("summary", "")
+                    step_record["result"] = "✓ done"
+                    transcript.append(step_record)
+                    done = True
+                    break
+
+                try:
+                    if action == "click":
+                        # Reuse the existing click ladder by simulating arguments
+                        sub_args = {"session": arguments["session"], "tab": tab_ref, "description": plan.get("description", "")}
+                        sub_args = {k: v for k, v in sub_args.items() if v is not None}
+                        # Inline the click logic via a recursive-ish call would be ideal; for v0 do raw JS click as fallback
+                        desc = plan.get("description", "")
+                        click_js = f"(function(){{ const els = Array.from(document.querySelectorAll('button, a, [role=button], input[type=submit]')); const m = els.find(el => (el.innerText||'').trim().toLowerCase().includes({json.dumps(desc.lower())})) || document.querySelector({json.dumps(desc)}); if (m) {{ m.click(); return 'clicked: ' + (m.innerText||m.tagName).slice(0,60); }} return 'not found: ' + {json.dumps(desc)[:120]}; }})()"
+                        cr = await eval_in_tab(ws_url, click_js)
+                        step_record["result"] = cr.get("result", {}).get("value", "?")
+                    elif action == "fill":
+                        fields = plan.get("fields", {})
+                        for k, v in fields.items():
+                            fill_js = f"(function(){{ const el = Array.from(document.querySelectorAll('input, textarea')).find(e => (e.name||e.id||e.placeholder||'').toLowerCase().includes({json.dumps(k.lower())})); if (el) {{ const proto = el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype; Object.getOwnPropertyDescriptor(proto,'value').set.call(el, {json.dumps(v)}); el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return 'filled ' + {json.dumps(k)}; }} return 'no field for ' + {json.dumps(k)}; }})()"
+                            fr = await eval_in_tab(ws_url, fill_js)
+                            step_record["result"] += fr.get("result", {}).get("value", "?") + " · "
+                    elif action == "navigate":
+                        await cdp_send(ws_url, "Page.navigate", {"url": plan.get("url", "")})
+                        step_record["result"] = f"navigated to {plan.get('url', '')}"
+                        await asyncio.sleep(2)
+                    elif action == "key_press":
+                        key = plan.get("key", "Enter")
+                        vk = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8}.get(key, 0)
+                        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": key, "code": key, "windowsVirtualKeyCode": vk})
+                        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key, "code": key, "windowsVirtualKeyCode": vk})
+                        step_record["result"] = f"pressed {key}"
+                    elif action == "scroll":
+                        amount = int(plan.get("amount", 500))
+                        if plan.get("direction") == "up":
+                            amount = -amount
+                        await eval_in_tab(ws_url, f"window.scrollBy(0, {amount})")
+                        step_record["result"] = f"scrolled {amount}px"
+                    elif action == "wait":
+                        await asyncio.sleep(min(10, float(plan.get("seconds", 1))))
+                        step_record["result"] = "waited"
+                    else:
+                        step_record["result"] = f"unknown action: {action}"
+                except Exception as e:
+                    step_record["result"] = f"error: {e}"
+
+                transcript.append(step_record)
+                await asyncio.sleep(0.5)  # let the page react
+
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "done": done,
+                "steps_used": len(transcript),
+                "max_steps": max_steps,
+                "summary": final_summary,
+                "goal": goal,
+                "transcript": transcript,
+                "note": "v0 agent loop. Tokens billed to your Anthropic key. trace_view between steps for richer debugging.",
+            }, indent=2))]
+
+        # ═════════════════════════════════════════════════════════════════
+        # AUTOPILOT TOOLS — cross-platform Chrome + service + scheduling
+        # ═════════════════════════════════════════════════════════════════
+        # These four together let Claude configure WebLoom for headless
+        # background use on ANY host, using OS-native mechanisms.
+
+        if name == "launch_headless_chrome":
+            import platform as _plat
+            from pathlib import Path as _P
+            _system = _plat.system()  # 'Windows', 'Darwin', 'Linux'
+            port = int(arguments.get("port", 9223) or 9223)
+            session_name = str(arguments.get("session_name", "headless") or "headless")
+            profile_dir = arguments.get("profile_dir") or str(_P.home() / ".webloom" / "headless-profile")
+            chrome_path = arguments.get("chrome_path")
+
+            # Detect Chrome / Chromium / Edge / Brave based on OS
+            if not chrome_path:
+                _candidates = []
+                if _system == "Windows":
+                    _candidates = [
+                        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                        r"C:\Program Files\Chromium\Application\chrome.exe",
+                        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                    ]
+                elif _system == "Darwin":
+                    _candidates = [
+                        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                    ]
+                else:  # Linux
+                    for bin_name in ("google-chrome-stable", "google-chrome", "chromium-browser", "chromium", "microsoft-edge"):
+                        import shutil as _sh
+                        found = _sh.which(bin_name)
+                        if found:
+                            _candidates.append(found)
+                for c in _candidates:
+                    if _P(c).exists():
+                        chrome_path = c
+                        break
+                if not chrome_path:
+                    return [TextContent(type="text", text=json.dumps({
+                        "ok": False,
+                        "error": f"no Chrome/Chromium/Edge/Brave binary found on this {_system} host. Install one or pass chrome_path explicitly.",
+                    }, indent=2))]
+
+            # Make dirs
+            _P(profile_dir).mkdir(parents=True, exist_ok=True)
+            _log_dir = _P.home() / ".webloom" / "logs"
+            _log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = str(_log_dir / f"chrome-{port}.log")
+
+            # Kill anything on the port already (so this is idempotent)
+            import subprocess as _sp
+            try:
+                if _system == "Windows":
+                    _sp.run(["powershell", "-NoProfile", "-Command",
+                             f"Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | "
+                             f"Select -ExpandProperty OwningProcess | ForEach {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"],
+                            capture_output=True, timeout=10)
+                else:
+                    _sp.run(["bash", "-lc", f"lsof -ti tcp:{port} 2>/dev/null | xargs -r kill 2>/dev/null || true"],
+                            capture_output=True, timeout=10)
+            except Exception:
+                pass
+
+            # Build Chrome flags
+            chrome_flags = [
+                "--headless=new",
+                f"--remote-debugging-port={port}",
+                "--remote-debugging-address=127.0.0.1",
+                f"--user-data-dir={profile_dir}",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-features=Translate",
+                # A windowless Chrome defaults to a small viewport, and responsive sites read
+                # that as a phone. Spotify for Artists, for one, refuses video uploads with
+                # "head to artists.spotify.com on your desktop device" — the session is fine,
+                # the window is just narrow, and nothing in the error hints at that. A desktop
+                # size costs nothing and removes a whole class of confusing failures.
+                "--window-size=1600,1000",
+                "about:blank",
+            ]
+
+            # Launch detached
+            try:
+                if _system == "Windows":
+                    # CREATE_NO_WINDOW + DETACHED_PROCESS so it survives the parent
+                    _CREATE_NO_WINDOW = 0x08000000
+                    _DETACHED_PROCESS = 0x00000008
+                    _sp.Popen([chrome_path] + chrome_flags,
+                              creationflags=_CREATE_NO_WINDOW | _DETACHED_PROCESS,
+                              stdout=open(log_file, "a"), stderr=_sp.STDOUT,
+                              close_fds=True)
+                else:
+                    _sp.Popen([chrome_path] + chrome_flags,
+                              stdout=open(log_file, "a"), stderr=_sp.STDOUT,
+                              start_new_session=True, close_fds=True)
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "error": f"failed to spawn Chrome: {e}",
+                }, indent=2))]
+
+            # Wait briefly for CDP to bind + probe
+            import time as _t
+            import urllib.request as _req
+            ready = False
+            for _ in range(15):
+                _t.sleep(0.5)
+                try:
+                    _req.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2).read()
+                    ready = True
+                    break
+                except Exception:
+                    continue
+
+            # Register the port in sessions.json so subsequent tools can attach by name
+            try:
+                sessions_path = _P(__file__).parent / "sessions.json"
+                if sessions_path.exists():
+                    sessions_data = json.loads(sessions_path.read_text(encoding="utf-8"))
+                else:
+                    sessions_data = {}
+                sessions_data[session_name] = {"port": port}
+                sessions_path.write_text(json.dumps(sessions_data, indent=2))
+            except Exception as e:
+                sessions_path_write_err = str(e)
+            else:
+                sessions_path_write_err = None
+
+            # Build a suggested launcher command so register_autostart is one call away
+            launcher_cmd = " ".join([f'"{chrome_path}"'] + chrome_flags)
+
+            return [TextContent(type="text", text=json.dumps({
+                "ok": ready,
+                "port": port,
+                "session_name": session_name,
+                "chrome_path": chrome_path,
+                "profile_dir": profile_dir,
+                "cdp_endpoint": f"http://127.0.0.1:{port}",
+                "sessions_json_updated": sessions_path_write_err is None,
+                "sessions_json_error": sessions_path_write_err,
+                "log_file": log_file,
+                "os": _system,
+                "next_step_launcher_command": launcher_cmd,
+                "next_step_hint": "Call register_autostart(name='webloom-headless', command=<the above launcher_command>) to survive reboots.",
+                "warning": None if ready else "Chrome spawned but the CDP probe did not respond within 7.5s. Check the log file.",
+            }, indent=2))]
+
+        if name == "register_autostart":
+            import platform as _plat
+            from pathlib import Path as _P
+            import subprocess as _sp
+            _system = _plat.system()
+            entry_name = str(arguments.get("name", "")).strip()
+            command = str(arguments.get("command", "")).strip()
+            scope = str(arguments.get("scope", "user"))
+            description = str(arguments.get("description", "") or f"WebLoom entry: {entry_name}")
+
+            if not entry_name or not command:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "error": "name and command are required",
+                }, indent=2))]
+
+            try:
+                if _system == "Windows":
+                    # Task Scheduler via schtasks. RU = User (interactive), no admin needed for /SC ONLOGON.
+                    # /F force-overwrite for idempotency.
+                    _sp.run(["schtasks", "/Delete", "/TN", entry_name, "/F"], capture_output=True, timeout=15)
+                    args = ["schtasks", "/Create",
+                            "/TN", entry_name,
+                            "/TR", command,
+                            "/SC", "ONLOGON",
+                            "/RL", "LIMITED" if scope == "user" else "HIGHEST",
+                            "/F"]
+                    if scope == "system":
+                        args += ["/RU", "SYSTEM"]
+                    res = _sp.run(args, capture_output=True, text=True, timeout=30)
+                    ok = res.returncode == 0
+                    detail = res.stdout.strip() + (("\n" + res.stderr.strip()) if res.stderr else "")
+
+                elif _system == "Darwin":
+                    # launchd plist in ~/Library/LaunchAgents/
+                    plist_path = _P.home() / "Library" / "LaunchAgents" / f"{entry_name}.plist"
+                    plist_path.parent.mkdir(parents=True, exist_ok=True)
+                    prog_args = command.split()  # naive split; users should quote heavy commands themselves
+                    prog_args_xml = "\n".join(f"        <string>{a}</string>" for a in prog_args)
+                    plist_body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{entry_name}</string>
+    <key>ProgramArguments</key>
+    <array>
+{prog_args_xml}
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>Nice</key><integer>19</integer>
+</dict>
+</plist>
+"""
+                    plist_path.write_text(plist_body)
+                    _sp.run(["launchctl", "unload", str(plist_path)], capture_output=True, timeout=10)
+                    res = _sp.run(["launchctl", "load", str(plist_path)], capture_output=True, text=True, timeout=15)
+                    ok = res.returncode == 0
+                    detail = f"plist: {plist_path}\n{res.stdout}\n{res.stderr}"
+
+                else:  # Linux
+                    if scope == "system":
+                        unit_dir = _P("/etc/systemd/system")
+                        systemctl = ["systemctl"]
+                    else:
+                        unit_dir = _P.home() / ".config" / "systemd" / "user"
+                        unit_dir.mkdir(parents=True, exist_ok=True)
+                        systemctl = ["systemctl", "--user"]
+                    unit_path = unit_dir / f"{entry_name}.service"
+                    unit_body = f"""[Unit]
+Description={description}
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={command}
+Restart=always
+RestartSec=5
+Nice=19
+
+[Install]
+WantedBy={'multi-user.target' if scope == 'system' else 'default.target'}
+"""
+                    unit_path.write_text(unit_body)
+                    _sp.run(systemctl + ["daemon-reload"], capture_output=True, timeout=10)
+                    res = _sp.run(systemctl + ["enable", "--now", f"{entry_name}.service"], capture_output=True, text=True, timeout=20)
+                    ok = res.returncode == 0
+                    detail = f"unit: {unit_path}\n{res.stdout}\n{res.stderr}"
+
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": ok,
+                    "os": _system,
+                    "scope": scope,
+                    "name": entry_name,
+                    "detail": detail[:800],
+                }, indent=2))]
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "os": _system, "error": f"{type(e).__name__}: {e}",
+                }, indent=2))]
+
+        if name == "schedule_task":
+            import platform as _plat
+            import subprocess as _sp
+            _system = _plat.system()
+            entry_name = str(arguments.get("name", "")).strip()
+            command = str(arguments.get("command", "")).strip()
+            cron = str(arguments.get("cron", "")).strip()
+            user_scope = bool(arguments.get("user_scope", True))
+
+            if not entry_name or not command or not cron:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "error": "name, command, and cron are all required",
+                }, indent=2))]
+
+            # Parse cron: minute hour dom month dow
+            parts = cron.split()
+            if len(parts) != 5:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "error": f"cron must be 5 space-separated fields (minute hour dom month dow), got {len(parts)}: {cron}",
+                }, indent=2))]
+            minute, hour, dom, month, dow = parts
+
+            try:
+                if _system == "Windows":
+                    # Translate cron → schtasks. Common patterns supported; edge cases fall back to raw MINUTE trigger.
+                    if minute.isdigit() and hour.isdigit() and dom == "*" and month == "*" and dow == "*":
+                        # Daily
+                        args = ["schtasks", "/Create", "/TN", entry_name, "/TR", command,
+                                "/SC", "DAILY", "/ST", f"{int(hour):02d}:{int(minute):02d}", "/F"]
+                    elif minute.isdigit() and hour.isdigit() and dow != "*":
+                        # Weekly on specific day-of-week (dow 0-6 → SUN-SAT)
+                        day_map = {"0": "SUN", "1": "MON", "2": "TUE", "3": "WED", "4": "THU", "5": "FRI", "6": "SAT", "7": "SUN"}
+                        days = ",".join(day_map.get(d, d.upper()) for d in dow.split(","))
+                        args = ["schtasks", "/Create", "/TN", entry_name, "/TR", command,
+                                "/SC", "WEEKLY", "/D", days, "/ST", f"{int(hour):02d}:{int(minute):02d}", "/F"]
+                    else:
+                        # Fallback: interpret as every-N-minutes
+                        return [TextContent(type="text", text=json.dumps({
+                            "ok": False,
+                            "error": f"cron pattern '{cron}' not directly translatable to schtasks. Use daily or weekly patterns, or use a Linux cron.",
+                        }, indent=2))]
+                    _sp.run(["schtasks", "/Delete", "/TN", entry_name, "/F"], capture_output=True, timeout=15)
+                    res = _sp.run(args, capture_output=True, text=True, timeout=30)
+                    ok = res.returncode == 0
+                    detail = res.stdout + res.stderr
+
+                else:  # Unix — user crontab
+                    # Read current crontab, strip prior entry with this name-tag, add new
+                    tag = f"# webloom-schedule:{entry_name}"
+                    r = _sp.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+                    lines = [ln for ln in (r.stdout or "").split("\n") if ln and tag not in ln]
+                    lines.append(f"{cron} {command}  {tag}")
+                    new_crontab = "\n".join(lines) + "\n"
+                    p = _sp.Popen(["crontab", "-"], stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+                    out, err = p.communicate(new_crontab, timeout=15)
+                    ok = p.returncode == 0
+                    detail = out + err
+                    # Also drop a mirror in /etc/cron.d/ if system-scope requested
+                    if not user_scope:
+                        from pathlib import Path as _P
+                        p2 = _P("/etc/cron.d") / entry_name
+                        try:
+                            p2.write_text(f"{cron} {os.environ.get('USER','root')} {command}  {tag}\n")
+                        except PermissionError:
+                            detail += "\n(system-scope /etc/cron.d write denied; user crontab still active)"
+
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": ok,
+                    "os": _system,
+                    "name": entry_name,
+                    "cron": cron,
+                    "user_scope": user_scope,
+                    "detail": detail[:800],
+                }, indent=2))]
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "os": _system, "error": f"{type(e).__name__}: {e}",
+                }, indent=2))]
+
+        if name == "autopilot_status":
+            import platform as _plat
+            from pathlib import Path as _P
+            import subprocess as _sp
+            _system = _plat.system()
+
+            # 1. sessions.json — what ports we know about
+            try:
+                sp = _P(__file__).parent / "sessions.json"
+                sessions_data = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+            except Exception:
+                sessions_data = {}
+
+            # 2. Probe each port to see if a CDP is answering
+            import urllib.request as _req
+            session_health = []
+            for name, meta in sessions_data.items():
+                port = meta.get("port")
+                if not port:
+                    continue
+                try:
+                    r = _req.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
+                    info = json.loads(r.read().decode())
+                    session_health.append({
+                        "name": name, "port": port, "ok": True,
+                        "browser": info.get("Browser", "?"),
+                    })
+                except Exception:
+                    session_health.append({"name": name, "port": port, "ok": False, "browser": None})
+
+            # 3. Registered autostart entries (best-effort per OS)
+            autostart = []
+            try:
+                if _system == "Windows":
+                    r = _sp.run(["schtasks", "/Query", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=15)
+                    for line in (r.stdout or "").split("\n"):
+                        if "webloom" in line.lower():
+                            autostart.append(line.strip())
+                elif _system == "Darwin":
+                    la = _P.home() / "Library" / "LaunchAgents"
+                    if la.exists():
+                        autostart = [f.name for f in la.iterdir() if "webloom" in f.name.lower()]
+                else:
+                    r = _sp.run(["systemctl", "--user", "list-units", "--type=service", "--all", "--no-pager"], capture_output=True, text=True, timeout=15)
+                    for line in (r.stdout or "").split("\n"):
+                        if "webloom" in line.lower():
+                            autostart.append(line.strip())
+            except Exception as e:
+                autostart = [f"probe failed: {e}"]
+
+            # 4. Scheduled tasks
+            scheduled = []
+            try:
+                if _system == "Windows":
+                    r = _sp.run(["schtasks", "/Query", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=15)
+                    for line in (r.stdout or "").split("\n"):
+                        if "webloom" in line.lower() and line not in autostart:
+                            scheduled.append(line.strip())
+                else:
+                    r = _sp.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+                    for line in (r.stdout or "").split("\n"):
+                        if line and ("webloom" in line.lower() or "webloom-schedule:" in line):
+                            scheduled.append(line.strip())
+            except Exception as e:
+                scheduled = [f"probe failed: {e}"]
+
+            # 5. Cookie profile path
+            cookies_dir = _P.home() / ".webloom" / "headless-profile"
+
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "os": _system,
+                "engine_version": ENGINE_VERSION,
+                "sessions_configured": list(sessions_data.keys()),
+                "session_health": session_health,
+                "autostart_entries": autostart,
+                "scheduled_tasks": scheduled,
+                "headless_profile_dir": str(cookies_dir),
+                "headless_profile_exists": cookies_dir.exists(),
+            }, indent=2))]
+
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 async def main():
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
+
+def _cli_autopilot(args: list[str]) -> int:
+    """
+    `python server.py autopilot <cmd>` — run WebLoom tools without an MCP client.
+
+    Turns WebLoom into a headless/VPS-friendly automation runtime. Cron jobs,
+    systemd timers, or GitHub Actions can drive Threads on a $5/mo box while
+    the user's laptop is off. Same tools, same Threads, same real Chrome —
+    just invoked from a shell instead of a chat.
+
+    Subcommands:
+      status                            — show Chrome + session state
+      run <tool> [--args '<JSON>'] [--session NAME] [--tab REF]
+                                        — invoke any WebLoom tool
+      run-recipe <recipe> --thread PATH [--params '<JSON>'] [--session NAME]
+                                        — execute a session_recipe from a Thread
+      ai-navigate --goal "text" [--max-steps N] [--session NAME] [--tab REF]
+                                        — LLM agent loop (needs ANTHROPIC_API_KEY)
+      install <domain> [--session NAME] — install a Thread from webloom.run
+      launch [--session NAME]           — launch/attach the Chrome session
+
+    Exit code: 0 on success, non-zero on failure. Stdout is JSON so downstream
+    scripts can pipe.
+    """
+    import asyncio, argparse, sys
+
+    ap = argparse.ArgumentParser(
+        prog="webloom-autopilot",
+        description="Run WebLoom on a VPS / cron / CI without an MCP client.",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", help="Show Chrome + session state")
+    p_status.add_argument("--session", default="main")
+
+    p_run = sub.add_parser("run", help="Invoke any WebLoom tool by name")
+    p_run.add_argument("tool", help="Tool name (e.g. click, fill, navigate)")
+    p_run.add_argument("--args", default="{}", help="JSON args dict")
+    p_run.add_argument("--session", default="main")
+    p_run.add_argument("--tab", default=None)
+
+    p_recipe = sub.add_parser("run-recipe", help="Replay a session_recipe from a Thread")
+    p_recipe.add_argument("recipe", help="Recipe name or id")
+    p_recipe.add_argument("--thread", required=True, help="Path to .thread.json")
+    p_recipe.add_argument("--params", default="{}", help="JSON params dict")
+    p_recipe.add_argument("--session", default="main")
+
+    p_ai = sub.add_parser("ai-navigate", help="LLM agent loop for a goal")
+    p_ai.add_argument("--goal", required=True)
+    p_ai.add_argument("--max-steps", type=int, default=12)
+    p_ai.add_argument("--session", default="main")
+    p_ai.add_argument("--tab", default=None)
+    p_ai.add_argument("--model", default="claude-sonnet-4-6")
+
+    p_install = sub.add_parser("install", help="Install a Thread from webloom.run")
+    p_install.add_argument("domain", help="Domain slug (e.g. distrokid.com)")
+    p_install.add_argument("--session", default="main")
+
+    p_launch = sub.add_parser("launch", help="Launch/attach the Chrome session")
+    p_launch.add_argument("--session", default="main")
+    p_launch.add_argument("--url", default=None)
+    p_launch.add_argument("--force-new", action="store_true")
+
+    parsed = ap.parse_args(args)
+
+    async def _dispatch() -> int:
+        try:
+            if parsed.cmd == "status":
+                result = await call_tool("chrome_status", {})
+            elif parsed.cmd == "run":
+                try:
+                    tool_args = json.loads(parsed.args) if parsed.args else {}
+                except json.JSONDecodeError as e:
+                    print(f"ERROR: --args is not valid JSON: {e}", file=sys.stderr)
+                    return 2
+                tool_args.setdefault("session", parsed.session)
+                if parsed.tab and "tab" not in tool_args:
+                    tool_args["tab"] = parsed.tab
+                result = await call_tool(parsed.tool, tool_args)
+            elif parsed.cmd == "run-recipe":
+                from pathlib import Path as _P
+                thread_path = _P(parsed.thread).expanduser().resolve()
+                if not thread_path.exists():
+                    print(f"ERROR: thread not found at {thread_path}", file=sys.stderr)
+                    return 2
+                try:
+                    params = json.loads(parsed.params) if parsed.params else {}
+                except json.JSONDecodeError as e:
+                    print(f"ERROR: --params is not valid JSON: {e}", file=sys.stderr)
+                    return 2
+                # Ensure the Thread is available to the engine before replay.
+                # Copy it to ~/.webloom/threads/ if it isn't already there.
+                try:
+                    thread_json = json.loads(thread_path.read_text(encoding="utf-8"))
+                    domain = thread_json.get("domain", "")
+                    if domain:
+                        threads_dir = _P.home() / ".webloom" / "threads"
+                        threads_dir.mkdir(parents=True, exist_ok=True)
+                        dest = threads_dir / f"{domain}.thread.json"
+                        if not dest.exists() or dest.stat().st_mtime < thread_path.stat().st_mtime:
+                            dest.write_text(thread_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+                result = await call_tool("replay_recipe", {
+                    "name": parsed.recipe,
+                    "parameters": params,
+                    "session": parsed.session,
+                })
+            elif parsed.cmd == "ai-navigate":
+                result = await call_tool("ai_navigate", {
+                    "goal": parsed.goal,
+                    "max_steps": parsed.max_steps,
+                    "session": parsed.session,
+                    "model": parsed.model,
+                    **({"tab": parsed.tab} if parsed.tab else {}),
+                })
+            elif parsed.cmd == "install":
+                result = await call_tool("webloom_install", {
+                    "domain": parsed.domain,
+                    "confirm_paywall": True,
+                    "open_checkout": False,
+                })
+            elif parsed.cmd == "launch":
+                result = await call_tool("launch_session", {
+                    "session": parsed.session,
+                    "confirmed_by_user": True,
+                    "force_new": parsed.force_new,
+                    **({"url": parsed.url} if parsed.url else {}),
+                })
+            else:
+                print(f"ERROR: unknown subcommand '{parsed.cmd}'", file=sys.stderr)
+                return 2
+
+            # Result is a list of TextContent; print each text payload.
+            # Return non-zero if any result payload looks like a failure.
+            exit_code = 0
+            for item in (result or []):
+                text = getattr(item, "text", "")
+                if text:
+                    print(text)
+                    # Heuristic: treat JSON with ok:false as failure
+                    try:
+                        parsed_out = json.loads(text)
+                        if isinstance(parsed_out, dict) and parsed_out.get("ok") is False:
+                            exit_code = 1
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            return exit_code
+        except Exception as e:
+            print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+
+    return asyncio.run(_dispatch())
+
 
 def _cli_telemetry(args: list[str]) -> int:
     """`python server.py telemetry on|off|preview|status` — persist user pref."""
@@ -7748,11 +10137,281 @@ def _cli_telemetry(args: list[str]) -> int:
     return 2
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# v0.3.9 — general CLI dispatcher.
+# `webloom <cmd> [args...]` lets you invoke tools without an MCP client.
+# Uses the SAME call_tool() code path as the MCP server so behavior is
+# identical: Pro gate, telemetry, playbook recording, everything.
+# ══════════════════════════════════════════════════════════════════════════
+_CLI_ALIASES = {
+    # short form → real MCP tool name
+    "scan":       "scan_tab",
+    "click":      "click",
+    "fill":       "fill",
+    "type":       "key_type",
+    "press":      "key_press",
+    "navigate":   "navigate",
+    "go":         "navigate",
+    "open":       "navigate",
+    "read":       "read_tab",
+    "shot":       "screenshot",
+    "screenshot": "screenshot",
+    "wait":       "wait_for",
+    "scroll":     "scroll_tab",
+    "tabs":       "list_tabs",
+    "eval":       "eval_js",
+    "chrome-status": "chrome_status",
+    "status":     "chrome_status",
+    "sessions":   "list_sessions",
+    "engine-status": "webloom_engine_status",
+    # Positional-arg maps: for each aliased tool, what the positional args map to
+    # (used when args aren't given with --key=val syntax)
+}
+_CLI_POSITIONAL = {
+    "navigate":  ["url"],
+    "click":     ["selector"],
+    "fill":      ["selector", "text"],
+    "key_type":  ["text"],
+    "key_press": ["key"],
+    "read_tab":  [],
+    "screenshot": [],
+    "eval_js":   ["expression"],
+    "wait_for":  ["selector"],
+    "scroll_tab": ["y"],
+    "chrome_status": [],
+    "list_tabs": [],
+    "list_sessions": [],
+    "scan_tab":  [],
+}
+
+
+def _cli_parse_args(argv: list[str], positional_names: list[str]) -> dict:
+    """Parse [pos1, pos2, --flag=val, --other, val] into a dict."""
+    out: dict = {"session": "main"}  # sane default so users don't have to type it
+    pos_idx = 0
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            key = a[2:]
+            if "=" in key:
+                k, v = key.split("=", 1)
+                out[k] = _cli_coerce(v)
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                out[key] = _cli_coerce(argv[i + 1])
+                i += 1
+            else:
+                out[key] = True
+        else:
+            if pos_idx < len(positional_names):
+                out[positional_names[pos_idx]] = _cli_coerce(a)
+                pos_idx += 1
+            else:
+                # extra positional → ignore or append to a bucket
+                out.setdefault("_extra", []).append(a)
+        i += 1
+    return out
+
+
+def _cli_coerce(v: str):
+    """Coerce string to number or bool where obvious."""
+    if v in ("true", "True"): return True
+    if v in ("false", "False"): return False
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        pass
+    return v
+
+
+def _cli_render(result, json_out: bool = False) -> str:
+    """Render an MCP tool result list (of TextContent etc) into printable text."""
+    if isinstance(result, list):
+        parts = []
+        for r in result:
+            text = getattr(r, "text", None)
+            if text is not None:
+                parts.append(text)
+            else:
+                parts.append(str(r))
+        joined = "\n".join(parts)
+    else:
+        joined = str(result)
+    if json_out:
+        import json as _j
+        return _j.dumps({"result": joined})
+    return joined
+
+
+def _cli_help() -> str:
+    lines = [
+        f"WebLoom CLI v{ENGINE_VERSION}",
+        "",
+        "USAGE:",
+        "  webloom <command> [args...]",
+        "",
+        "COMMANDS:",
+        "  version                          print engine version",
+        "  help                             show this message",
+        "  docs [tool_name]                 list all tools (or show one tool's docs)",
+        "  threads list                     list installed Threads",
+        "  threads get <domain>             show details of a Thread",
+        "  threads install <domain>         install a Thread from the marketplace",
+        "  chrome status                    Chrome session + tab health",
+        "  scan [--tab N] [--mode ax-min|ax|full] [--session name]",
+        "  navigate <url> [--tab N]",
+        "  click <selector> [--tab N]",
+        "  fill <selector> <text> [--tab N]",
+        "  read [--tab N]                   plain-text read of the current tab",
+        "  screenshot [--tab N]             PNG to ~/.webloom/screenshots/",
+        "",
+        "  telemetry on|off|status|preview  telemetry sub-CLI (legacy)",
+        "  autopilot <cmd>                  autopilot sub-CLI (headless VPS setup)",
+        "",
+        "GLOBAL FLAGS:",
+        "  --session <name>                 slot name (default: main)",
+        "  --tab <index_or_id>              tab to target (default: first tab)",
+        "  --json                           output JSON envelope instead of text",
+        "",
+        "EXAMPLES:",
+        "  webloom version",
+        "  webloom docs scan_tab",
+        "  webloom navigate https://linkedin.com/feed",
+        "  webloom scan --mode ax-min",
+        "  webloom click @e3",
+        "  webloom fill \"input[name=email]\" \"foo@bar.com\"",
+        "  webloom threads list",
+    ]
+    return "\n".join(lines)
+
+
+async def _cli_get_tool_docs(tool_name: str | None) -> str:
+    """Return docs for one tool or a list of all tool names."""
+    tools = await list_tools()
+    if not tool_name:
+        # List all tools with a one-liner
+        lines = [f"WebLoom v{ENGINE_VERSION} — {len(tools)} tools available", ""]
+        for t in tools:
+            desc = (t.description or "").split(". ")[0][:100]
+            lines.append(f"  {t.name:32}  {desc}")
+        lines.append("")
+        lines.append("For a specific tool: webloom docs <tool_name>")
+        return "\n".join(lines)
+    match = next((t for t in tools if t.name == tool_name), None)
+    if not match:
+        # Fuzzy: check aliases
+        real = _CLI_ALIASES.get(tool_name)
+        if real:
+            match = next((t for t in tools if t.name == real), None)
+    if not match:
+        # Substring hint
+        hits = [t.name for t in tools if tool_name.lower() in t.name.lower()]
+        return f"No tool named '{tool_name}'." + (f" Did you mean: {', '.join(hits[:5])}?" if hits else "")
+    import json as _j
+    return f"# {match.name}\n\n{match.description}\n\n## Input schema\n\n{_j.dumps(match.inputSchema, indent=2)}"
+
+
+def _cli_run(argv: list[str]) -> int:
+    """General-purpose CLI dispatcher. Returns exit code."""
+    if not argv:
+        print(_cli_help())
+        return 0
+    cmd = argv[0]
+    rest = argv[1:]
+    json_out = "--json" in rest
+    rest = [a for a in rest if a != "--json"]
+
+    # Simple commands (no async needed)
+    if cmd in ("version", "-v", "--version"):
+        print(ENGINE_VERSION)
+        return 0
+    if cmd in ("help", "-h", "--help"):
+        print(_cli_help())
+        return 0
+
+    # docs [tool_name]
+    if cmd == "docs":
+        tool_name = rest[0] if rest else None
+        try:
+            print(asyncio.run(_cli_get_tool_docs(tool_name)))
+            return 0
+        except Exception as e:
+            print(f"docs failed: {e}")
+            return 1
+
+    # threads subcommands — dispatch to list_threads / webloom_thread_info / install_thread
+    if cmd == "threads":
+        sub = rest[0] if rest else "list"
+        subargs = rest[1:]
+        if sub in ("list", "ls"):
+            tool_name = "list_threads"
+            args = {}
+        elif sub in ("get", "info", "show"):
+            if not subargs:
+                print("usage: webloom threads get <domain>")
+                return 2
+            tool_name = "webloom_thread_info"
+            args = {"domain": subargs[0]}
+        elif sub in ("install", "add"):
+            if not subargs:
+                print("usage: webloom threads install <domain>")
+                return 2
+            tool_name = "install_thread"
+            args = {"domain": subargs[0]}
+        else:
+            print(f"unknown threads subcommand: {sub}. try: list | get | install")
+            return 2
+        try:
+            result = asyncio.run(call_tool(tool_name, args))
+            print(_cli_render(result, json_out))
+            return 0
+        except Exception as e:
+            print(f"threads {sub} failed: {e}")
+            return 1
+
+    # chrome subcommands (currently just status)
+    if cmd == "chrome":
+        sub = rest[0] if rest else "status"
+        if sub == "status":
+            try:
+                result = asyncio.run(call_tool("chrome_status", {}))
+                print(_cli_render(result, json_out))
+                return 0
+            except Exception as e:
+                print(f"chrome status failed: {e}")
+                return 1
+        print(f"unknown chrome subcommand: {sub}")
+        return 2
+
+    # Generic tool dispatch via alias table
+    tool_name = _CLI_ALIASES.get(cmd, cmd)
+    positional = _CLI_POSITIONAL.get(tool_name, [])
+    args = _cli_parse_args(rest, positional)
+    try:
+        result = asyncio.run(call_tool(tool_name, args))
+        print(_cli_render(result, json_out))
+        return 0
+    except Exception as e:
+        print(f"webloom {cmd}: {e}")
+        return 1
+
+
 if __name__ == "__main__":
     import sys as _sys
     # CLI subcommands run BEFORE the MCP stdio loop
     if len(_sys.argv) >= 2 and _sys.argv[1] == "telemetry":
         _sys.exit(_cli_telemetry(_sys.argv[2:]))
+    if len(_sys.argv) >= 2 and _sys.argv[1] == "autopilot":
+        _sys.exit(_cli_autopilot(_sys.argv[2:]))
+    # v0.3.9 — any other subcommand goes to the general CLI dispatcher.
+    # The MCP stdio loop only runs when server.py is invoked with NO args
+    # (which is how MCP clients start it).
+    if len(_sys.argv) >= 2:
+        _sys.exit(_cli_run(_sys.argv[1:]))
 
     # Optional process-hygiene wrapper. Only loaded when running from the
     # MCP Studio monorepo where _lib/bulletproof.py exists. On a fresh
