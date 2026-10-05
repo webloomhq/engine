@@ -10019,6 +10019,40 @@ async def _minimize_windows(port: int) -> int:
     return done
 
 
+async def _pump_frames(sname: str, every_s: float = 0.4) -> None:
+    """A minimized Chrome stops drawing, and pages that build their controls when they draw (Upwork's dashboards
+    wait for a frame) never finish while an unattended run waits for them. A tiny screenshot asks Chrome for one
+    frame; asking every few hundred milliseconds keeps the session's pages drawing, with the window still
+    minimized and the person's focus untouched. Only for a minimized window; any error just stops the pump."""
+    try:
+        cfg = load_sessions().get(sname)
+        if not cfg or not _port_live(cfg["port"]):
+            return
+        port = cfg["port"]
+        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+            browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
+        pages = [t for t in get_tabs(port) if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+        if not pages:
+            return
+        win = await cdp_send(browser_ws, "Browser.getWindowForTarget", {"targetId": pages[0]["id"]}, retries=0)
+        state = ((win.get("bounds") or (win.get("result") or {}).get("bounds") or {}).get("windowState"))
+        if state != "minimized":
+            return
+        clip = {"format": "jpeg", "quality": 5, "clip": {"x": 0, "y": 0, "width": 4, "height": 4, "scale": 1}}
+        while True:
+            for t in get_tabs(port):
+                if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and not t.get("url", "").startswith("chrome"):
+                    try:
+                        await asyncio.wait_for(cdp_send(t["webSocketDebuggerUrl"], "Page.captureScreenshot", clip, retries=0), 3)
+                    except Exception:
+                        pass
+            await asyncio.sleep(every_s)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return
+
+
 async def _close_browser(port: int, wait_s: float = 15) -> bool:
     """Browser.close through CDP: Chrome saves its profile and exits like a person closing it. True once the port
     stops answering."""
@@ -10167,7 +10201,11 @@ def _cli_autopilot(args: list[str]) -> int:
                     tool_args["tab"] = parsed.tab
                 if os.environ.get("WEBLOOM_AUTOLAUNCH") == "1":
                     await _ensure_session_live(tool_args["session"])
-                result = await call_tool(parsed.tool, tool_args)
+                pump = asyncio.ensure_future(_pump_frames(tool_args["session"]))
+                try:
+                    result = await call_tool(parsed.tool, tool_args)
+                finally:
+                    pump.cancel()
             elif parsed.cmd == "run-recipe":
                 from pathlib import Path as _P
                 thread_path = _P(parsed.thread).expanduser().resolve()
