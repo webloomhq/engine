@@ -26,6 +26,25 @@ from pathlib import Path
 import websockets
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent))
+
+
+def _load_local_env() -> None:
+    # Optional .env next to server.py (gitignored, never packaged). Real env vars win.
+    p = Path(__file__).parent / ".env"
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_local_env()
+
 import recording  # noqa: E402
 import auto_record  # noqa: E402
 
@@ -3482,8 +3501,10 @@ _LEARNING_TOOLS: set[str] = {
     "capture_network_start", "capture_network_stop", "get_captured_requests",
 }
 
-_ADMIN_EMAILS: set[str] = {
-    "nanomarche@gmail.com", "marchesonip@gmail.com", "dev@webloom.run",
+_ADMIN_EMAILS: set[str] = {"dev@webloom.run"} | {
+    e.strip().lower()
+    for e in os.environ.get("WEBLOOM_ADMIN_EMAILS", "").split(",")
+    if e.strip()
 }
 
 
@@ -9035,7 +9056,6 @@ async def _execute_tool_action(name: str, arguments: dict):
 
         # --- Pro-gate. Admin emails auto-pass; everyone else checks subscription. ---
         # During local dev (no engine session paired) we treat the caller as Pro too.
-        _ADMIN_EMAILS = {"nanomarche@gmail.com", "marchesonip@gmail.com", "dev@webloom.run"}
         _is_pro = True
         _pro_reason = "local_dev"
         try:
