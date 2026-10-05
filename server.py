@@ -414,6 +414,15 @@ def get_tabs(port: int) -> list:
     except Exception:
         return []
 
+
+def _port_live(port: int) -> bool:
+    """True when a Chrome answers on this debug port, even with no tab open."""
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
 def find_tab(tabs: list, tab_ref: str) -> dict | None:
     """Find tab by id, title substring, or URL substring.
 
@@ -2158,9 +2167,9 @@ async def list_tools():
             "If 1–5 ALL fail, that's the moment to capture findings to a Thread and pause for human — not earlier. Site-wall claims need to exhaust this whole ladder first.\n"
             "Always pass absolute file paths."
         ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}, "react_input_selector": {"type": "string", "description": "Strategy E: CSS selector for a React-controlled file input, possibly inside shadow DOM. Walks shadow roots recursively to find the input, builds File objects in page JS, assigns via the native HTMLInputElement.files prototype setter (which React's controlled-input observer DOES notice — unlike B/D's synthetic path), fires input+change, AND invokes the input's onChange via fiber walk for handler-gated implementations. Use for LinkedIn composer + similar Lit/shadow-DOM React patterns. Max 25MB combined."}}, "required": ["session", "selector", "files"]}),
-        Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget — works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}}, "required": ["session"]}),
+        Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget, works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}, "background": {"type": "boolean", "description": "Open without raising the window (default: true in autopilot runs, false in chats)"}}, "required": ["session"]}),
         Tool(name="wait_for", description="Wait for an element to appear in a tab (polls every 500ms)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session", "selector"]}),
-        Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first — it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}}, "required": []}),
+        Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first: it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}, "background": {"type": "boolean", "default": False, "description": "Windows: open the window minimized without taking the focus, and keep the session's login confirmation (an unattended relaunch of the same profile). For scheduled jobs, not for a person who wants to see the window."}}, "required": []}),
         Tool(name="scan_tab", description="Page intelligence scan. Modes: 'ax-min' (v0.3.8, cheapest — ~80-200 tokens, format `@e1 button \"Sign in\"`, drops framework noise like Radix IDs); 'ax' (default — compressed accessibility tree with @eN refs, ~200-400 tokens, includes role brackets + placeholders + IDs); 'full' (legacy — every button/input/form with CSS selectors, ~5000 tokens, good for unfamiliar sites where you need everything). All modes share the same @eN ref cache so click/fill/key_type/upload work identically. Prefer ax-min for known/familiar sites; ax when you need placeholder/id hints; full only when nothing else works.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "mode": {"type": "string", "enum": ["ax-min", "ax", "full"], "default": "ax", "description": "ax-min = ultra-compact @eN + kind + label only (cheapest). ax = compact + roles/placeholders/ids (default). full = legacy verbose with CSS selectors."}, "save_to_playbook": {"type": "boolean", "default": True, "description": "Auto-save discovered structure to playbook for this domain (full mode only)"}}, "required": ["session"]}),
         Tool(name="get_playbook", description="Read everything Claude has learned about a domain — known quirks, field names, working patterns, affiliate links. Includes data merged from any installed Threads (profile packs).", inputSchema={"type": "object", "properties": {"domain": {"type": "string", "description": "Domain like bitget.com or mexc.com. Leave empty to list all known domains."}}, "required": []}),
         Tool(name="list_threads", description="List installable Threads (profile packs) currently discovered by WebLoom. Shows domain, version, source path, and which keys it contributes.", inputSchema={"type": "object", "properties": {}}),
@@ -3630,7 +3639,10 @@ async def _execute_tool_action(name: str, arguments: dict):
         except Exception:
             pass
 
-    if not _startup_was_done_recently() and name not in _STATUS_FREE and not _live_target:
+    # Autopilot (WEBLOOM_AUTOPILOT=1) is a scheduled script with nobody to answer, like the login gate below: the
+    # session check is for chats only. Without this, every unattended run after a quiet hour stopped here.
+    if (not _startup_was_done_recently() and name not in _STATUS_FREE and not _live_target
+            and not os.environ.get("WEBLOOM_AUTOPILOT")):
         _mark_startup_done()
         sessions = load_sessions()
         running = discover_running_chrome_sessions()
@@ -3787,11 +3799,40 @@ async def _execute_tool_action(name: str, arguments: dict):
             "--disable-features=IsolateOrigins,site-per-process,Translate",
             "--disable-infobars",
         ]
+        headless = bool(arguments.get("headless"))
+        if headless:
+            # no window at all; a real window size so pages lay out as on a laptop screen
+            args += ["--headless=new", "--window-size=1366,900"]
+        background = bool(arguments.get("background")) or headless
+        if background:
+            # a minimized window counts as hidden: without these Chrome slows its timers to a crawl and the
+            # pages an unattended run drives (single-page apps, forms) stall
+            args += ["--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+                     "--disable-backgrounding-occluded-windows"]
         if arguments.get("url"):
             args.append(arguments["url"])
-
-        subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        popen_kw = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        if background and os.name == "nt":
+            # Minimized and never activated: whatever window the person is using keeps the focus.
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+            popen_kw["startupinfo"] = si
+        subprocess.Popen(args, **popen_kw)
         await asyncio.sleep(2)
+
+        if background:
+            # An unattended relaunch of the same profile folder: the saved logins are the ones the person
+            # already confirmed, so their confirmation stands. Chrome restores its last window size (often
+            # maximized) whatever the start flags say, so the window is minimized once it answers.
+            for _ in range(15):
+                if _port_live(port):
+                    break
+                await asyncio.sleep(1)
+            minimized = await _minimize_windows(port) if _port_live(port) and not headless else 0
+            return [TextContent(type="text", text=json.dumps({"ok": True, "session": sname, "port": port,
+                                                               "background": True, "live": _port_live(port),
+                                                               "minimized_windows": minimized}))]
 
         # New session window — login state is unknown; clear any prior confirmation.
         _LOGIN_CONFIRMED.discard(sname)
@@ -5594,7 +5635,12 @@ async def _execute_tool_action(name: str, arguments: dict):
 
     if name == "new_tab":
         url = arguments.get("url", "about:blank")
-        result = await cdp_browser_send(port, "Target.createTarget", {"url": url})
+        # A foreground tab raises a minimized window over whatever the person is doing. Unattended runs
+        # (autopilot) open tabs in the background unless told otherwise.
+        bg = arguments.get("background")
+        if bg is None:
+            bg = bool(os.environ.get("WEBLOOM_AUTOPILOT"))
+        result = await cdp_browser_send(port, "Target.createTarget", {"url": url, "background": bool(bg)})
         target_id = result.get("targetId", "")
         return [TextContent(type="text", text=f"Opened tab: {target_id} — {url}")]
 
@@ -9946,6 +9992,77 @@ async def main():
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 
+async def _minimize_windows(port: int) -> int:
+    """Minimize every window of the Chrome on this port through CDP (no OS cursor, no focus change)."""
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+            browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
+    except Exception:
+        return 0
+    ids = set()
+    for t in get_tabs(port):
+        if t.get("type") != "page":
+            continue
+        try:
+            got = await cdp_send(browser_ws, "Browser.getWindowForTarget", {"targetId": t["id"]}, retries=0)
+            ids.add(got.get("windowId") or (got.get("result") or {}).get("windowId"))
+        except Exception:
+            pass
+    done = 0
+    for wid in ids - {None}:
+        try:
+            await cdp_send(browser_ws, "Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "minimized"}},
+                           retries=0)
+            done += 1
+        except Exception:
+            pass
+    return done
+
+
+async def _close_browser(port: int, wait_s: float = 15) -> bool:
+    """Browser.close through CDP: Chrome saves its profile and exits like a person closing it. True once the port
+    stops answering."""
+    if not _port_live(port):
+        return False
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+            browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
+        await cdp_send(browser_ws, "Browser.close", {}, retries=0)
+    except Exception:
+        pass  # the connection drops as Chrome exits; the port check below is the answer
+    _cdp_pool.clear()
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if not _port_live(port):
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _ensure_session_live(sname: str, wait_s: float = 30) -> bool:
+    """Unattended runs (WEBLOOM_AUTOLAUNCH=1): a configured session whose Chrome was closed is reopened in the
+    background, then this waits until its debug port answers. Windows only; elsewhere it only reports."""
+    try:
+        cfg = load_sessions().get(sname)
+    except Exception:
+        return False
+    if not cfg:
+        return False
+    if _port_live(cfg["port"]):
+        return True
+    if os.name != "nt":
+        return False
+    await call_tool("launch_session", {"session": sname, "confirmed_by_user": True, "force_new": True,
+                                       "background": True})
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if _port_live(cfg["port"]):
+            await asyncio.sleep(2)  # the first tab finishes opening
+            return True
+        await asyncio.sleep(1)
+    return False
+
+
 def _cli_autopilot(args: list[str]) -> int:
     """
     `python server.py autopilot <cmd>` — run WebLoom tools without an MCP client.
@@ -9964,7 +10081,11 @@ def _cli_autopilot(args: list[str]) -> int:
       ai-navigate --goal "text" [--max-steps N] [--session NAME] [--tab REF]
                                         — LLM agent loop (needs ANTHROPIC_API_KEY)
       install <domain> [--session NAME] — install a Thread from webloom.run
-      launch [--session NAME]           — launch/attach the Chrome session
+      launch [--session NAME] [--background]
+                                        launch/attach the Chrome session
+
+    WEBLOOM_AUTOLAUNCH=1 (Windows): before `run`, a configured session whose Chrome is closed is reopened
+    minimized, without taking the focus, from its own profile folder (its saved logins come back with it).
 
     Exit code: 0 on success, non-zero on failure. Stdout is JSON so downstream
     scripts can pipe.
@@ -10007,8 +10128,29 @@ def _cli_autopilot(args: list[str]) -> int:
     p_launch.add_argument("--session", default="main")
     p_launch.add_argument("--url", default=None)
     p_launch.add_argument("--force-new", action="store_true")
+    p_launch.add_argument("--background", action="store_true",
+                          help="Windows: minimized, without taking the focus")
+    p_launch.add_argument("--headless", action="store_true", help="no window at all")
+
+    p_live = sub.add_parser("live", help="Is the session's Chrome running? Prints {\"live\": true|false}")
+    p_live.add_argument("--session", default="main")
+
+    p_close = sub.add_parser("close", help="Close the session's Chrome cleanly (all its windows)")
+    p_close.add_argument("--session", default="main")
 
     parsed = ap.parse_args(args)
+
+    if parsed.cmd in ("live", "close"):
+        cfg = load_sessions().get(parsed.session)
+        if not cfg:
+            print(json.dumps({"ok": False, "error": f"unknown session {parsed.session}"}))
+            return 2
+        if parsed.cmd == "live":
+            print(json.dumps({"ok": True, "session": parsed.session, "live": _port_live(cfg["port"])}))
+            return 0
+        closed = asyncio.run(_close_browser(cfg["port"]))
+        print(json.dumps({"ok": True, "session": parsed.session, "closed": closed}))
+        return 0
 
     async def _dispatch() -> int:
         try:
@@ -10023,6 +10165,8 @@ def _cli_autopilot(args: list[str]) -> int:
                 tool_args.setdefault("session", parsed.session)
                 if parsed.tab and "tab" not in tool_args:
                     tool_args["tab"] = parsed.tab
+                if os.environ.get("WEBLOOM_AUTOLAUNCH") == "1":
+                    await _ensure_session_live(tool_args["session"])
                 result = await call_tool(parsed.tool, tool_args)
             elif parsed.cmd == "run-recipe":
                 from pathlib import Path as _P
@@ -10072,6 +10216,8 @@ def _cli_autopilot(args: list[str]) -> int:
                     "session": parsed.session,
                     "confirmed_by_user": True,
                     "force_new": parsed.force_new,
+                    "background": parsed.background,
+                    "headless": parsed.headless,
                     **({"url": parsed.url} if parsed.url else {}),
                 })
             else:
