@@ -16,7 +16,7 @@ Usage:
   python weaver.py list
 
 Threads live at ~/.webloom/threads/<domain>.thread.json and are the unit you
-share / sell on the WebLoom Atelier. Every Thread ships with its own pre-flight
+share / sell on the WebLoom marketplace at webloom.run. Every Thread ships with its own pre-flight
 because the probes that discovered it ARE the probes that validate it.
 """
 import argparse

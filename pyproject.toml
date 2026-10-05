@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "webloom-engine"
 version = "0.2.0"
 description = "WebLoom MCP engine + Python SDK for AI-driven browser automation"
-authors = [{ name = "WebLoom HQ", email = "hi@webloom.run" }]
+authors = [{ name = "WebLoom HQ", email = "dev@webloom.run" }]
 readme = "README.md"
 requires-python = ">=3.10"
 keywords = ["webloom", "mcp", "browser", "automation", "ai", "agent"]

@@ -106,7 +106,7 @@ Example: "Multi-Platform Book Launch Weave" depends on Threads for KDP, D2D, App
 | Profile packs | **Loom Threads** | Per-site knowledge | $5-30 each |
 | Workflow bundles | **Loom Weaves** | Multi-site automations | $50-500 each |
 | Subscription | **Loom Pro** | All Threads kept current + API access | $19-49/mo |
-| Marketplace | **Loom Atelier** | Where Threads and Weaves are sold | webloom.dev |
+| Marketplace | **WebLoom marketplace** | Where Threads and Weaves are sold | webloom.run |
 
 ---
 
@@ -241,7 +241,7 @@ Smoke test: 23/23 passing.
 | Engine: seed_thread_generator.py | Pending | Headless crawl that emits Seed Threads for popular sites |
 | Initial Thread library | In progress | KDP and D2D Threads exported tonight; ~100-200 Seed Threads via generator next |
 | webloom.dev landing page | Pending | Marketplace + docs |
-| webloom.dev/atelier listings for Pro Threads | Pending | KDP + D2D as flagship $19 listings |
+| Marketplace listings for Pro Threads | Pending | KDP + D2D as flagship $19 listings |
 | Discord/community space | Pending | Where Thread creators talk |
 
 ### Phase 2 — Extension companion (next 2-3 weeks)

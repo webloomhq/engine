@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security issue in WebLoom, please email **nanomarche@gmail.com** with details. We respond within 72 hours.
+If you discover a security issue in WebLoom, please email **dev@webloom.run** with details. We respond within 72 hours.
 
 Do NOT open a public GitHub issue for security reports — open one only after the fix has shipped.
 
@@ -133,4 +133,4 @@ Vendored libs in `vendor/x_client_transaction/` are pinned to the upstream commi
 
 ## Disclosing vulnerabilities
 
-Email **nanomarche@gmail.com**. We confirm receipt within 72 hours, fix within 14 days for high-severity issues, and publish the fix + write-up in CHANGELOG.md.
+Email **dev@webloom.run**. We confirm receipt within 72 hours, fix within 14 days for high-severity issues, and publish the fix + write-up in CHANGELOG.md.

@@ -89,10 +89,10 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Security
 
-See [SECURITY.md](./SECURITY.md). Report vulnerabilities to nanomarche@gmail.com.
+See [SECURITY.md](./SECURITY.md). Report vulnerabilities to dev@webloom.run.
 
 ## Author + contact
 
-Built by [MarStudio](https://webloom.run). Primary contact: nanomarche@gmail.com.
+Built by [MarStudio](https://webloom.run). Primary contact: dev@webloom.run.
 
 Issues and PRs welcome — open one at https://github.com/webloomhq/engine/issues.
