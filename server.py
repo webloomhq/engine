@@ -423,12 +423,17 @@ def load_sessions() -> dict:
     with open(SESSIONS_FILE, encoding="utf-8") as f:
         return json.load(f)
 
+# 127.0.0.1, never "localhost": on Windows "localhost" tries IPv6 first and Chrome's debug port only listens on IPv4,
+# so every request waited about 2 s before falling back (a 1+1 eval took over 20 s through the CLI)
+CDP_HOST = "127.0.0.1"
+
+
 def cdp_url(port: int) -> str:
-    return f"http://localhost:{port}"
+    return f"http://{CDP_HOST}:{port}"
 
 def get_tabs(port: int) -> list:
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/json", timeout=3) as r:
+        with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json", timeout=3) as r:
             return json.loads(r.read())
     except Exception:
         return []
@@ -437,7 +442,7 @@ def get_tabs(port: int) -> list:
 def _port_live(port: int) -> bool:
     """True when a Chrome answers on this debug port, even with no tab open."""
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+        with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
             return r.status == 200
     except Exception:
         return False
@@ -653,7 +658,7 @@ async def cdp_browser_send(port: int, method: str, params: dict = None) -> dict:
     Playwright FIRST (it claims the browser target), then WebLoom can still
     connect to individual page targets; the reverse order can lock Playwright out.
     """
-    with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=5) as r:
+    with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=5) as r:
         version = json.loads(r.read())
     ws_url = version.get("webSocketDebuggerUrl")
     if not ws_url:
@@ -10015,7 +10020,7 @@ async def main():
 async def _minimize_windows(port: int) -> int:
     """Minimize every window of the Chrome on this port through CDP (no OS cursor, no focus change)."""
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+        with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
             browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
     except Exception:
         return 0
@@ -10049,7 +10054,7 @@ async def _pump_frames(sname: str, every_s: float = 0.4) -> None:
         if not cfg or not _port_live(cfg["port"]):
             return
         port = cfg["port"]
-        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+        with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
             browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
         pages = [t for t in get_tabs(port) if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
         if not pages:
@@ -10077,7 +10082,7 @@ async def _window_state(port: int) -> str | None:
     """"minimized", "normal", "maximized" or "fullscreen" for the session's first window; None when unknown. An
     unattended run uses it to tell its own minimized window from one a person has on screen."""
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+        with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
             browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
         page = next((t for t in get_tabs(port) if t.get("type") == "page"), None)
         if not page:
@@ -10094,7 +10099,7 @@ async def _close_browser(port: int, wait_s: float = 15) -> bool:
     if not _port_live(port):
         return False
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+        with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
             browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
         await cdp_send(browser_ws, "Browser.close", {}, retries=0)
     except Exception:
@@ -10152,6 +10157,8 @@ def _cli_autopilot(args: list[str]) -> int:
       install <domain> [--session NAME] — install a Thread from webloom.run
       launch [--session NAME] [--background]
                                         launch/attach the Chrome session
+      live | close | minimize [--session NAME]
+                                        is it running (and its window state) / close it / minimize it
 
     WEBLOOM_AUTOLAUNCH=1 (Windows): before `run`, a configured session whose Chrome is closed is reopened
     minimized, without taking the focus, from its own profile folder (its saved logins come back with it).
@@ -10207,9 +10214,12 @@ def _cli_autopilot(args: list[str]) -> int:
     p_close = sub.add_parser("close", help="Close the session's Chrome cleanly (all its windows)")
     p_close.add_argument("--session", default="main")
 
+    p_min = sub.add_parser("minimize", help="Minimize every window of the session's Chrome (no cursor, no focus change)")
+    p_min.add_argument("--session", default="main")
+
     parsed = ap.parse_args(args)
 
-    if parsed.cmd in ("live", "close"):
+    if parsed.cmd in ("live", "close", "minimize"):
         cfg = load_sessions().get(parsed.session)
         if not cfg:
             print(json.dumps({"ok": False, "error": f"unknown session {parsed.session}"}))
@@ -10218,6 +10228,10 @@ def _cli_autopilot(args: list[str]) -> int:
             live = _port_live(cfg["port"])
             state = asyncio.run(_window_state(cfg["port"])) if live else None
             print(json.dumps({"ok": True, "session": parsed.session, "live": live, "window": state}))
+            return 0
+        if parsed.cmd == "minimize":
+            n = asyncio.run(_minimize_windows(cfg["port"])) if _port_live(cfg["port"]) else 0
+            print(json.dumps({"ok": True, "session": parsed.session, "minimized": n}))
             return 0
         closed = asyncio.run(_close_browser(cfg["port"]))
         print(json.dumps({"ok": True, "session": parsed.session, "closed": closed}))
