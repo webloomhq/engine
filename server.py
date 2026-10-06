@@ -10073,6 +10073,21 @@ async def _pump_frames(sname: str, every_s: float = 0.4) -> None:
         return
 
 
+async def _window_state(port: int) -> str | None:
+    """"minimized", "normal", "maximized" or "fullscreen" for the session's first window; None when unknown. An
+    unattended run uses it to tell its own minimized window from one a person has on screen."""
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3) as r:
+            browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
+        page = next((t for t in get_tabs(port) if t.get("type") == "page"), None)
+        if not page:
+            return None
+        got = await cdp_send(browser_ws, "Browser.getWindowForTarget", {"targetId": page["id"]}, retries=0)
+        return (got.get("bounds") or (got.get("result") or {}).get("bounds") or {}).get("windowState")
+    except Exception:
+        return None
+
+
 async def _close_browser(port: int, wait_s: float = 15) -> bool:
     """Browser.close through CDP: Chrome saves its profile and exits like a person closing it. True once the port
     stops answering."""
@@ -10200,7 +10215,9 @@ def _cli_autopilot(args: list[str]) -> int:
             print(json.dumps({"ok": False, "error": f"unknown session {parsed.session}"}))
             return 2
         if parsed.cmd == "live":
-            print(json.dumps({"ok": True, "session": parsed.session, "live": _port_live(cfg["port"])}))
+            live = _port_live(cfg["port"])
+            state = asyncio.run(_window_state(cfg["port"])) if live else None
+            print(json.dumps({"ok": True, "session": parsed.session, "live": live, "window": state}))
             return 0
         closed = asyncio.run(_close_browser(cfg["port"]))
         print(json.dumps({"ok": True, "session": parsed.session, "closed": closed}))
