@@ -2486,16 +2486,18 @@ async def list_tools():
         Tool(name="x_create_tweet", description="Post a tweet on X without typing into the DOM. Computes x-client-transaction-id from the page (reverses X's body-signed anti-replay header), refreshes ct0 from cookie, fires CreateTweet GraphQL POST from the tab context (cookies auto-attach). Zero manual seed needed — kills the seed-and-replay dance entirely. Use this instead of draftjs_set_text+click for X posting. Requires the X tab to be open and logged in.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching x.com (defaults to first x.com tab)"}, "text": {"type": "string", "description": "Tweet body"}, "query_id": {"type": "string", "description": "X's CreateTweet GraphQL queryId. Optional — if omitted, scraped from the page. Pass explicitly when scrape fails (X bundles changed)."}, "reply_to_tweet_id": {"type": "string", "description": "Optional — if set, posts as a reply to this tweet id."}}, "required": ["session", "text"]}),
         Tool(name="tiktok_sign", description="Compute TikTok's anti-bot signature for any URL via the page's own in-bundle signer. Reads window.byted_acrawler.sign(url) — TikTok exposes this on every page after the bundle loads, used for their own internal API calls. Returns {x-bogus, x-tt-params, signature, msToken} for the given URL so you can hit TikTok's authenticated API endpoints directly (POST aweme/create, upload, comment, follow, etc.) WITHOUT driving the DOM. msToken is read from cookie. Requires an already-loaded tiktok.com tab (any page; opens / first if needed).", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching tiktok.com (defaults to first one)"}, "url": {"type": "string", "description": "Full URL to sign. The signer takes the full URL including query params and returns the headers TikTok's API expects on that request."}}, "required": ["session", "url"]}),
         Tool(name="tiktok_post_video", description=(
-            "End-to-end TikTok video post via the upload-studio UI. Drives /tiktokstudio/upload: drops the file on the dropzone, fills caption + hashtags, "
-            "optionally toggles privacy, clicks Post, returns the resulting video URL. Pure DOM-driving (uses upload_file Strategy C internally) — works on "
-            "tiktok.com and tiktok-studio. For batch/native-API posting use tiktok_sign + replay_xhr instead."
+            "Post a video on TikTok through the logged-in TikTok Studio page (/tiktokstudio/upload): hands the file to the page, waits until it is fully uploaded, "
+            "types the caption with its line breaks, optionally sets a cover image, checks who can see it, clicks Post (confirming 'Post now' if the content check is still running) "
+            "and reads the post back from the content list. The video and cover paths must exist on the machine where that Chrome runs. "
+            "A new post is listed as 'Content under review' for a while before it goes out. For batch/native-API posting use tiktok_sign + replay_xhr instead."
         ), inputSchema={"type": "object", "properties": {
             "session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching tiktok.com (defaults to first)"},
-            "video_path": {"type": "string", "description": "Absolute local path to the video file (mp4 recommended, 1080×1920 vertical)."},
-            "caption": {"type": "string", "description": "Caption text. Hashtags can be embedded as `#tag` — TikTok converts them. Up to 2200 chars."},
+            "video_path": {"type": "string", "description": "Absolute path to the video (mp4, 1080x1920 vertical)."},
+            "caption": {"type": "string", "description": "Caption text; line breaks are kept. Hashtags as #tag. Up to 2200 chars."},
+            "cover_path": {"type": "string", "description": "Optional absolute path to a JPEG/PNG used as the cover."},
             "privacy": {"type": "string", "enum": ["public", "friends", "private"], "default": "public"},
-            "wait_for_upload_seconds": {"type": "integer", "default": 90, "description": "How long to wait for the upload to finish before clicking Post (file size dependent)."},
-            "drop_selector": {"type": "string", "description": "Override the drop-zone selector if TikTok rotates classes."},
+            "dry_run": {"type": "boolean", "default": False, "description": "Do every step except clicking Post, to check the account and the files."},
+            "wait_for_upload_seconds": {"type": "integer", "default": 300, "description": "How long to wait for the upload to finish before giving up."},
             "caption_selector": {"type": "string", "description": "Override the caption editor selector if TikTok rotates."},
             "post_button_selector": {"type": "string", "description": "Override the Post-button selector."},
         }, "required": ["session", "video_path", "caption"]}),
@@ -3835,6 +3837,11 @@ async def _execute_tool_action(name: str, arguments: dict):
             # pages an unattended run drives (single-page apps, forms) stall
             args += ["--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                      "--disable-backgrounding-occluded-windows"]
+        # Optional per-session exit: "proxy": "http://127.0.0.1:8890" in sessions.json. A session that
+        # is born here and then moved to a server should be born from the SAME exit the server uses,
+        # or the platform sees one account jump countries between login and first use.
+        if cfg.get("proxy"):
+            args.append(f"--proxy-server={cfg['proxy']}")
         if arguments.get("url"):
             args.append(arguments["url"])
         popen_kw = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
@@ -8422,21 +8429,22 @@ async def _execute_tool_action(name: str, arguments: dict):
         return [TextContent(type="text", text=f"tiktok_sign: {json.dumps(parsed)}")]
 
     if name == "tiktok_post_video":
-        # End-to-end UI-driven upload on tiktok.com/tiktokstudio/upload.
-        # Uses upload_file Strategy C internally (drop synthesis) which is the
-        # path TikTok's editor reliably accepts.
+        # End-to-end UI-driven post on tiktok.com/tiktokstudio/upload. Recipe proven live 2026-10-11
+        # (first @astradual post, headless Chrome on a server behind a residential proxy). Each step
+        # says what broke before it was written this way.
         video_path = arguments["video_path"]
         caption_text = arguments["caption"]
+        cover_path = arguments.get("cover_path") or ""
         privacy = arguments.get("privacy", "public")
-        wait_upload = int(arguments.get("wait_for_upload_seconds", 90))
-        drop_sel = arguments.get("drop_selector") or "[class*='upload-card'], [data-tt='Upload_index_dragArea'], .upload-stage, .file-upload, input[type=file]"
-        caption_sel = arguments.get("caption_selector") or "div[contenteditable='true'], [data-text='true'], textarea[name='caption']"
-        post_sel = arguments.get("post_button_selector") or "button[data-e2e='post_video_button'], button:has-text('Post'), [data-tt='upload_post_btn']"
+        wait_upload = int(arguments.get("wait_for_upload_seconds", 300))
+        caption_sel = arguments.get("caption_selector") or ".public-DraftEditor-content, div[contenteditable='true']"
+        post_sel = arguments.get("post_button_selector") or "button[data-e2e='post_video_button']"
 
         if not Path(video_path).is_file():
             return [TextContent(type="text", text=f"tiktok_post_video: file not found at {video_path}")]
+        if cover_path and not Path(cover_path).is_file():
+            return [TextContent(type="text", text=f"tiktok_post_video: cover not found at {cover_path}")]
 
-        # Resolve TikTok tab
         if not arguments.get("tab"):
             cur_url = (tab.get("url") or "").lower()
             if "tiktok.com" not in cur_url:
@@ -8448,210 +8456,263 @@ async def _execute_tool_action(name: str, arguments: dict):
                     return [TextContent(type="text", text="tiktok_post_video: no tiktok.com tab open. Open https://www.tiktok.com/tiktokstudio/upload and retry.")]
 
         steps = []
-        # 1. Navigate to the upload page
-        await cdp_send(ws_url, "Page.navigate", {"url": "https://www.tiktok.com/tiktokstudio/upload"})
-        await asyncio.sleep(3)
-        steps.append("navigated to /tiktokstudio/upload")
 
-        # 2. Drop the video file via Strategy C
-        from pathlib import Path as _P
-        try:
-            file_bytes = _P(video_path).read_bytes()
-        except Exception as e:
-            return [TextContent(type="text", text=f"tiktok_post_video: read file failed — {e}")]
-        if len(file_bytes) > 200 * 1024 * 1024:
-            return [TextContent(type="text", text=f"tiktok_post_video: file is {len(file_bytes)//(1024*1024)}MB, too large (200MB cap)")]
-        file_b64 = base64.b64encode(file_bytes).decode()
-        file_name = _P(video_path).name
-        drop_js = """(async function(dropSel, fileName, b64, mime) {
-            const target = document.querySelector(dropSel) || document.querySelector('input[type=file]');
-            if (!target) return JSON.stringify({ok:false, error:'no drop target at '+dropSel});
-            // Build File from base64
-            const bin = atob(b64);
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            const f = new File([bytes], fileName, {type: mime});
-            // If we found an input directly, set files via native setter + change
-            if (target.tagName === 'INPUT' && target.type === 'file') {
-                const dt = new DataTransfer();
-                dt.items.add(f);
-                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files').set;
-                setter.call(target, dt.files);
-                target.dispatchEvent(new Event('input', {bubbles:true}));
-                target.dispatchEvent(new Event('change', {bubbles:true}));
-                return JSON.stringify({ok:true, mode:'native-setter'});
-            }
-            // Otherwise synthesize drop events on the zone
-            const r = target.getBoundingClientRect();
-            const cx = r.left + r.width/2, cy = r.top + r.height/2;
-            const dt = new DataTransfer();
-            dt.items.add(f);
-            for (const t of ['dragenter','dragover','drop']) {
-                const ev = new DragEvent(t, {bubbles:true, cancelable:true, composed:true, clientX:cx, clientY:cy, dataTransfer:dt});
-                Object.defineProperty(ev, 'dataTransfer', {value: dt});
-                target.dispatchEvent(ev);
-                await new Promise(r => setTimeout(r, 80));
-            }
-            return JSON.stringify({ok:true, mode:'drop-synthesis'});
-        })(""" + json.dumps(drop_sel) + "," + json.dumps(file_name) + "," + json.dumps(file_b64) + "," + json.dumps("video/mp4") + ")"
-        rd = await eval_in_tab(ws_url, drop_js)
-        rd_val = rd.get("result", {}).get("value", "{}")
-        try:
-            rd_parsed = json.loads(rd_val) if isinstance(rd_val, str) else rd_val
-        except Exception:
-            rd_parsed = {"ok": False}
-        if not rd_parsed.get("ok"):
-            return [TextContent(type="text", text=f"tiktok_post_video: drop failed — {json.dumps(rd_parsed)}")]
-        steps.append(f"video dropped ({rd_parsed.get('mode')})")
+        def _done(ok, **extra):
+            return [TextContent(type="text", text=json.dumps({"ok": ok, "steps": steps, **extra}))]
 
-        # 3. Wait for upload to register (caption editor becomes available)
-        for _ in range(wait_upload):
-            await asyncio.sleep(1)
-            probe = await eval_in_tab(ws_url, f"!!document.querySelector({json.dumps(caption_sel)})")
-            if probe.get("result", {}).get("value"):
-                break
-        else:
-            return [TextContent(type="text", text=f"tiktok_post_video: upload editor never appeared after {wait_upload}s. Try a smaller file or check tiktok.com is logged in.")]
-        steps.append("caption editor visible")
-        await asyncio.sleep(1)
+        async def _val(js):
+            r = await eval_in_tab(ws_url, js)
+            return r.get("result", {}).get("value")
 
-        # 4. Fill caption via REAL CDP keystrokes — fiber walk + synthetic
-        # beforeinput events update the editor's VISIBLE text but TikTok's
-        # form-state binding (which controls Post button + serializes the
-        # caption to the published video) doesn't sync. Real keystrokes go
-        # through Chrome's native input pipeline → Draft.js's keypress
-        # handler → TikTok's form binding. Verified live 2026-06-16:
-        # goldenbreath upload posted with FILENAME as caption when we used
-        # the fiber-walk path; only real keystrokes serialize properly.
-        #
-        # Sequence: click into editor → select all (Ctrl+A) → backspace clear
-        # → type the caption per-char via Input.dispatchKeyEvent.
-        await eval_in_tab(ws_url, "(function(){const e=document.querySelector(" + json.dumps(caption_sel) + ");if(e)e.focus();return 'ok'})()")
-        await asyncio.sleep(0.2)
-        # Ctrl+A
-        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Control", "code": "ControlLeft", "modifiers": 2, "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17})
-        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2, "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65})
-        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 2, "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65})
-        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Control", "code": "ControlLeft", "modifiers": 0, "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17})
-        await asyncio.sleep(0.1)
-        # Backspace
-        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8})
-        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8})
-        await asyncio.sleep(0.2)
-        # Type each char as a real keystroke (text field carries the actual character)
-        for ch in caption_text:
-            if ch == "\n":
-                continue  # Draft.js maps Enter to handleReturn, skip line breaks
-            kc = ord(ch.upper()) if ch.isalnum() else 0
-            code = ("Key" + ch.upper()) if ch.isalpha() else (("Digit" + ch) if ch.isdigit() else ("Space" if ch == " " else "Unidentified"))
-            down = {"type": "keyDown", "key": ch, "code": code, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc, "text": ch, "unmodifiedText": ch}
-            up = {"type": "keyUp", "key": ch, "code": code, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc}
+        async def _raw(calls):
+            # Its own short connection, answering with Chrome's real reply. The pooled one returns {}
+            # for a CDP error, and through it the file handoff failed without a word (2026-10-11):
+            # the same two calls on a fresh connection worked.
+            out = []
+            async with websockets.connect(ws_url, max_size=50_000_000, ping_interval=None) as w:
+                for n, (m, p) in enumerate(calls, 1):
+                    if callable(p):
+                        p = p(out)
+                        if p is None:
+                            break
+                    await w.send(json.dumps({"id": n, "method": m, "params": p}))
+                    while True:
+                        d = json.loads(await asyncio.wait_for(w.recv(), timeout=30))
+                        if d.get("id") == n:
+                            out.append(d)
+                            break
+            return out
+
+        async def _set_files(find_js, files):
+            def _with_oid(out):
+                ro = (out[0].get("result") or {}).get("result") or {}
+                oid = ro.get("objectId")
+                return {"files": files, "objectId": oid} if oid and ro.get("subtype") != "null" else None
+            out = await _raw([("Runtime.evaluate", {"expression": find_js, "returnByValue": False}),
+                              ("DOM.setFileInputFiles", _with_oid)])
+            if len(out) < 2:
+                return False
+            if out[1].get("error"):
+                steps.append("file handoff refused: " + str(out[1]["error"].get("message"))[:120])
+                return False
+            return True
+
+        def _center(find_expr):
+            return ("(function(){var b=" + find_expr + ";if(!b)return '';b.scrollIntoView({block:'center'});"
+                    "var r=b.getBoundingClientRect();if(r.width<=0)return '';return (r.x+r.width/2)+','+(r.y+r.height/2);})()")
+
+        async def _real_click(find_expr):
+            # TikTok ignores element.click() on Post and on the confirm dialog: only a trusted mouse
+            # event through CDP goes through. It never touches the OS cursor.
+            c = await _val(_center(find_expr))
+            if not c:
+                return False
+            x, y = (float(v) for v in c.split(","))
+            for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+                await cdp_send(ws_url, "Input.dispatchMouseEvent", {"type": t, "x": x, "y": y, "button": "left", "clickCount": 0 if t == "mouseMoved" else 1})
+                await asyncio.sleep(0.08)
+            return True
+
+        async def _key(key, code, vk, modifiers=0):
+            for t in ("keyDown", "keyUp"):
+                await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": t, "key": key, "code": code, "modifiers": modifiers, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+
+        def _by_text(rx, tags="button"):
+            return ("Array.from(document.querySelectorAll(" + json.dumps(tags) + ")).find(function(x){return "
+                    + rx + ".test((x.innerText||'').trim()) && x.children.length<4;})")
+
+        # 0. A tab left frozen by an earlier run (a stuck upload, an unanswered dialog) answers
+        # nothing, and every call on it waits out its cap. Probe it briefly; release a dialog if that
+        # is what holds it; otherwise close it and work in a fresh tab of the same browser.
+        async def _alive():
             try:
-                await cdp_send(ws_url, "Input.dispatchKeyEvent", down)
-                await cdp_send(ws_url, "Input.dispatchKeyEvent", up)
+                return bool(await asyncio.wait_for(_raw([("Runtime.evaluate", {"expression": "1", "returnByValue": True})]), timeout=8))
+            except Exception:
+                return False
+        if not await _alive():
+            try:
+                await asyncio.wait_for(_raw([("Page.enable", {}), ("Page.handleJavaScriptDialog", {"accept": True})]), timeout=8)
             except Exception:
                 pass
-            await asyncio.sleep(0.025)
-        await asyncio.sleep(0.5)
-        rb = await eval_in_tab(ws_url, "(function(){const e=document.querySelector(" + json.dumps(caption_sel) + ");return e ? (e.innerText||'').length : -1})()")
-        rb_len = rb.get("result", {}).get("value", -1)
-        steps.append(f"caption filled (readback={rb_len} of {len(caption_text)})")
-        await asyncio.sleep(1)
+            if not await _alive():
+                base = "http://" + ws_url.split("//", 1)[1].split("/", 1)[0]
+                try:
+                    urllib.request.urlopen(base + "/json/close/" + ws_url.rstrip("/").rsplit("/", 1)[-1], timeout=10).read()
+                except Exception:
+                    pass
+                fresh = json.loads(urllib.request.urlopen(urllib.request.Request(base + "/json/new?about:blank", method="PUT"), timeout=10).read())
+                ws_url = fresh["webSocketDebuggerUrl"]
+                steps.append("the tab was frozen: closed it and opened a fresh one")
 
-        # 5. Privacy toggle — ALWAYS run, because TikTok Studio's UI default
-        # varies by account (some default to "Only me", others to "Everyone").
-        # Set explicitly BEFORE Post; if you set it AFTER, the video lands in
-        # "Content under review" and TikTok's backend rejects further privacy
-        # changes for up to 12h. Verified live on @auralalchemy 2026-06-16.
-        want_label = {"public": "Everyone", "friends": "Friends", "private": "Only me"}.get(privacy, "Everyone")
-        priv_js = """(async function(want) {
-            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-            // 1. Find the current privacy trigger — a button whose text matches one of the 3 privacy labels
-            const labels = ['Everyone', 'Friends', 'Only me'];
-            const buttons = Array.from(document.querySelectorAll('button')).filter(b => b.offsetWidth > 0);
-            const trigger = buttons.find(b => labels.includes((b.innerText || '').trim()));
-            if (!trigger) return JSON.stringify({ok:false, error:'no privacy trigger button visible — upload form may still be loading'});
-            const currentLabel = (trigger.innerText || '').trim();
-            if (currentLabel === want) {
-                return JSON.stringify({ok:true, already:want, skipped:true});
-            }
-            // 2. Click trigger with full event sequence (TUX dropdowns gate on pointerdown)
-            const fireSeq = (el) => {
-                const r = el.getBoundingClientRect();
-                const cx = r.left + r.width/2, cy = r.top + r.height/2;
-                for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
-                    el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, composed:true, view:window, clientX:cx, clientY:cy, button:0, buttons:1}));
-                }
-            };
-            trigger.scrollIntoView({block:'center'});
-            fireSeq(trigger);
-            await sleep(400);
-            // 3. Find the opened dropdown/dialog and click the desired option inside it
-            const dlg = document.querySelector('[role=dialog]:not([aria-hidden=true])') || document.querySelector('.Dropdown__content');
-            if (!dlg) return JSON.stringify({ok:false, error:'dropdown did not open after clicking trigger', current:currentLabel});
-            let optionTarget = null;
-            for (const el of dlg.querySelectorAll('*')) {
-                if (el.children.length === 0 && (el.innerText||'').trim() === want) {
-                    let p = el;
-                    while (p && p !== dlg && p.tagName !== 'BUTTON' && getComputedStyle(p).cursor !== 'pointer') p = p.parentElement;
-                    if (p && p !== dlg) { optionTarget = p; break; }
-                }
-            }
-            if (!optionTarget) return JSON.stringify({ok:false, error:'option '+want+' not in opened dropdown', dialog_text:dlg.innerText.slice(0,200)});
-            fireSeq(optionTarget);
-            await sleep(500);
-            // 4. Verify — find the trigger again, check its label
-            const newTrigger = Array.from(document.querySelectorAll('button')).filter(b => b.offsetWidth > 0).find(b => labels.includes((b.innerText || '').trim()));
-            const verified = newTrigger && (newTrigger.innerText || '').trim() === want;
-            return JSON.stringify({ok:!!verified, was:currentLabel, now: newTrigger ? newTrigger.innerText.trim() : null, target:want});
-        })(""" + json.dumps(want_label) + ")"
-        rpv = await eval_in_tab(ws_url, priv_js)
-        rpv_val = rpv.get("result", {}).get("value", "{}")
-        try:
-            rpv_parsed = json.loads(rpv_val) if isinstance(rpv_val, str) else rpv_val
-        except Exception:
-            rpv_parsed = {"ok": False}
-        if rpv_parsed.get("ok"):
-            steps.append(f"privacy set: {rpv_parsed.get('was')} → {rpv_parsed.get('now') or want_label}")
-        else:
-            steps.append(f"privacy toggle returned: {rpv_parsed.get('error') or 'unknown'} — proceeding (will post at current setting)")
-        await asyncio.sleep(1)
-
-        # 6. Click Post
-        post_js = """(function(sel) {
-            const all = Array.from(document.querySelectorAll(sel.replace(/:has-text\\([^)]*\\)/g, '')));
-            const want = all.find(b => /post/i.test(b.innerText || ''));
-            const btn = want || document.querySelector('button[data-e2e=post_video_button]') || document.querySelector('[data-tt=upload_post_btn]');
-            if (!btn) return JSON.stringify({ok:false, error:'no post button'});
-            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return JSON.stringify({ok:false, error:'post button disabled — upload may still be processing'});
-            btn.click();
-            return JSON.stringify({ok:true});
-        })(""" + json.dumps(post_sel) + ")"
-        rp = await eval_in_tab(ws_url, post_js)
-        rp_val = rp.get("result", {}).get("value", "{}")
-        try:
-            rp_parsed = json.loads(rp_val) if isinstance(rp_val, str) else rp_val
-        except Exception:
-            rp_parsed = {"ok": False}
-        if not rp_parsed.get("ok"):
-            return [TextContent(type="text", text=f"tiktok_post_video: post-click failed — {json.dumps(rp_parsed)}. Steps so far: {steps}")]
-        steps.append("post button clicked")
-
-        # 7. Wait for redirect to studio drafts / contents page
-        post_url = ""
-        for _ in range(30):
+        # 1. Upload page. Leaving a half-done upload raises a "leave site?" dialog. It has to be
+        # answered by a connection that enabled Page BEFORE navigating: answering it afterwards
+        # froze the tab for good (2026-10-11). So the navigation runs on its own connection that
+        # listens for the dialog and accepts it.
+        async def _goto(url):
+            accepted = False
+            async with websockets.connect(ws_url, max_size=50_000_000, ping_interval=None) as w:
+                await w.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
+                await w.send(json.dumps({"id": 2, "method": "Page.navigate", "params": {"url": url}}))
+                deadline = time.time() + 45
+                while time.time() < deadline:
+                    try:
+                        d = json.loads(await asyncio.wait_for(w.recv(), timeout=5))
+                    except asyncio.TimeoutError:
+                        continue
+                    if d.get("method") == "Page.javascriptDialogOpening":
+                        await w.send(json.dumps({"id": 3, "method": "Page.handleJavaScriptDialog", "params": {"accept": True}}))
+                        accepted = True
+                    elif d.get("id") == 2:
+                        break
+            return accepted
+        if await _goto("https://www.tiktok.com/tiktokstudio/upload"):
+            steps.append("accepted a leave-page dialog from an earlier upload")
+        for _ in range(40):
             await asyncio.sleep(1)
-            cur = await eval_in_tab(ws_url, "location.href")
-            url_now = cur.get("result", {}).get("value", "")
+            if await _val("!!document.querySelector('input[type=file]')"):
+                break
+        else:
+            return _done(False, error="upload page never showed a file input; is this session logged in to TikTok?")
+        # the input is in the HTML before the page wires it up: a file handed over too early is lost
+        await asyncio.sleep(6)
+        steps.append("upload page ready")
+        # "A video you were editing wasn't saved. Continue editing?" is left by an upload that never
+        # finished. Discard is tried; the new file is still taken when the banner stays.
+        if await _val("/Continue editing\\?/.test(document.body.innerText||'')"):
+            await _val("(function(){var b=" + _by_text("/^Discard$/i") + ";if(b)b.click();return !!b;})()")
+            await asyncio.sleep(1.5)
+
+        # 2. The video. DOM.setFileInputFiles hands Chrome the path directly: no base64 through the
+        # page, no size cap. The path must exist on the machine where Chrome runs. If the page does
+        # not react in 20 s the input is emptied (the same file twice fires no change) and refilled.
+        started_js = ("(function(){var t=document.body.innerText||'';return /Uploaded|Uploading|\\d{1,3}%/.test(t)||"
+                      "!!document.querySelector(" + json.dumps(post_sel) + ");})()")
+        for attempt in range(2):
+            if attempt:
+                await _val("(function(){var i=document.querySelector('input[type=file]');if(i)i.value='';return 1;})()")
+            if not await _set_files("document.querySelector('input[type=file]')", [str(Path(video_path).resolve())]):
+                return _done(False, error="no file input to receive the video")
+            for _ in range(20):
+                await asyncio.sleep(1)
+                if await _val(started_js):
+                    break
+            else:
+                continue
+            break
+        else:
+            seen = await _val("(function(){var i=document.querySelector('input[type=file]');return 'files='+(i&&i.files?i.files.length:'-')+' | '+(document.body.innerText||'').slice(0,160).replace(/\\n/g,' / ');})()")
+            return _done(False, error="the page did not take the video file", page=seen)
+        steps.append("video upload started")
+
+        # 3. Wait for the REAL end of the upload. The caption editor shows up at 0%, so waiting for it
+        # (the old check) clicked Post on a half-uploaded video. Done = "Uploaded" + Post enabled.
+        last_pct = ""
+        for i in range(wait_upload):
+            await asyncio.sleep(1)
+            st = await _val("""(function(sel){var t=document.body.innerText||'';var b=document.querySelector(sel);
+                var m=t.match(/(\\d{1,3})%/);
+                return JSON.stringify({done:/Uploaded/.test(t), fail:/Upload failed|Couldn.t upload|Something went wrong/i.test(t),
+                  pct:m?m[0]:'', on:!!b&&!b.disabled&&b.getAttribute('data-disabled')!=='true'&&b.getAttribute('aria-disabled')!=='true'});
+            })(""" + json.dumps(post_sel) + ")")
+            s = json.loads(st or "{}")
+            last_pct = s.get("pct") or last_pct
+            if s.get("fail"):
+                return _done(False, error="TikTok reported the upload failed", progress=last_pct)
+            if s.get("done") and s.get("on"):
+                break
+        else:
+            # A stall right before 100% was the proxy closing idle tunnels (30 s socket timeout in
+            # the forwarder), not TikTok. Check the proxy before retrying.
+            return _done(False, error=f"upload did not finish in {wait_upload}s", progress=last_pct)
+        steps.append("video uploaded")
+
+        # 4. Caption. Input.insertText per line, Enter between lines: it goes through Chrome's input
+        # pipeline so TikTok's form state picks it up (synthetic DOM edits posted the FILE NAME as
+        # caption, 2026-06-16), and the old per-key typing dropped every line break.
+        await _val("(function(){var e=document.querySelector(" + json.dumps(caption_sel) + ");if(e)e.focus();return 1;})()")
+        await asyncio.sleep(0.2)
+        await _key("a", "KeyA", 65, modifiers=2)
+        await _key("Backspace", "Backspace", 8)
+        lines = caption_text.replace("\r\n", "\n").split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                # a trailing space closes the hashtag/mention suggestion list, so Enter is a line break
+                await cdp_send(ws_url, "Input.insertText", {"text": line + (" " if ("#" in line or "@" in line) else "")})
+            if i < len(lines) - 1:
+                await _key("Enter", "Enter", 13)
+            await asyncio.sleep(0.3)
+        got = await _val("(function(){var e=document.querySelector(" + json.dumps(caption_sel) + ");return e?(e.innerText||''):null;})()") or ""
+        want_flat = " ".join(caption_text.split())
+        if " ".join(got.split())[:60] != want_flat[:60]:
+            return _done(False, error="caption did not land in the editor", caption_read_back=got[:200])
+        steps.append(f"caption typed ({len(got)} chars)")
+
+        # 5. Cover (optional): Edit cover > Upload cover > the image > Save.
+        if cover_path:
+            if not await _val("(function(){var b=" + _by_text("/^Edit cover$/i", "button,div,span") + ";if(!b)return false;b.click();return true;})()"):
+                return _done(False, error="no 'Edit cover' control")
+            await asyncio.sleep(2.5)
+            await _val("(function(){var b=" + _by_text("/^Upload cover$/i", "button,div[role=tab],div,span") + ";if(b)b.click();return !!b;})()")
+            await asyncio.sleep(1.5)
+            if not await _set_files("Array.from(document.querySelectorAll('input[type=file]')).find(function(x){return /image/.test(x.accept||'');})", [str(Path(cover_path).resolve())]):
+                return _done(False, error="the cover editor has no image input")
+            await asyncio.sleep(4)
+            await _val("(function(){var b=" + _by_text("/^Save$/i") + ";if(b)b.click();return !!b;})()")
+            await asyncio.sleep(3)
+            if await _val("/Preview in profile/.test(document.body.innerText||'')"):
+                return _done(False, error="cover editor did not close after Save")
+            steps.append("cover set")
+
+        # 6. Privacy. Set it BEFORE Post: once the video is under review TikTok refuses changes for
+        # hours (verified on @auralalchemy 2026-06-16). And never post at the wrong setting.
+        want_label = {"public": "Everyone", "friends": "Friends", "private": "Only me"}.get(privacy, "Everyone")
+        shown_js = "(function(){var t=document.body.innerText||'';var m=t.match(/Who can (?:see|watch) this (?:post|video)\\s*\\n\\s*([^\\n]+)/);return m?m[1].trim():'';})()"
+        shown = await _val(shown_js) or ""
+        if shown and shown != want_label:
+            await _real_click("Array.from(document.querySelectorAll('button,div[role=combobox],div')).find(function(x){return (x.innerText||'').trim()===" + json.dumps(shown) + " && x.children.length<4;})")
+            await asyncio.sleep(0.8)
+            await _real_click("Array.from(document.querySelectorAll('[role=option],li,div,span')).filter(function(x){return (x.innerText||'').trim()===" + json.dumps(want_label) + " && x.children.length<3;}).pop()")
+            await asyncio.sleep(0.8)
+            shown = await _val(shown_js) or ""
+            if shown != want_label:
+                return _done(False, error=f"privacy shows '{shown}', wanted '{want_label}'; not posting")
+        steps.append(f"privacy: {shown or 'not readable, left as is'}")
+        if arguments.get("dry_run"):
+            return _done(True, dry_run=True, note="everything is filled in on the upload page; Post was not clicked")
+
+        # 7. Post, then the "Continue to post?" dialog that appears while TikTok's content check runs.
+        if not await _real_click("document.querySelector(" + json.dumps(post_sel) + ")"):
+            return _done(False, error="no Post button")
+        steps.append("post clicked")
+        post_url = ""
+        for _ in range(45):
+            await asyncio.sleep(1)
+            url_now = await _val("location.href") or ""
             if "/tiktokstudio/upload" not in url_now:
                 post_url = url_now
                 break
-        steps.append(f"final url: {post_url or '(still on upload page)'}")
+            if await _real_click(_by_text("/^(Post now|Post anyway)$/i")):
+                steps.append("confirmed 'Post now' (content check still running)")
+        if not post_url:
+            return _done(False, error="still on the upload page after Post")
+
+        # 8. Read it back from the content list: what the account actually has, not what we clicked.
+        row = ""
+        for _ in range(10):
+            await asyncio.sleep(2)
+            row = await _val("(function(){var t=document.body.innerText||'';var i=t.indexOf(" + json.dumps(want_flat[:40]) + ");return i<0?'':t.slice(i,i+400);})()") or ""
+            if row:
+                break
+        status = ""
+        for word in ("Content under review", "Only me", "Everyone", "Friends", "Processing"):
+            if word in row:
+                status += (", " if status else "") + word
+        steps.append(f"in the content list: {status or 'not found yet'}")
         try:
-            _playbook_record("tiktok.com", "tiktok_post_video", "ui_drive", True, kind="action", selector_pattern=drop_sel)
+            _playbook_record("tiktok.com", "tiktok_post_video", "ui_drive", bool(row), kind="action", selector_pattern=post_sel)
         except Exception:
             pass
-        return [TextContent(type="text", text=json.dumps({"ok": True, "steps": steps, "url": post_url}))]
+        return _done(True, url=post_url, listed=bool(row), status=status)
 
     if name == "inject_on_new_document":
         # CDP Page.addScriptToEvaluateOnNewDocument — survives all navigations
