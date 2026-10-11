@@ -8448,16 +8448,28 @@ async def _execute_tool_action(name: str, arguments: dict):
         if not arguments.get("tab"):
             cur_url = (tab.get("url") or "").lower()
             if "tiktok.com" not in cur_url:
-                tt_tabs = [t for t in real_tabs(tabs) if "tiktok.com" in (t.get("url") or "").lower()]
+                # Any tab will do: the tool navigates to the upload page itself, and it leaves the
+                # tab blank when it ends, so a blank tab is the normal state between posts.
+                tt_tabs = ([t for t in real_tabs(tabs) if "tiktok.com" in (t.get("url") or "").lower()]
+                           or [t for t in tabs if t.get("type") == "page" and t.get("webSocketDebuggerUrl")])
                 if tt_tabs:
                     tab = tt_tabs[0]
                     ws_url = tab["webSocketDebuggerUrl"]
                 else:
-                    return [TextContent(type="text", text="tiktok_post_video: no tiktok.com tab open. Open https://www.tiktok.com/tiktokstudio/upload and retry.")]
+                    return [TextContent(type="text", text="tiktok_post_video: this browser has no open tab. Open one and retry.")]
 
         steps = []
 
-        def _done(ok, **extra):
+        async def _done(ok, **extra):
+            # Leave the tab blank whatever happened. A TikTok tab left on the feed or on a filled
+            # upload page keeps playing video: two of them held 1.4 GB and filled the swap of a
+            # 4 GB server (2026-10-11), and every other browser on it slowed to a crawl.
+            # keep_page=True leaves it as it is, to look at what went wrong.
+            if not arguments.get("keep_page"):
+                try:
+                    await asyncio.wait_for(_goto("about:blank"), timeout=60)
+                except Exception:
+                    pass
             return [TextContent(type="text", text=json.dumps({"ok": ok, "steps": steps, **extra}))]
 
         async def _val(js):
@@ -8498,24 +8510,57 @@ async def _execute_tool_action(name: str, arguments: dict):
             return True
 
         def _center(find_expr):
-            return ("(function(){var b=" + find_expr + ";if(!b)return '';b.scrollIntoView({block:'center'});"
-                    "var r=b.getBoundingClientRect();if(r.width<=0)return '';return (r.x+r.width/2)+','+(r.y+r.height/2);})()")
+            # The point is only returned when the target itself is what sits there. The page moves
+            # while a heavy video loads, and a click aimed at Post landed on Discard, next to it
+            # (2026-10-11): "covered" means measure again, never click blind.
+            return ("(function(){var b=" + find_expr + ";if(!b)return '';"
+                    "var r=b.getBoundingClientRect();if(r.width<=0)return '';"
+                    "var x=r.x+r.width/2,y=r.y+r.height/2;"
+                    "if(y<0||y>innerHeight||x<0||x>innerWidth){b.scrollIntoView({block:'center'});return 'moved';}"
+                    "var h=document.elementFromPoint(x,y);"
+                    "return (h&&(h===b||b.contains(h)))?(x+','+y):'covered';})()")
 
         async def _real_click(find_expr):
             # TikTok ignores element.click() on Post and on the confirm dialog: only a trusted mouse
             # event through CDP goes through. It never touches the OS cursor.
-            c = await _val(_center(find_expr))
-            if not c:
+            c = ""
+            for _ in range(8):
+                c = await _val(_center(find_expr))
+                if not c:
+                    return False
+                if c not in ("moved", "covered"):
+                    break
+                await asyncio.sleep(0.5)
+            else:
                 return False
-            x, y = (float(v) for v in c.split(","))
+            await asyncio.sleep(0.3)
+            # one last look right before pressing: still the target at that point?
+            c2 = await _val(_center(find_expr))
+            if not c2 or c2 in ("moved", "covered"):
+                return False
+            x, y = (float(v) for v in c2.split(","))
+            x0, y0 = (float(v) for v in c.split(","))
+            if abs(x - x0) > 3 or abs(y - y0) > 3:
+                return False
             for t in ("mouseMoved", "mousePressed", "mouseReleased"):
                 await cdp_send(ws_url, "Input.dispatchMouseEvent", {"type": t, "x": x, "y": y, "button": "left", "clickCount": 0 if t == "mouseMoved" else 1})
                 await asyncio.sleep(0.08)
             return True
 
-        async def _key(key, code, vk, modifiers=0):
+        async def _key(key, code, vk, modifiers=0, commands=None):
             for t in ("keyDown", "keyUp"):
-                await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": t, "key": key, "code": code, "modifiers": modifiers, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+                ev = {"type": t, "key": key, "code": code, "modifiers": modifiers, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+                if commands and t == "keyDown":
+                    ev["commands"] = commands   # an editing command Chrome runs for sure, on any OS
+                await cdp_send(ws_url, "Input.dispatchKeyEvent", ev)
+
+        def _modal_button(question, label):
+            # clicks `label` inside the open dialog that asks `question`; 'ok', or why not
+            return ("(function(){var m=Array.from(document.querySelectorAll('.TUXModal-overlay,[role=dialog]'))"
+                    ".find(function(x){return (x.innerText||'').indexOf(" + json.dumps(question) + ")>=0;});"
+                    "if(!m)return 'no dialog';var b=Array.from(m.querySelectorAll('button')).find(function(x){"
+                    "return (x.innerText||'').trim().toLowerCase()===" + json.dumps(label.lower()) + ";});"
+                    "if(!b)return 'no button';b.click();return 'ok';})()")
 
         def _by_text(rx, tags="button"):
             return ("Array.from(document.querySelectorAll(" + json.dumps(tags) + ")).find(function(x){return "
@@ -8572,7 +8617,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             if await _val("!!document.querySelector('input[type=file]')"):
                 break
         else:
-            return _done(False, error="upload page never showed a file input; is this session logged in to TikTok?")
+            return await _done(False, error="upload page never showed a file input; is this session logged in to TikTok?")
         # the input is in the HTML before the page wires it up: a file handed over too early is lost
         await asyncio.sleep(6)
         steps.append("upload page ready")
@@ -8581,6 +8626,12 @@ async def _execute_tool_action(name: str, arguments: dict):
         if await _val("/Continue editing\\?/.test(document.body.innerText||'')"):
             await _val("(function(){var b=" + _by_text("/^Discard$/i") + ";if(b)b.click();return !!b;})()")
             await asyncio.sleep(1.5)
+            # That Discard only ASKS ("Discard this post?"). Unanswered, the question's overlay sat
+            # over the whole page and the Post click landed on it (2026-10-11). Confirm it.
+            r = await _val(_modal_button("Discard this post", "Discard"))
+            await asyncio.sleep(1.5)
+            if r == "ok":
+                steps.append("discarded an unsaved draft")
 
         # 2. The video. DOM.setFileInputFiles hands Chrome the path directly: no base64 through the
         # page, no size cap. The path must exist on the machine where Chrome runs. If the page does
@@ -8591,7 +8642,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             if attempt:
                 await _val("(function(){var i=document.querySelector('input[type=file]');if(i)i.value='';return 1;})()")
             if not await _set_files("document.querySelector('input[type=file]')", [str(Path(video_path).resolve())]):
-                return _done(False, error="no file input to receive the video")
+                return await _done(False, error="no file input to receive the video")
             for _ in range(20):
                 await asyncio.sleep(1)
                 if await _val(started_js):
@@ -8601,7 +8652,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             break
         else:
             seen = await _val("(function(){var i=document.querySelector('input[type=file]');return 'files='+(i&&i.files?i.files.length:'-')+' | '+(document.body.innerText||'').slice(0,160).replace(/\\n/g,' / ');})()")
-            return _done(False, error="the page did not take the video file", page=seen)
+            return await _done(False, error="the page did not take the video file", page=seen)
         steps.append("video upload started")
 
         # 3. Wait for the REAL end of the upload. The caption editor shows up at 0%, so waiting for it
@@ -8617,50 +8668,61 @@ async def _execute_tool_action(name: str, arguments: dict):
             s = json.loads(st or "{}")
             last_pct = s.get("pct") or last_pct
             if s.get("fail"):
-                return _done(False, error="TikTok reported the upload failed", progress=last_pct)
+                return await _done(False, error="TikTok reported the upload failed", progress=last_pct)
             if s.get("done") and s.get("on"):
                 break
         else:
             # A stall right before 100% was the proxy closing idle tunnels (30 s socket timeout in
             # the forwarder), not TikTok. Check the proxy before retrying.
-            return _done(False, error=f"upload did not finish in {wait_upload}s", progress=last_pct)
+            return await _done(False, error=f"upload did not finish in {wait_upload}s", progress=last_pct)
         steps.append("video uploaded")
 
         # 4. Caption. Input.insertText per line, Enter between lines: it goes through Chrome's input
         # pipeline so TikTok's form state picks it up (synthetic DOM edits posted the FILE NAME as
         # caption, 2026-06-16), and the old per-key typing dropped every line break.
-        await _val("(function(){var e=document.querySelector(" + json.dumps(caption_sel) + ");if(e)e.focus();return 1;})()")
-        await asyncio.sleep(0.2)
-        await _key("a", "KeyA", 65, modifiers=2)
-        await _key("Backspace", "Backspace", 8)
-        lines = caption_text.replace("\r\n", "\n").split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                # a trailing space closes the hashtag/mention suggestion list, so Enter is a line break
-                await cdp_send(ws_url, "Input.insertText", {"text": line + (" " if ("#" in line or "@" in line) else "")})
-            if i < len(lines) - 1:
-                await _key("Enter", "Enter", 13)
-            await asyncio.sleep(0.3)
-        got = await _val("(function(){var e=document.querySelector(" + json.dumps(caption_sel) + ");return e?(e.innerText||''):null;})()") or ""
+        # Right after the upload TikTok puts its own default text in the editor; typing into it at
+        # that instant lost the first line (2026-10-11, once in two runs). So wait a beat, read the
+        # WHOLE caption back, and clear and type once more if it does not match.
+        await asyncio.sleep(2)
         want_flat = " ".join(caption_text.split())
-        if " ".join(got.split())[:60] != want_flat[:60]:
-            return _done(False, error="caption did not land in the editor", caption_read_back=got[:200])
+        lines = caption_text.replace("\r\n", "\n").split("\n")
+        got = ""
+        for intento in range(2):
+            await _val("(function(){var e=document.querySelector(" + json.dumps(caption_sel) + ");if(e)e.focus();return 1;})()")
+            await asyncio.sleep(0.3)
+            await _key("a", "KeyA", 65, modifiers=2, commands=["selectAll"])
+            await _key("Backspace", "Backspace", 8)
+            await asyncio.sleep(0.3)
+            for i, line in enumerate(lines):
+                if line:
+                    # a trailing space closes the hashtag/mention suggestion list, so Enter is a line break
+                    await cdp_send(ws_url, "Input.insertText", {"text": line + (" " if ("#" in line or "@" in line) else "")})
+                if i < len(lines) - 1:
+                    await _key("Enter", "Enter", 13)
+                await asyncio.sleep(0.3)
+            await asyncio.sleep(1)
+            got = await _val("(function(){var e=document.querySelector(" + json.dumps(caption_sel) + ");return e?(e.innerText||''):null;})()") or ""
+            if " ".join(got.split()) == want_flat:
+                break
+            steps.append("caption did not match on the first pass, typed again")
+        else:
+            return await _done(False, error="caption did not land in the editor", caption_read_back=got[:300])
         steps.append(f"caption typed ({len(got)} chars)")
 
         # 5. Cover (optional): Edit cover > Upload cover > the image > Save.
         if cover_path:
             if not await _val("(function(){var b=" + _by_text("/^Edit cover$/i", "button,div,span") + ";if(!b)return false;b.click();return true;})()"):
-                return _done(False, error="no 'Edit cover' control")
+                return await _done(False, error="no 'Edit cover' control")
             await asyncio.sleep(2.5)
             await _val("(function(){var b=" + _by_text("/^Upload cover$/i", "button,div[role=tab],div,span") + ";if(b)b.click();return !!b;})()")
             await asyncio.sleep(1.5)
             if not await _set_files("Array.from(document.querySelectorAll('input[type=file]')).find(function(x){return /image/.test(x.accept||'');})", [str(Path(cover_path).resolve())]):
-                return _done(False, error="the cover editor has no image input")
+                return await _done(False, error="the cover editor has no image input")
             await asyncio.sleep(4)
             await _val("(function(){var b=" + _by_text("/^Save$/i") + ";if(b)b.click();return !!b;})()")
             await asyncio.sleep(3)
             if await _val("/Preview in profile/.test(document.body.innerText||'')"):
-                return _done(False, error="cover editor did not close after Save")
+                return await _done(False, error="cover editor did not close after Save")
             steps.append("cover set")
 
         # 6. Privacy. Set it BEFORE Post: once the video is under review TikTok refuses changes for
@@ -8675,14 +8737,24 @@ async def _execute_tool_action(name: str, arguments: dict):
             await asyncio.sleep(0.8)
             shown = await _val(shown_js) or ""
             if shown != want_label:
-                return _done(False, error=f"privacy shows '{shown}', wanted '{want_label}'; not posting")
+                return await _done(False, error=f"privacy shows '{shown}', wanted '{want_label}'; not posting")
         steps.append(f"privacy: {shown or 'not readable, left as is'}")
         if arguments.get("dry_run"):
-            return _done(True, dry_run=True, note="everything is filled in on the upload page; Post was not clicked")
+            return await _done(True, dry_run=True, note="everything is filled in on the upload page; Post was not clicked")
 
         # 7. Post, then the "Continue to post?" dialog that appears while TikTok's content check runs.
-        if not await _real_click("document.querySelector(" + json.dumps(post_sel) + ")"):
-            return _done(False, error="no Post button")
+        # a leftover "Discard this post?" question would sit over Post: close it with "Not now"
+        if await _val(_modal_button("Discard this post", "Not now")) == "ok":
+            steps.append("closed a leftover 'Discard this post?' question")
+            await asyncio.sleep(1)
+        clicked = False
+        for _ in range(3):
+            if await _real_click("document.querySelector(" + json.dumps(post_sel) + ")"):
+                clicked = True
+                break
+            await asyncio.sleep(2)
+        if not clicked:
+            return await _done(False, error="the Post button was missing or never held still to be clicked")
         steps.append("post clicked")
         post_url = ""
         for _ in range(45):
@@ -8694,7 +8766,14 @@ async def _execute_tool_action(name: str, arguments: dict):
             if await _real_click(_by_text("/^(Post now|Post anyway)$/i")):
                 steps.append("confirmed 'Post now' (content check still running)")
         if not post_url:
-            return _done(False, error="still on the upload page after Post")
+            # say what the page shows: a dialog this tool does not know yet is the usual reason
+            seen = await _val("""(function(){
+                var d=Array.from(document.querySelectorAll('[role=dialog],[class*=modal],[class*=Modal],[class*=toast],[class*=Toast],[role=alert]'))
+                  .map(function(x){return (x.innerText||'').trim();}).filter(Boolean).join(' | ');
+                var b=Array.from(document.querySelectorAll('button')).map(function(x){return (x.innerText||'').trim();}).filter(Boolean).slice(0,25).join(', ');
+                var p=document.querySelector(""" + json.dumps(post_sel) + """);
+                return 'dialogs: '+(d||'none').slice(0,400)+' || buttons: '+b.slice(0,300)+' || post: '+(p?('disabled='+p.disabled+' loading='+p.getAttribute('data-loading')):'gone');})()""")
+            return await _done(False, error="still on the upload page after Post", page=seen)
 
         # 8. Read it back from the content list: what the account actually has, not what we clicked.
         row = ""
@@ -8712,7 +8791,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             _playbook_record("tiktok.com", "tiktok_post_video", "ui_drive", bool(row), kind="action", selector_pattern=post_sel)
         except Exception:
             pass
-        return _done(True, url=post_url, listed=bool(row), status=status)
+        return await _done(True, url=post_url, listed=bool(row), status=status)
 
     if name == "inject_on_new_document":
         # CDP Page.addScriptToEvaluateOnNewDocument — survives all navigations
