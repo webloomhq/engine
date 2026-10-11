@@ -196,7 +196,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.14"
+ENGINE_VERSION = "0.3.15"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -2192,7 +2192,9 @@ async def list_tools():
             "Strategies B and D set the FileList but React's controlled-input observer doesn't notice the synthetic change. "
             "E uses Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files').set — the path React DOES observe — and additionally invokes the input's React onChange via fiber walk for sites that gate on the handler. "
             "Max 25MB combined.\n\n"
-            "DECISION TREE: Inside shadow DOM (LinkedIn-style)? → E. Hidden input inside a <label>? → D. Visible drop zone with 'drop files here'? → C. Visible 'Browse' button (and not on Windows)? → A. Plain unhidden input? → B.\n\n"
+            "STRATEGY F (pass chunked_input_selector): NO size cap. Streams each file into the page in 2MB pieces (stored by index, size verified against disk), builds the File objects in page JS, then calls the input's React onChange ONCE (or, without React, sets input.files via the native setter and fires input+change once). "
+            "Use for big files (audiobook chapters, video) and for React inputs whose onChange clears e.target.value after reading, where B's double change event wipes the selection (seen on authors.spotify.com). Slower than E for small files.\n\n"
+            "DECISION TREE: Files over 25MB, or a React input where B 'uploads' but the UI never changes? → F. Inside shadow DOM (LinkedIn-style)? → E. Hidden input inside a <label>? → D. Visible drop zone with 'drop files here'? → C. Visible 'Browse' button (and not on Windows)? → A. Plain unhidden input? → B.\n\n"
             "🔁 IF ALL 5 STRATEGIES FAIL — DO NOT GIVE UP. Escalate to: "
             "(1) `xhr_upload` — for SaaS uploaders that intercept input.files and corrupt programmatic uploads (KDP AjaxInput, custom AJAX). "
             "(2) `start_recording` → drive ONE manual upload → `replay_xhr` with new file bytes — captures the exact multipart request shape including CSRF/chunk-id/boundary, then replays forever with any file. Works against ANY uploader that talks HTTP (Bandcamp Plupload, Substack, Notion). "
@@ -2201,7 +2203,7 @@ async def list_tools():
             "(5) `inject_on_new_document` an XHR interceptor that swaps the FormData body of the outgoing multipart request — network-level file substitution before the server sees it. "
             "If 1–5 ALL fail, that's the moment to capture findings to a Thread and pause for human — not earlier. Site-wall claims need to exhaust this whole ladder first.\n"
             "Always pass absolute file paths."
-        ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}, "react_input_selector": {"type": "string", "description": "Strategy E: CSS selector for a React-controlled file input, possibly inside shadow DOM. Walks shadow roots recursively to find the input, builds File objects in page JS, assigns via the native HTMLInputElement.files prototype setter (which React's controlled-input observer DOES notice — unlike B/D's synthetic path), fires input+change, AND invokes the input's onChange via fiber walk for handler-gated implementations. Use for LinkedIn composer + similar Lit/shadow-DOM React patterns. Max 25MB combined."}}, "required": ["session", "selector", "files"]}),
+        ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}, "react_input_selector": {"type": "string", "description": "Strategy E: CSS selector for a React-controlled file input, possibly inside shadow DOM. Walks shadow roots recursively to find the input, builds File objects in page JS, assigns via the native HTMLInputElement.files prototype setter (which React's controlled-input observer DOES notice — unlike B/D's synthetic path), fires input+change, AND invokes the input's onChange via fiber walk for handler-gated implementations. Use for LinkedIn composer + similar Lit/shadow-DOM React patterns. Max 25MB combined."}, "chunked_input_selector": {"type": "string", "description": "Strategy F: CSS selector for the <input type=file> (light or shadow DOM). No size cap: files are streamed into the page in 2MB pieces, verified against disk size, then handed to the input's React onChange exactly once (or set via the native setter + one input/change event when there is no React handler). Use for files over 25MB and for React inputs that clear their value after reading."}}, "required": ["session", "selector", "files"]}),
         Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget, works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}, "background": {"type": "boolean", "description": "Open without raising the window (default: true in autopilot runs, false in chats). In a headless Chrome every new tab gets its own window instead, so it is never a hidden back tab (hidden pages never load audio or video)."}}, "required": ["session"]}),
         Tool(name="wait_for", description="Wait for an element to appear in a tab (polls every 500ms)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session", "selector"]}),
         Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first: it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}, "background": {"type": "boolean", "default": False, "description": "Windows: open the window minimized without taking the focus, and keep the session's login confirmation (an unattended relaunch of the same profile). For scheduled jobs, not for a person who wants to see the window."}}, "required": []}),
@@ -4295,6 +4297,7 @@ async def _execute_tool_action(name: str, arguments: dict):
     # Resolve @eN references — any arg that holds a selector pointing into the
     # last AX scan gets expanded to a real CSS selector before downstream use.
     _ax_keys = ("description", "selector", "drop_target_selector", "inject_input_selector",
+                "react_input_selector", "chunked_input_selector",
                 "click_first_selector", "from_selector", "target_selector")
     for _k in _ax_keys:
         if _k in arguments and isinstance(arguments[_k], str) and arguments[_k].startswith("@e"):
@@ -4759,6 +4762,85 @@ async def _execute_tool_action(name: str, arguments: dict):
         if missing:
             return [TextContent(type="text", text=f"upload_file: files not found: {missing}")]
         abs_files = [str(Path(f).resolve()) for f in files]
+
+        # ── STRATEGY F: chunked transfer, no size cap, ONE handler call ──
+        # Big files (audiobook chapters of 30-50MB, videos) on React inputs whose onChange does
+        # `k(files); e.target.value = ""`. B fails there (Chrome fires change on setFileInputFiles and
+        # the re-dispatch fires a SECOND change with an empty list that overwrites the first), A drops
+        # the CDP socket on Windows, and C/D/E carry every byte in one Runtime.evaluate (25MB cap).
+        # F streams each file in 2MB pieces stored BY INDEX (a retried piece overwrites itself instead of
+        # duplicating), checks the size in the page against the disk, builds the File objects in page JS
+        # and calls the React onChange exactly once (or, with no React handler, sets input.files through
+        # the native setter and fires input + change once). Proven on authors.spotify.com, 13 chapters, 389MB.
+        chunked_input = arguments.get("chunked_input_selector", "")
+        if chunked_input:
+            import mimetypes
+            piece = 2 * 1024 * 1024
+            await eval_in_tab(ws_url, "window.__wlF = {}; 'ok'")
+            manifest = []
+            for i, fp in enumerate(abs_files):
+                key = f"f{i}"
+                await eval_in_tab(ws_url, f"window.__wlF['{key}'] = []; 'ok'")
+                idx = 0
+                with open(fp, "rb") as fh:
+                    while True:
+                        raw = fh.read(piece)
+                        if not raw:
+                            break
+                        b64 = base64.b64encode(raw).decode("ascii")
+                        js_piece = ("(()=>{const s=atob('" + b64 + "');const a=new Uint8Array(s.length);"
+                                    "for(let i=0;i<s.length;i++)a[i]=s.charCodeAt(i);"
+                                    "window.__wlF['" + key + "'][" + str(idx) + "]=a;return a.length})()")
+                        rr = await eval_in_tab(ws_url, js_piece)
+                        if rr.get("exceptionDetails") or rr.get("result", {}).get("value") != len(raw):
+                            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"Strategy F: piece {idx} of {Path(fp).name} did not land", "detail": str(rr)[:300]}, indent=2))]
+                        idx += 1
+                disk = Path(fp).stat().st_size
+                got = (await eval_in_tab(ws_url, f"window.__wlF['{key}'].reduce((n,a)=>n+(a?a.length:0),0)")).get("result", {}).get("value")
+                if got != disk:
+                    return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"Strategy F: {Path(fp).name} is {got} bytes in the page, {disk} on disk"}, indent=2))]
+                manifest.append({"name": Path(fp).name, "mime": mimetypes.guess_type(fp)[0] or "application/octet-stream", "size": disk})
+
+            js = """(function(sel, manifest) {
+                function deepQuery(root, s) {
+                    const direct = root.querySelector(s);
+                    if (direct) return direct;
+                    for (const node of root.querySelectorAll('*')) {
+                        if (node.shadowRoot) { const inner = deepQuery(node.shadowRoot, s); if (inner) return inner; }
+                    }
+                    return null;
+                }
+                const inp = deepQuery(document, sel);
+                if (!inp) return JSON.stringify({ok:false, error:'input not found in light+shadow DOM: ' + sel});
+                if (inp.tagName !== 'INPUT' || inp.type !== 'file') return JSON.stringify({ok:false, error:'matched but not <input type=file>'});
+                const fs = manifest.map((m, i) => new File(window.__wlF['f' + i], m.name, {type: m.mime}));
+                window.__wlF = null;
+                const pk = Object.keys(inp).find(k => k.startsWith('__reactProps'));
+                if (pk && inp[pk] && typeof inp[pk].onChange === 'function') {
+                    const fake = {files: fs, value: ''};
+                    inp[pk].onChange({target: fake, currentTarget: fake, preventDefault(){}, stopPropagation(){}, nativeEvent: {}, bubbles: true});
+                    return JSON.stringify({ok:true, mode:'react_handler_once', files: fs.map(f => f.name + ':' + f.size)});
+                }
+                const dt = new DataTransfer();
+                fs.forEach(f => dt.items.add(f));
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files').set.call(inp, dt.files);
+                inp.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                inp.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                return JSON.stringify({ok:true, mode:'native_setter_once', files: Array.from(inp.files || []).map(f => f.name + ':' + f.size)});
+            })(""" + json.dumps(chunked_input) + ", " + json.dumps(manifest) + ")"
+            r = await eval_in_tab(ws_url, js)
+            val = r.get("result", {}).get("value", "{}")
+            try:
+                cur = await eval_in_tab(ws_url, "location.href")
+                dom = domain_from_url(cur.get("result", {}).get("value", ""))
+                parsed = json.loads(val) if isinstance(val, str) else {}
+                if dom:
+                    _playbook_record(dom, f"upload_file:F:{chunked_input}", "strategy_f_chunked",
+                                     bool(parsed.get("ok")), kind="upload", selector_pattern=chunked_input)
+            except Exception:
+                pass
+            total_mb = round(sum(m["size"] for m in manifest) / 1048576, 1)
+            return [TextContent(type="text", text=f"upload_file (Strategy F, chunked, {len(manifest)} file(s), {total_mb}MB): {val}")]
 
         # ── STRATEGY E: shadow-DOM-aware + native HTMLInputElement setter + React onChange ──
         # Solves LinkedIn-style composer modals: file input lives inside a
