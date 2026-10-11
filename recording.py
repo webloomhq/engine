@@ -123,6 +123,40 @@ def end(outcome: str = "success", parameters: list | None = None) -> dict:
     }
 
 
+# A recipe is a file on disk that gets shared and replayed, so no secret may land in it. A recorded
+# step that READ a token kept it in plain text in its result (a Meta user token sat in a saved
+# recipe, found 2026-10-11). Known key shapes are masked in results and arguments, and so is
+# whatever was typed into a field whose selector says password, token, secret or code.
+_SECRET_SHAPES = re.compile(
+    r"EAA[A-Za-z0-9]{20,}"                              # Meta / Facebook
+    r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|sk-ant-[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"
+    r"|AIza[0-9A-Za-z_\-]{30,}|polar_oat_[A-Za-z0-9]{20,}"
+    r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"   # JWT
+    r"|(?i:bearer)\s+[A-Za-z0-9._\-]{20,}"
+    r"|(?i:access_token|refresh_token|client_secret|api_key)=[^&\s\"']{8,}")
+_SECRET_FIELD = re.compile(r"pass|token|secret|otp|2fa|totp|verif", re.I)
+
+
+def _mask(v):
+    if isinstance(v, str):
+        return _SECRET_SHAPES.sub("<redacted>", v)
+    if isinstance(v, dict):
+        return {k: _mask(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_mask(x) for x in v]
+    return v
+
+
+def _mask_args(tool: str, args: dict) -> dict:
+    out = _mask(args)
+    if tool in ("fill", "key_type") and _SECRET_FIELD.search(str(args.get("selector") or args.get("field") or "")):
+        for k in ("value", "text"):
+            if k in out:
+                out[k] = "<redacted>"
+    return out
+
+
 def log_action(tool: str, args: dict, result_summary: str = "ok", error: str | None = None):
     """Append a single action to the current recording. Called from call_tool wrapper."""
     state = _read_state()
@@ -133,15 +167,15 @@ def log_action(tool: str, args: dict, result_summary: str = "ok", error: str | N
     started_ms = state.get("started_at_ms", int(time.time() * 1000))
     now_ms = int(time.time() * 1000)
     # Capture a clean copy of args — drop session/tab references that won't be portable
-    clean_args = {k: v for k, v in args.items() if v is not None}
+    clean_args = _mask_args(tool, {k: v for k, v in args.items() if v is not None})
     action = {
         "tool": tool,
         "args": clean_args,
         "elapsed_ms": now_ms - started_ms,
-        "result": result_summary,
+        "result": _mask(result_summary),
     }
     if error:
-        action["error"] = error
+        action["error"] = _mask(error)
     state.setdefault("actions", []).append(action)
     _write_state(state)
 
