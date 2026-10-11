@@ -18,7 +18,10 @@ function Launch-Session($name, $cfg) {
     # Check if already running
     $existing = try { Invoke-RestMethod "http://localhost:$port/json/version" -TimeoutSec 1 } catch { $null }
     if ($existing) {
-        Write-Host "[$name] Already running on port $port — skipping" -ForegroundColor Yellow
+        # ASCII only. PowerShell 5.1 reads this file as ANSI, so a UTF-8 dash arrives as three
+        # bytes, one of them a quote, and the whole script dies with "string is missing the
+        # terminator" pointing 30 lines away from the real character.
+        Write-Host "[$name] Already running on port $port, skipping" -ForegroundColor Yellow
         return
     }
 
@@ -48,7 +51,9 @@ if ($Session -eq "all") {
 } else {
     if (-not ($sessions | Get-Member -MemberType NoteProperty -Name $Session)) {
         Write-Host "Unknown session: $Session" -ForegroundColor Red
-        Write-Host "Available: $(($sessions | Get-Member -MemberType NoteProperty).Name -join ', ')"
+        # PowerShell 5.1 no parsea comillas simples dentro de $() dentro de "": se arma antes
+        $disponibles = ($sessions | Get-Member -MemberType NoteProperty).Name -join ', '
+        Write-Host "Available: $disponibles"
         exit 1
     }
     Launch-Session $Session $sessions.$Session

@@ -10,7 +10,7 @@ description: |
   your existing logged-in Chrome profiles — no re-auth needed.
 
   Free: tab management, navigation, screenshots.
-  Paid ($29/mo): click automation, form filling, JS execution, DOM scanning, session playbooks.
+  Paid ($20/mo): click automation, form filling, JS execution, DOM scanning, session playbooks.
 
 version: 1
 category: Productivity
@@ -41,7 +41,7 @@ pricing:
     - list_tabs
     - screenshot
   paid:
-    price: 29
+    price: 20
     interval: month
     currency: usd
     tools:

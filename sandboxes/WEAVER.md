@@ -16,7 +16,7 @@ Both modes are **read-only**. Nothing saves, submits, or changes site state.
 
 A Thread is a JSON profile pack at `~/.webloom/threads/<domain>.thread.json` that captures everything WebLoom knows about one site: inputs, buttons, framework, fingerprints, anti-bot notes, and a frozen **pre-flight** — the same probes that discovered the site, kept around so we can detect drift later.
 
-Threads are the unit you share, install, and sell on the WebLoom Atelier.
+Threads are the unit you share, install, and sell on the WebLoom marketplace at webloom.run.
 
 ## How `discover` works
 
@@ -69,7 +69,7 @@ Weaver uses whatever Chrome tab is already open on `--port`. Log into the site o
 
 The `preflight` field is the **same shape** for every Thread. Anyone can read it, anyone can re-run it, anyone can extend it.
 
-## Why this is the right shape for the Atelier
+## Why this is the right shape for the marketplace
 
 A Thread that ships with its own pre-flight is **self-validating**. Buyers don't have to trust selectors that worked once on someone's machine — they can run `weaver check` and see green/red in 30 seconds. When a site drifts, the seller gets a clear repair signal: re-run discover, ship a new version.
 

@@ -46,8 +46,13 @@ def download_publisher_if_missing() -> None:
     print(f"[publish] downloading mcp-publisher from {url}")
     tmp = HERE / "_pub.tar.gz"
     urllib.request.urlretrieve(url, tmp)
+    # Only the binary. The archive also carries the registry's own README.md and LICENSE
+    # (Apache), and extracting all of it here overwrote WebLoom's README and LICENSE.
     with tarfile.open(tmp, "r:gz") as t:
-        t.extractall(HERE)
+        member = next(m for m in t.getmembers()
+                      if m.isfile() and pathlib.Path(m.name).name == PUBLISHER_EXE.name)
+        member.name = PUBLISHER_EXE.name
+        t.extract(member, HERE)
     tmp.unlink(missing_ok=True)
     if sys.platform != "win32":
         os.chmod(PUBLISHER_EXE, 0o755)
@@ -67,11 +72,43 @@ def bump_version(new_ver: str) -> None:
     print(f"[publish] bumped server.json + manifest.json to {new_ver}")
 
 
+def preflight_check_ansi_scripts() -> None:
+    """Scan every .ps1 / .cmd / .bat file that will ship for non-ASCII chars.
+    PowerShell 5.1 (default on Windows) reads .ps1 as ANSI/cp1252, not UTF-8.
+    A single '—' or '“' becomes multiple bytes, one of which is interpreted as
+    a smart-quote-close, unbalancing the parser 30 lines later with an
+    unhelpful error at the wrong line. Buyer sees garbage, can't diagnose.
+    Added 2026-08-16 after the v0.3.10 launch.ps1 em-dash regression."""
+    bad: list[tuple[str, int, str]] = []
+    for ext in ("*.ps1", "*.cmd", "*.bat"):
+        for p in HERE.rglob(ext):
+            if "__pycache__" in p.parts:
+                continue
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    for i, line in enumerate(fh, 1):
+                        offenders = [(c, hex(ord(c))) for c in line if ord(c) > 127]
+                        if offenders:
+                            bad.append((str(p.relative_to(HERE)), i, str(offenders[:3])))
+            except Exception:
+                continue
+    if bad:
+        print("[publish] PREFLIGHT FAILED — non-ASCII chars in shell script(s):")
+        for f, ln, chars in bad:
+            print(f"    {f}:{ln}  {chars}")
+        print("[publish] These will crash PowerShell 5.1 on Windows. Replace with ASCII "
+              "(- instead of —, ' instead of ‘’, \" instead of “”) before republishing.")
+        raise SystemExit(2)
+    print("[publish] preflight ok: no non-ASCII chars in .ps1/.cmd/.bat")
+
+
 def build_mcpb(version: str) -> tuple[pathlib.Path, str]:
+    preflight_check_ansi_scripts()  # 2026-08-16 — never ship em-dash in a .ps1 again
     out = HERE / f"webloom-{version}.mcpb"
     out.unlink(missing_ok=True)
     include_files = [
         "manifest.json", "server.json", "server.py", "recording.py",
+        "webloom_marketplace.py", "auto_record.py",
         "requirements.txt", "README.md", "LICENSE", "SECURITY.md",
         "thread-schema.json", "launch.ps1",
     ]
