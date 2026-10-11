@@ -447,6 +447,17 @@ def _port_live(port: int) -> bool:
     except Exception:
         return False
 
+
+def _is_headless(port: int) -> bool:
+    """True when the Chrome on this port runs without a screen (--headless): its /json/version user agent says
+    HeadlessChrome. Asked every time, never cached by port, because the same port can host a windowed Chrome later."""
+    try:
+        with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
+            v = json.loads(r.read())
+        return "Headless" in (v.get("User-Agent", "") + " " + v.get("Browser", ""))
+    except Exception:
+        return False
+
 def find_tab(tabs: list, tab_ref: str) -> dict | None:
     """Find tab by id, title substring, or URL substring.
 
@@ -2191,7 +2202,7 @@ async def list_tools():
             "If 1–5 ALL fail, that's the moment to capture findings to a Thread and pause for human — not earlier. Site-wall claims need to exhaust this whole ladder first.\n"
             "Always pass absolute file paths."
         ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}, "react_input_selector": {"type": "string", "description": "Strategy E: CSS selector for a React-controlled file input, possibly inside shadow DOM. Walks shadow roots recursively to find the input, builds File objects in page JS, assigns via the native HTMLInputElement.files prototype setter (which React's controlled-input observer DOES notice — unlike B/D's synthetic path), fires input+change, AND invokes the input's onChange via fiber walk for handler-gated implementations. Use for LinkedIn composer + similar Lit/shadow-DOM React patterns. Max 25MB combined."}}, "required": ["session", "selector", "files"]}),
-        Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget, works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}, "background": {"type": "boolean", "description": "Open without raising the window (default: true in autopilot runs, false in chats)"}}, "required": ["session"]}),
+        Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget, works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}, "background": {"type": "boolean", "description": "Open without raising the window (default: true in autopilot runs, false in chats). In a headless Chrome every new tab gets its own window instead, so it is never a hidden back tab (hidden pages never load audio or video)."}}, "required": ["session"]}),
         Tool(name="wait_for", description="Wait for an element to appear in a tab (polls every 500ms)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session", "selector"]}),
         Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first: it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}, "background": {"type": "boolean", "default": False, "description": "Windows: open the window minimized without taking the focus, and keep the session's login confirmation (an unattended relaunch of the same profile). For scheduled jobs, not for a person who wants to see the window."}}, "required": []}),
         Tool(name="scan_tab", description="Page intelligence scan. Modes: 'ax-min' (v0.3.8, cheapest — ~80-200 tokens, format `@e1 button \"Sign in\"`, drops framework noise like Radix IDs); 'ax' (default — compressed accessibility tree with @eN refs, ~200-400 tokens, includes role brackets + placeholders + IDs); 'full' (legacy — every button/input/form with CSS selectors, ~5000 tokens, good for unfamiliar sites where you need everything). All modes share the same @eN ref cache so click/fill/key_type/upload work identically. Prefer ax-min for known/familiar sites; ax when you need placeholder/id hints; full only when nothing else works.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "mode": {"type": "string", "enum": ["ax-min", "ax", "full"], "default": "ax", "description": "ax-min = ultra-compact @eN + kind + label only (cheapest). ax = compact + roles/placeholders/ids (default). full = legacy verbose with CSS selectors."}, "save_to_playbook": {"type": "boolean", "default": True, "description": "Auto-save discovered structure to playbook for this domain (full mode only)"}}, "required": ["session"]}),
@@ -5673,7 +5684,14 @@ async def _execute_tool_action(name: str, arguments: dict):
         bg = arguments.get("background")
         if bg is None:
             bg = bool(os.environ.get("WEBLOOM_AUTOPILOT"))
-        result = await cdp_browser_send(port, "Target.createTarget", {"url": url, "background": bool(bg)})
+        create = {"url": url, "background": bool(bg)}
+        # Chrome treats every tab that is not the front one of its window as hidden, and a hidden page that never
+        # played media holds every audio/video load forever (loadstart > stalled, readyState 0). Without a screen
+        # there is no window to raise and no focus to take, so a headless tab gets a window of its own and stays
+        # the front one, whatever opens after it. The new window keeps the --window-size of the launch.
+        if _is_headless(port):
+            create["newWindow"] = True
+        result = await cdp_browser_send(port, "Target.createTarget", create)
         target_id = result.get("targetId", "")
         return [TextContent(type="text", text=f"Opened tab: {target_id} — {url}")]
 
@@ -8518,7 +8536,9 @@ async def _execute_tool_action(name: str, arguments: dict):
                     "var x=r.x+r.width/2,y=r.y+r.height/2;"
                     "if(y<0||y>innerHeight||x<0||x>innerWidth){b.scrollIntoView({block:'center'});return 'moved';}"
                     "var h=document.elementFromPoint(x,y);"
-                    "return (h&&(h===b||b.contains(h)))?(x+','+y):'covered';})()")
+                    "if(h&&(h===b||b.contains(h)))return x+','+y;"
+                    "window.__wlCover=h?(h.tagName+'.'+String(h.className).slice(0,60)+' '+(h.innerText||'').slice(0,80).split('\\n').join('/')):'nothing';"
+                    "return 'covered';})()")
 
         async def _real_click(find_expr):
             # TikTok ignores element.click() on Post and on the confirm dialog: only a trusted mouse
@@ -8747,6 +8767,25 @@ async def _execute_tool_action(name: str, arguments: dict):
         if await _val(_modal_button("Discard this post", "Not now")) == "ok":
             steps.append("closed a leftover 'Discard this post?' question")
             await asyncio.sleep(1)
+        # A welcome tour (react-joyride) darkens the whole page for an account that uploads from the
+        # web for the first time, and its overlay swallows the Post click (2026-10-11, @auralalchemyx).
+        # Step through it with its own buttons; Escape as the last resort.
+        cerrados = 0
+        for _ in range(8):
+            r = await _val("""(function(){
+                if(!document.querySelector('.react-joyride__overlay,.react-joyride__tooltip,[class*=joyride]'))return 'none';
+                var b=document.querySelector('.react-joyride__tooltip button[data-action=skip],.react-joyride__tooltip button[data-action=close],.react-joyride__tooltip button[data-action=last]')
+                  ||Array.from(document.querySelectorAll('.react-joyride__tooltip button,[class*=joyride] button')).find(function(x){
+                       return /^(got it|skip|skip all|close|done|ok|next|finish)$/i.test((x.innerText||'').trim());});
+                if(!b)return 'no button';b.click();return 'clicked';})()""")
+            if r == "none":
+                break
+            if r == "no button":
+                await _key("Escape", "Escape", 27)
+            cerrados += 1
+            await asyncio.sleep(0.8)
+        if cerrados:
+            steps.append("closed a TikTok welcome tour" + ("" if await _val("!document.querySelector('.react-joyride__overlay')") else " (overlay still there)"))
         clicked = False
         for _ in range(3):
             if await _real_click("document.querySelector(" + json.dumps(post_sel) + ")"):
@@ -8754,7 +8793,9 @@ async def _execute_tool_action(name: str, arguments: dict):
                 break
             await asyncio.sleep(2)
         if not clicked:
-            return await _done(False, error="the Post button was missing or never held still to be clicked")
+            tapa = await _val("window.__wlCover||''")
+            return await _done(False, error="the Post button was missing or never held still to be clicked",
+                               page=("covered by: " + tapa) if tapa else "")
         steps.append("post clicked")
         post_url = ""
         for _ in range(45):
@@ -10159,6 +10200,9 @@ async def main():
 
 async def _minimize_windows(port: int) -> int:
     """Minimize every window of the Chrome on this port through CDP (no OS cursor, no focus change)."""
+    if _is_headless(port):
+        # nothing on screen to tidy away, and a minimized window turns every page hidden: audio and video stop loading
+        return 0
     try:
         with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
             browser_ws = json.loads(r.read())["webSocketDebuggerUrl"]
