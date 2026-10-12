@@ -10659,8 +10659,8 @@ def _cli_autopilot(args: list[str]) -> int:
 
     Subcommands:
       status                            — show Chrome + session state
-      run <tool> [--args '<JSON>'] [--session NAME] [--tab REF]
-                                        — invoke any WebLoom tool
+      run <tool> [--args '<JSON>' | @file.json | -] [--code-file F.js] [--session NAME] [--tab REF]
+                                        — invoke any WebLoom tool (args from a file or stdin; eval_js code from a file)
       run-recipe <recipe> --thread PATH [--params '<JSON>'] [--session NAME]
                                         — execute a session_recipe from a Thread
       ai-navigate --goal "text" [--max-steps N] [--session NAME] [--tab REF]
@@ -10690,7 +10690,10 @@ def _cli_autopilot(args: list[str]) -> int:
 
     p_run = sub.add_parser("run", help="Invoke any WebLoom tool by name")
     p_run.add_argument("tool", help="Tool name (e.g. click, fill, navigate)")
-    p_run.add_argument("--args", default="{}", help="JSON args dict")
+    p_run.add_argument("--args", default="{}",
+                       help="JSON args dict, or @path/to/args.json, or - to read it from stdin")
+    p_run.add_argument("--code-file", default=None,
+                       help="eval_js: read the JavaScript from this file (no shell quoting to fight)")
     p_run.add_argument("--session", default="main")
     p_run.add_argument("--tab", default=None)
 
@@ -10753,11 +10756,26 @@ def _cli_autopilot(args: list[str]) -> int:
             if parsed.cmd == "status":
                 result = await call_tool("chrome_status", {})
             elif parsed.cmd == "run":
+                # Long JavaScript or nested quotes do not survive a shell (worse, ssh plus a shell), so
+                # the args can come from a file or stdin, and eval_js code from its own file. Without
+                # this the only way out was a throwaway script next to the tool, which is exactly
+                # what the tool is for.
+                raw = parsed.args or "{}"
                 try:
-                    tool_args = json.loads(parsed.args) if parsed.args else {}
-                except json.JSONDecodeError as e:
-                    print(f"ERROR: --args is not valid JSON: {e}", file=sys.stderr)
+                    if raw == "-":
+                        raw = sys.stdin.read()
+                    elif raw.startswith("@"):
+                        raw = Path(raw[1:]).read_text(encoding="utf-8")
+                    tool_args = json.loads(raw) if raw.strip() else {}
+                except (OSError, json.JSONDecodeError) as e:
+                    print(f"ERROR: --args is not valid JSON (or its file could not be read): {e}", file=sys.stderr)
                     return 2
+                if parsed.code_file:
+                    try:
+                        tool_args["code"] = Path(parsed.code_file).read_text(encoding="utf-8")
+                    except OSError as e:
+                        print(f"ERROR: --code-file could not be read: {e}", file=sys.stderr)
+                        return 2
                 tool_args.setdefault("session", parsed.session)
                 if parsed.tab and "tab" not in tool_args:
                     tool_args["tab"] = parsed.tab
