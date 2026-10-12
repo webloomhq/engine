@@ -196,7 +196,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.15"
+ENGINE_VERSION = "0.3.16"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -2514,6 +2514,23 @@ async def list_tools():
             "caption_selector": {"type": "string", "description": "Override the caption editor selector if TikTok rotates."},
             "post_button_selector": {"type": "string", "description": "Override the Post-button selector."},
         }, "required": ["session", "video_path", "caption"]}),
+        Tool(name="pinterest_post_pin", description=(
+            "Publish one Pin through the logged-in Pinterest pin builder (/pin-builder/): hands the image to the page, types the title, description and "
+            "destination link, picks the board, reads every field back, clicks Publish and confirms the Pin exists by the link Pinterest returns. "
+            "One Pin per call, and it never retries by itself: a caller that loops on failures is how an account gets flooded. "
+            "Returns published=true with pin_id when confirmed, published='unknown' when Publish was clicked but no Pin link came back "
+            "(treat it as posted, never post the same image again), and published=false when it stopped before clicking Publish. "
+            "The image path must exist on the machine where that Chrome runs."
+        ), inputSchema={"type": "object", "properties": {
+            "session": {"type": "string"}, "tab": {"type": "string", "description": "Tab to use (defaults to any open tab; it is left blank at the end)"},
+            "image_path": {"type": "string", "description": "Absolute path to the image (JPG/PNG, 2:3 vertical works best)."},
+            "title": {"type": "string", "description": "Pin title, up to 100 characters."},
+            "description": {"type": "string", "description": "Pin description, up to 500 characters; line breaks are kept."},
+            "link": {"type": "string", "description": "Destination link of the Pin (where a click on it goes)."},
+            "board": {"type": "string", "description": "Exact name of the board to save it to. It must already exist."},
+            "dry_run": {"type": "boolean", "default": False, "description": "Do every step except clicking Publish, to check the session, the fields and the board."},
+            "keep_page": {"type": "boolean", "default": False, "description": "Leave the page as it is at the end instead of blanking the tab (to look at what went wrong)."},
+        }, "required": ["session", "image_path", "title", "board"]}),
         # ── Marketplace (in-chat) ──────────────────────────────────────
         # Browse / install / claim Threads from webloom.run without leaving
         # chat. All seven tools talk to webloom.run with a paired session
@@ -2814,7 +2831,7 @@ def _login_guardar(sesiones: set, refrescar: str | None = None) -> None:
 
 
 _LOGIN_CONFIRMED: set = _login_leer()
-_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler", "x_create_tweet", "tiktok_sign", "tiktok_post_video"}
+_REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler", "x_create_tweet", "tiktok_sign", "tiktok_post_video", "pinterest_post_pin"}
 # check_thread_updates + show_recent_auto_heals don't need a session — they're admin/info tools
 
 # v0.3.10 — session-scoped current-domain tracker. Updated by the navigate handler
@@ -8915,6 +8932,234 @@ async def _execute_tool_action(name: str, arguments: dict):
         except Exception:
             pass
         return await _done(True, url=post_url, listed=bool(row), status=status)
+
+    if name == "pinterest_post_pin":
+        # One Pin through /pin-builder/, proven 2026-10-12 on the Aural Alchemy account. Written
+        # after an old script on that account looped for two months: it treated "the API could not
+        # confirm" as "not published", retried the next image forever and left 12,700 repeated
+        # Pins. So this tool posts ONE Pin, never retries, and tells apart "confirmed", "clicked but
+        # not confirmed" and "stopped before Publish".
+        image_path = arguments["image_path"]
+        title = (arguments.get("title") or "").strip()[:100]
+        desc = (arguments.get("description") or "").strip()[:500]
+        link = (arguments.get("link") or "").strip()
+        board = (arguments.get("board") or "").strip()
+        if not Path(image_path).is_file():
+            return [TextContent(type="text", text=f"pinterest_post_pin: image not found at {image_path}")]
+        if not title or not board:
+            return [TextContent(type="text", text="pinterest_post_pin: title and board are required")]
+
+        if not arguments.get("tab"):
+            cur_url = (tab.get("url") or "").lower()
+            if "pinterest." not in cur_url:
+                pt = ([t for t in real_tabs(tabs) if "pinterest." in (t.get("url") or "").lower()]
+                      or [t for t in tabs if t.get("type") == "page" and t.get("webSocketDebuggerUrl")])
+                if not pt:
+                    return [TextContent(type="text", text="pinterest_post_pin: this browser has no open tab. Open one and retry.")]
+                tab = pt[0]
+                ws_url = tab["webSocketDebuggerUrl"]
+
+        steps = []
+
+        async def _goto(url):
+            # its own connection, Page enabled BEFORE navigating, so a leave-page dialog from a
+            # half-filled builder is accepted instead of freezing the tab
+            async with websockets.connect(ws_url, max_size=50_000_000, ping_interval=None) as w:
+                await w.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
+                await w.send(json.dumps({"id": 2, "method": "Page.navigate", "params": {"url": url}}))
+                deadline = time.time() + 45
+                while time.time() < deadline:
+                    try:
+                        d = json.loads(await asyncio.wait_for(w.recv(), timeout=5))
+                    except asyncio.TimeoutError:
+                        continue
+                    if d.get("method") == "Page.javascriptDialogOpening":
+                        await w.send(json.dumps({"id": 3, "method": "Page.handleJavaScriptDialog", "params": {"accept": True}}))
+                    elif d.get("id") == 2:
+                        break
+
+        async def _done(ok, **extra):
+            # the tab is left blank: a Pinterest feed left open keeps loading images and memory
+            if not arguments.get("keep_page"):
+                try:
+                    await asyncio.wait_for(_goto("about:blank"), timeout=60)
+                except Exception:
+                    pass
+            return [TextContent(type="text", text=json.dumps({"ok": ok, "steps": steps, **extra}))]
+
+        async def _val(js):
+            r = await eval_in_tab(ws_url, js)
+            return r.get("result", {}).get("value")
+
+        async def _raw(calls):
+            out = []
+            async with websockets.connect(ws_url, max_size=50_000_000, ping_interval=None) as w:
+                for n, (m, prm) in enumerate(calls, 1):
+                    if callable(prm):
+                        prm = prm(out)
+                        if prm is None:
+                            break
+                    await w.send(json.dumps({"id": n, "method": m, "params": prm}))
+                    while True:
+                        d = json.loads(await asyncio.wait_for(w.recv(), timeout=30))
+                        if d.get("id") == n:
+                            out.append(d)
+                            break
+            return out
+
+        def _center(find_expr):
+            return ("(function(){var b=" + find_expr + ";if(!b)return '';"
+                    "var r=b.getBoundingClientRect();if(r.width<=0)return '';"
+                    "var x=r.x+r.width/2,y=r.y+r.height/2;"
+                    "if(y<0||y>innerHeight||x<0||x>innerWidth){b.scrollIntoView({block:'center'});return 'moved';}"
+                    "var h=document.elementFromPoint(x,y);"
+                    "if(h&&(h===b||b.contains(h)||h.contains(b)))return x+','+y;return 'covered';})()")
+
+        async def _real_click(find_expr):
+            for _ in range(8):
+                c = await _val(_center(find_expr))
+                if not c:
+                    return False
+                if c not in ("moved", "covered"):
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return False
+            x, y = (float(v) for v in c.split(","))
+            for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+                await cdp_send(ws_url, "Input.dispatchMouseEvent", {"type": t, "x": x, "y": y, "button": "left", "clickCount": 0 if t == "mouseMoved" else 1})
+                await asyncio.sleep(0.08)
+            return True
+
+        async def _type_into(find_expr, text, multiline=False):
+            # focus by a real click, select what is there, then type like a person (insertText), so
+            # React sees the change; a value set from JS is dropped when the field re-renders
+            if not await _real_click(find_expr):
+                return False
+            await asyncio.sleep(0.3)
+            for t in ("keyDown", "keyUp"):
+                ev = {"type": t, "key": "a", "code": "KeyA", "modifiers": 2, "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65}
+                if t == "keyDown":
+                    ev["commands"] = ["selectAll"]
+                await cdp_send(ws_url, "Input.dispatchKeyEvent", ev)
+            lines = text.split("\n") if multiline else [text.replace("\n", " ")]
+            for i, ln in enumerate(lines):
+                if i:
+                    for t in ("keyDown", "keyUp"):
+                        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": t, "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
+                if ln:
+                    await cdp_send(ws_url, "Input.insertText", {"text": ln})
+                await asyncio.sleep(0.15)
+            return True
+
+        F_TITLE = "document.querySelector('textarea[id^=\"pin-draft-title\"],input[id^=\"pin-draft-title\"]')"
+        F_DESC = ("(document.querySelector('[id^=\"pin-draft-description\"] [contenteditable=true]')"
+                  "||document.querySelector('[data-test-id=\"pin-draft-description\"] [contenteditable=true]')"
+                  "||Array.from(document.querySelectorAll('[contenteditable=true]')).find(function(e){"
+                  "return e.getBoundingClientRect().width>200;}))")
+        F_LINK = "document.querySelector('textarea[id^=\"pin-draft-link\"],input[id^=\"pin-draft-link\"]')"
+        F_BOARD = "document.querySelector('[data-test-id=\"board-dropdown-select-button\"]')"
+        F_SAVE = ("(document.querySelector('[data-test-id=\"board-dropdown-save-button\"]')"
+                  "||Array.from(document.querySelectorAll('button')).find(function(b){"
+                  "return /^(Publicar|Publish)$/.test((b.innerText||'').trim());}))")
+
+        # 1. the builder, with a logged-in session
+        await _goto("https://www.pinterest.com/pin-builder/")
+        for _ in range(40):
+            await asyncio.sleep(1)
+            u = (await _val("location.href")) or ""
+            if re.search(r"/login|/signup", u):
+                return await _done(False, published=False, error="this session is not logged in to Pinterest")
+            if await _val("!!document.querySelector('input[type=file]')"):
+                break
+        else:
+            return await _done(False, published=False, error="the pin builder never showed its file input")
+        await asyncio.sleep(3)
+        steps.append("pin builder ready")
+
+        # 2. the image, handed to the page's own file input
+        def _with_oid(out):
+            ro = (out[0].get("result") or {}).get("result") or {}
+            oid = ro.get("objectId")
+            return {"files": [image_path], "objectId": oid} if oid and ro.get("subtype") != "null" else None
+        out = await _raw([("Runtime.evaluate", {"expression": "document.querySelector('input[type=file]')", "returnByValue": False}),
+                          ("DOM.setFileInputFiles", _with_oid)])
+        if len(out) < 2 or out[1].get("error"):
+            return await _done(False, published=False, error="the page did not take the image")
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if await _val("!!" + F_TITLE):
+                break
+        else:
+            return await _done(False, published=False, error="the image went in but the title field never appeared")
+        await asyncio.sleep(2)
+        steps.append("image uploaded")
+
+        # 3. title, description, link: typed, then read back
+        if not await _type_into(F_TITLE, title):
+            return await _done(False, published=False, error="could not reach the title field")
+        if desc and not await _type_into(F_DESC, desc, multiline=True):
+            return await _done(False, published=False, error="could not reach the description field")
+        if link and not await _type_into(F_LINK, link):
+            return await _done(False, published=False, error="could not reach the link field")
+        await asyncio.sleep(1)
+        got_t = (await _val("(" + F_TITLE + "||{}).value||''")) or ""
+        got_l = (await _val("(" + F_LINK + "||{}).value||''")) or ""
+        got_d = (await _val("((" + F_DESC + ")||{}).innerText||''")) or ""
+        if got_t.strip() != title:
+            return await _done(False, published=False, error=f"the title reads back different: {got_t[:80]!r}")
+        if link and got_l.strip() != link:
+            return await _done(False, published=False, error=f"the link reads back different: {got_l[:80]!r}")
+        if desc and " ".join(got_d.split())[:40] != " ".join(desc.split())[:40]:
+            return await _done(False, published=False, error=f"the description reads back different: {got_d[:80]!r}")
+        steps.append("title, description and link typed and read back")
+
+        # 4. board: the dropdown remembers the last one used, so it is checked every time
+        cur = ((await _val("((" + F_BOARD + ")||{}).innerText||''")) or "").strip()
+        if cur != board:
+            if not await _real_click(F_BOARD):
+                return await _done(False, published=False, error="no board selector on the page")
+            await asyncio.sleep(1.5)
+            srch = "document.querySelector('input[id=\"pickerSearchField\"],input[placeholder*=\"Buscar\"],input[placeholder*=\"Search\"]')"
+            if await _val("!!" + srch):
+                await _type_into(srch, board)
+                await asyncio.sleep(1.5)
+            row = ("Array.from(document.querySelectorAll('[data-test-id=\"board-row\"],div[role=\"button\"],[role=\"option\"]'))"
+                   ".find(function(e){return (e.innerText||'').trim().split('\\n')[0].trim()===" + json.dumps(board) + ";})")
+            if not await _real_click(row):
+                return await _done(False, published=False, error=f"board {board!r} is not in the list (it must already exist)")
+            await asyncio.sleep(1.5)
+            cur = ((await _val("((" + F_BOARD + ")||{}).innerText||''")) or "").strip()
+        if cur != board:
+            return await _done(False, published=False, error=f"the board reads {cur!r}, not {board!r}")
+        steps.append(f"board: {board}")
+
+        if arguments.get("dry_run"):
+            return await _done(True, published=False, dry_run=True)
+
+        # 5. publish, and confirm by the link Pinterest itself returns for the new Pin
+        if not await _real_click(F_SAVE):
+            return await _done(False, published=False, error="no Publish button")
+        steps.append("publish clicked")
+        pin_id = ""
+        for _ in range(25):
+            await asyncio.sleep(1)
+            pin_id = (await _val(
+                "(function(){var m=location.href.match(/\\/pin\\/(\\d+)/);if(m)return m[1];"
+                "var a=Array.from(document.querySelectorAll('a[href*=\"/pin/\"]')).filter(function(x){"
+                "var r=x.getBoundingClientRect();return r.width>0&&r.height>0&&!x.closest('[data-test-id=\"pin-builder-draft\"]');});"
+                "var t=(document.body.innerText||'');"
+                "if(!/(publicad|publish|guardad|saved|Ver ahora|See it now)/i.test(t))return '';"
+                "for(var i=0;i<a.length;i++){var k=(a[i].getAttribute('href')||'').match(/\\/pin\\/(\\d+)/);if(k)return k[1];}"
+                "return '';})()")) or ""
+            if pin_id:
+                break
+        if pin_id:
+            steps.append(f"confirmed: pin {pin_id}")
+            return await _done(True, published=True, pin_id=pin_id, pin_url=f"https://www.pinterest.com/pin/{pin_id}/")
+        steps.append("Publish was clicked but no Pin link came back")
+        return await _done(False, published="unknown",
+                           error="clicked Publish but could not confirm the Pin: treat it as posted, do not post this image again")
 
     if name == "inject_on_new_document":
         # CDP Page.addScriptToEvaluateOnNewDocument — survives all navigations

@@ -44,7 +44,7 @@ ACTION_TOOLS = {
     "reddit_submit_comment",
     "pause_for_human",
     "react_invoke_handler",
-    "tiktok_post_video", "x_create_tweet",
+    "tiktok_post_video", "pinterest_post_pin", "x_create_tweet",
 }
 
 
