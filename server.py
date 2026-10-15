@@ -110,37 +110,6 @@ def find_and_focus_chrome_window(port: int) -> int | None:
         import time; time.sleep(0.5)
     return best_hwnd
 
-async def get_exact_screen_coords(ws_url: str, text: str) -> tuple[float, float] | None:
-    """Get exact physical screen coordinates — accounts for DPI scaling."""
-    js = f"""(function() {{
-        const all = document.querySelectorAll('*');
-        const q = {json.dumps(text.lower())};
-        const dpr = window.devicePixelRatio || 1;
-        const toolbarCSS = window.outerHeight - window.innerHeight;
-        for (const el of all) {{
-            const t = (el.textContent || '').trim().toLowerCase();
-            if (t.includes(q) && t.length < 200 && el.offsetParent !== null) {{
-                const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) {{
-                    return JSON.stringify({{
-                        x: Math.round((window.screenX + r.left + r.width/2) * dpr),
-                        y: Math.round((window.screenY + toolbarCSS + r.top + r.height/2) * dpr)
-                    }});
-                }}
-            }}
-        }}
-        return null;
-    }})()"""
-    result = await eval_in_tab(ws_url, js)
-    val = result.get("result", {}).get("value")
-    if val:
-        try:
-            coords = json.loads(val)
-            return coords["x"], coords["y"]
-        except Exception:
-            pass
-    return None
-
 # NOTE: The historical real_cursor_click() function used to live here and could
 # move the actual Windows cursor via pyautogui. It is intentionally removed.
 # WebLoom NEVER moves the OS cursor — see WEBLOOM_SPEC.md §15. If a click can't
@@ -196,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.17"
+ENGINE_VERSION = "0.3.18"
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -476,6 +445,13 @@ def find_tab(tabs: list, tab_ref: str) -> dict | None:
     rt = real_tabs(tabs)
     if rt:
         return rt[0]
+    # No real page yet (a fresh Chrome showing about:blank or a new tab): use that page. Falling
+    # straight to tabs[0] picked whatever target Chrome listed first; on a fresh headless Chrome that
+    # was a built-in extension's background page, and every navigate failed with net::ERR_ABORTED.
+    blank = [t for t in tabs if t.get("type", "page") == "page"
+             and not t.get("url", "").startswith(("chrome-extension://", "devtools://"))]
+    if blank:
+        return blank[0]
     if tabs:
         return tabs[0]
     return None
@@ -675,6 +651,60 @@ async def cdp_browser_send(port: int, method: str, params: dict = None) -> dict:
     if not ws_url:
         raise RuntimeError("Browser websocket not available — Chrome may need --remote-debugging-port")
     return await cdp_send(ws_url, method, params)
+
+
+_COOKIE_SAME_SITE = {"strict": "Strict", "lax": "Lax", "none": "None", "no_restriction": "None"}
+
+
+def _cookies_for_cdp(data) -> list[dict]:
+    """Cookies from export_profile ({"cookies": [...]}) or from a browser cookie-export extension (a
+    bare list, with expirationDate / hostOnly / sameSite "no_restriction"), shaped the way CDP
+    Storage.setCookies accepts them. Chrome refuses a cookie that breaks a prefix rule, and one
+    refused cookie can sink the whole batch:
+      __Host-   no Domain, Path=/ and Secure, so it is set by url (https://<host>/) instead;
+      __Secure- must be Secure;
+      SameSite=None must be Secure.
+    An empty value is kept as "" (a session can depend on a cookie that exists but is empty)."""
+    items = data.get("cookies", []) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError("expected a list of cookies or {\"cookies\": [...]}")
+    keep = ("httpOnly", "priority", "sourceScheme", "sourcePort", "partitionKey")
+    out = []
+    for c in items:
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        name = str(c["name"])
+        d = {"name": name, "value": "" if c.get("value") is None else str(c["value"])}
+        domain = str(c.get("domain") or "").strip()
+        path = c.get("path") or "/"
+        secure = bool(c.get("secure")) or name.startswith(("__Secure-", "__Host-"))
+        if name.startswith("__Host-"):
+            host = domain.lstrip(".") or (urllib.parse.urlparse(c["url"]).hostname if c.get("url") else "")
+            if not host:
+                continue
+            d["url"] = f"https://{host}/"
+            path = "/"
+        elif domain:
+            d["domain"] = domain
+        elif c.get("url"):
+            d["url"] = c["url"]
+        else:
+            continue
+        d["path"] = path
+        same_site = _COOKIE_SAME_SITE.get(str(c.get("sameSite") or "").lower())
+        if same_site:
+            d["sameSite"] = same_site
+            if same_site == "None":
+                secure = True
+        d["secure"] = secure
+        for k in keep:
+            if c.get(k) not in (None, ""):
+                d[k] = c[k]
+        expires = c.get("expires", c.get("expirationDate"))
+        if isinstance(expires, (int, float)) and expires > 0 and not c.get("session"):
+            d["expires"] = float(expires)
+        out.append(d)
+    return out
 
 
 async def navigate_and_wait_load(ws_url: str, url: str, timeout: float = 20.0) -> str:
@@ -1042,18 +1072,13 @@ async def vision_ground(ws_url: str, description: str) -> tuple[float, float] | 
     (e.g. KDP page pushed buttons down due to a banner).
     """
     try:
-        scroll_js = f"""(function() {{
-            const desc = {json.dumps(description.lower())};
-            const all = document.querySelectorAll('button, a, input, [role=button], div, span, label');
-            for (const el of all) {{
-                const t = (el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').toLowerCase();
-                if (t.includes(desc)) {{
-                    el.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}});
-                    return true;
-                }}
-            }}
-            return false;
-        }})()"""
+        # Same locator as click, so the element scrolled into view is the one click means
+        # (the old first-in-page-order match was usually a big wrapper).
+        scroll_js = ("(function(description) {\n" + _LOCATE_JS
+                     + "\n    const loc = __wlLocate(description);"
+                     + "\n    if (!loc.el) return false;"
+                     + "\n    loc.el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
+                     + "\n    return true;\n})(" + json.dumps(description) + ")")
         await eval_in_tab(ws_url, scroll_js)
         await asyncio.sleep(0.15)  # let layout settle
     except Exception:
@@ -1075,24 +1100,155 @@ async def vision_ground(ws_url: str, description: str) -> tuple[float, float] | 
 
 
 # ── Actionability + playbook-informed click ────────────────────────────────────
-ACTIONABILITY_JS = """(function(description) {
-    // Locate by text/aria/placeholder OR CSS selector — same matchers as CLICK_JS.
-    const desc = description.toLowerCase();
-    const candidates = document.querySelectorAll(
-        'button, a, input[type=submit], input[type=button], '
-        + '[role=button], [role=link], [role=combobox], [role=option], '
-        + '[role=menuitem], [role=tab], [aria-haspopup], [onclick], label, '
-        + 'div, span, li'
-    );
-    let el = null;
-    for (const c of candidates) {
-        const t = (c.textContent || c.value || c.getAttribute('aria-label') || c.getAttribute('placeholder') || '').toLowerCase();
-        if (t.includes(desc)) { el = c; break; }
+# One element locator for every click-by-text path (the CDP probe, the JS dispatch fallback and
+# vision's pre-scroll), so they all pick the same element.
+#
+# Root cause it replaces (2026-10-15, a Google account chooser picked the wrong account): each path
+# took the FIRST element in page order whose text CONTAINED the words. Page order lists ancestors
+# before their children, so the winner was usually a large wrapper (the whole account list) and the
+# click landed in its middle, on whichever entry happened to sit there.
+#
+# Now: only the innermost elements carrying the text count (an ancestor drops out when a descendant
+# matches at least as well), hidden ones drop out when a visible one exists, and the rest are ranked
+# exact text > starts with > contains, then clickable control > plain text, then on screen, then
+# reachable by a real click at its center. A tie at the top is reported as ambiguous and nothing is
+# clicked, unless the caller picks one with nth (1-based, page order).
+_LOCATE_JS = r"""
+function __wlLocate(description, nth) {
+    const raw = String(description == null ? '' : description);
+    const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+    const q = norm(raw);
+    if (!q) return {el: null, count: 0, matches: []};
+    const CLICKABLE = 'button, a[href], input[type=submit], input[type=button], input[type=reset], '
+        + 'input[type=checkbox], input[type=radio], input[type=image], summary, select, label, '
+        + '[role=button], [role=link], [role=option], [role=menuitem], [role=menuitemradio], '
+        + '[role=menuitemcheckbox], [role=tab], [role=checkbox], [role=radio], [role=switch], '
+        + '[role=treeitem], [role=combobox], [onclick], [aria-haspopup]';
+    const byCss = () => { try { return document.querySelector(raw); } catch (e) { return null; } };
+    const looksCss = /^\s*[#.\[]/.test(raw) || /\s>\s|:nth-|\[[\w-]+([~|^$*]?=|\])/.test(raw);
+    if (looksCss) {
+        const el = byCss();
+        if (el) return {el, target: el, by: 'css', tier: 3, text: '', count: 1, matches: []};
     }
-    if (!el) {
-        try { el = document.querySelector(description); } catch (e) {}
+    const labelsOf = (el) => {
+        const out = [];
+        const attr = (n) => el.getAttribute(n);
+        const tag = el.tagName;
+        if (attr('aria-label')) out.push(attr('aria-label'));
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+            const ty = String(el.type || '').toLowerCase();
+            if (ty === 'submit' || ty === 'button' || ty === 'reset') out.push(el.value);
+            if (attr('placeholder')) out.push(attr('placeholder'));
+        } else {
+            out.push(el.innerText);
+        }
+        if (attr('title')) out.push(attr('title'));
+        if (tag === 'IMG' && attr('alt')) out.push(attr('alt'));
+        return out;
+    };
+    const matchOf = (el) => {
+        let tier = 0, text = '';
+        for (const l of labelsOf(el)) {
+            const t = norm(l);
+            if (!t) continue;
+            const k = t === q ? 3 : t.startsWith(q) ? 2 : t.includes(q) ? 1 : 0;
+            if (k > tier) { tier = k; text = t; }
+        }
+        return {tier, text};
+    };
+    const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'META', 'LINK', 'TITLE']);
+    const first = q.split(' ')[0];
+    const hits = new Map();
+    for (const el of (document.body || document.documentElement).querySelectorAll('*')) {
+        if (SKIP.has(el.tagName)) continue;
+        if (!String(el.textContent || '').toLowerCase().includes(first)
+            && !el.hasAttribute('aria-label') && !el.hasAttribute('placeholder')
+            && !el.hasAttribute('title') && !el.hasAttribute('alt') && el.tagName !== 'INPUT') continue;
+        const m = matchOf(el);
+        if (m.tier) hits.set(el, m);
     }
-    if (!el) return JSON.stringify({found: false});
+    // keep the innermost: an ancestor drops out when a descendant matches at least as well
+    const deeper = new Map();
+    for (const [el, m] of hits) {
+        for (let p = el.parentElement; p; p = p.parentElement) {
+            if (hits.has(p) && (deeper.get(p) || 0) < m.tier) deeper.set(p, m.tier);
+        }
+    }
+    const vw = innerWidth, vh = innerHeight;
+    const visibleOf = (el, r) => {
+        if (r.width * r.height < 4) return false;
+        if (el.checkVisibility) return el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+        const s = getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none' && parseFloat(s.opacity || '1') > 0;
+    };
+    const score = (c) => [c.visible ? 1 : 0, c.tier, c.clickable ? 1 : 0, c.onScreen ? 1 : 0, c.hittable ? 1 : 0];
+    const cmp = (a, b) => {
+        const sa = score(a), sb = score(b);
+        for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return sb[i] - sa[i];
+        return 0;
+    };
+    const byKey = new Map();
+    for (const [el, m] of hits) {
+        if ((deeper.get(el) || 0) >= m.tier) continue;
+        let target = el.closest(CLICKABLE);
+        if (target && target !== el) {
+            let hops = 0;
+            for (let p = el; p && p !== target; p = p.parentElement) hops++;
+            if (hops > 8) target = null;
+        }
+        const r = el.getBoundingClientRect();
+        const visible = visibleOf(el, r);
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const onScreen = visible && cx >= 0 && cy >= 0 && cx < vw && cy < vh;
+        let hittable = false;
+        if (onScreen) {
+            const top = document.elementFromPoint(cx, cy);
+            hittable = !!top && (top === el || el.contains(top) || (!!target && target.contains(top) && top.contains(el)));
+        }
+        const c = {el, target, tier: m.tier, text: m.text, clickable: !!target, visible, onScreen, hittable, r};
+        // Two hits inside the same small control (a button whose label is repeated for screen
+        // readers, a label and its own checkbox) are one choice, not two.
+        let key = el;
+        if (target && !target.querySelector(CLICKABLE)) key = target;
+        if (target && target.tagName === 'LABEL' && target.control) key = target.control;
+        if (target && target.labels && target.labels.length && target.labels[0].querySelector(CLICKABLE) === target) key = target;
+        const prev = byKey.get(key);
+        if (!prev || cmp(c, prev) < 0) byKey.set(key, c);
+    }
+    let list = [...byKey.values()];
+    if (list.some((c) => c.visible)) list = list.filter((c) => c.visible);
+    list.sort(cmp);
+    const describe = (c, i) => ({
+        n: i + 1, tag: c.el.tagName.toLowerCase(), role: (c.target || c.el).getAttribute('role') || '',
+        text: (c.text || '').slice(0, 80), x: Math.round(c.r.left + c.r.width / 2), y: Math.round(c.r.top + c.r.height / 2),
+        match: ['', 'contains', 'starts-with', 'exact'][c.tier], clickable: c.clickable, on_screen: c.onScreen,
+    });
+    if (!list.length) {
+        const el = looksCss ? null : byCss();
+        return el ? {el, target: el, by: 'css', tier: 3, text: '', count: 1, matches: []} : {el: null, count: 0, matches: []};
+    }
+    const top = list.filter((c) => cmp(c, list[0]) === 0);
+    const k = parseInt(nth, 10);
+    let pick = top[0];
+    if (k >= 1) {
+        if (k > top.length) return {el: null, nthOutOfRange: true, count: list.length, tied: top.length, matches: top.slice(0, 8).map(describe)};
+        pick = top[k - 1];
+    } else if (top.length > 1) {
+        return {el: null, ambiguous: true, count: list.length, tied: top.length, matches: top.slice(0, 8).map(describe)};
+    }
+    return {el: pick.el, target: pick.target, by: 'text', tier: pick.tier, text: pick.text, count: list.length,
+            matches: list.slice(0, 8).map(describe)};
+}
+"""
+
+ACTIONABILITY_JS = "(function(description, nth) {\n" + _LOCATE_JS + r"""
+    const loc = __wlLocate(description, nth);
+    if (loc.ambiguous || loc.nthOutOfRange) {
+        return JSON.stringify({found: false, ambiguous: !!loc.ambiguous, nth_out_of_range: !!loc.nthOutOfRange,
+                               match_count: loc.count, tied: loc.tied, matches: loc.matches});
+    }
+    if (!loc.el) return JSON.stringify({found: false, match_count: 0});
+    const el = loc.el;
 
     el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
     const r = el.getBoundingClientRect();
@@ -1104,7 +1260,8 @@ ACTIONABILITY_JS = """(function(description) {
         : (r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && parseFloat(style.opacity || '1') > 0));
 
     const inViewport = r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
-    const notDisabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+    const ctl = loc.target || el;
+    const notDisabled = !el.disabled && !ctl.disabled && el.getAttribute('aria-disabled') !== 'true' && ctl.getAttribute('aria-disabled') !== 'true';
     const hasArea = r.width >= 1 && r.height >= 1;
 
     let hitsTarget = false;
@@ -1118,7 +1275,9 @@ ACTIONABILITY_JS = """(function(description) {
         // will land on the cover element, not reach el. Common when an invisible
         // overlay / wrapper steals hit-test from the actual button (Amazon AUI,
         // KDP modal alerts, etc.).
-        hitsTarget = !!top && (top === el || el.contains(top));
+        //   - a leaf with pointer-events:none: the hit lands on its control, which holds it
+        hitsTarget = !!top && (top === el || el.contains(top)
+            || (!!loc.target && loc.target.contains(top) && top.contains(el)));
         if (top && !hitsTarget) {
             intercepting = {
                 tag: top.tagName,
@@ -1139,14 +1298,16 @@ ACTIONABILITY_JS = """(function(description) {
         intercepting,  // populated when hit-test landed on a non-descendant of el
         animating: pendingAnim,
         actionable: visible && inViewport && notDisabled && hasArea && hitsTarget && pendingAnim === 0,
-        tag: el.tagName, id: el.id || '', cls: (el.className || '').toString().slice(0, 80)
+        tag: el.tagName, id: el.id || '', cls: (el.className || '').toString().slice(0, 80),
+        by: loc.by, match: ['', 'contains', 'starts-with', 'exact'][loc.tier] || '', matched_text: (loc.text || '').slice(0, 80),
+        match_count: loc.count, matches: loc.matches
     });
 })(DESCRIPTION)"""
 
 
-async def check_actionability(ws_url: str, desc: str) -> dict:
+async def check_actionability(ws_url: str, desc: str, nth: int | None = None) -> dict:
     """One-shot actionability probe. Returns a dict (or {} on JS error)."""
-    js = ACTIONABILITY_JS.replace("DESCRIPTION", json.dumps(desc))
+    js = ACTIONABILITY_JS.replace("DESCRIPTION", json.dumps(desc) + ", " + json.dumps(nth))
     r = await eval_in_tab(ws_url, js)
     try:
         return json.loads(r.get("result", {}).get("value", "{}"))
@@ -1154,17 +1315,21 @@ async def check_actionability(ws_url: str, desc: str) -> dict:
         return {}
 
 
-async def wait_actionable(ws_url: str, desc: str, timeout_s: float = 5.0, interval_s: float = 0.12) -> dict:
+async def wait_actionable(ws_url: str, desc: str, timeout_s: float = 5.0, interval_s: float = 0.12,
+                          nth: int | None = None) -> dict:
     """Poll actionability until True, returning the final probe dict.
     Bails early as soon as actionable, or after timeout. Also confirms position
     stability by requiring two consecutive probes to agree within 1px.
+    An ambiguous match returns at once: waiting does not make a tie less of a guess.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
     last_rect = None
     last = {}
     while asyncio.get_event_loop().time() < deadline:
-        probe = await check_actionability(ws_url, desc)
+        probe = await check_actionability(ws_url, desc, nth)
         last = probe
+        if probe.get("ambiguous") or probe.get("nth_out_of_range"):
+            return probe
         if not probe.get("found"):
             await asyncio.sleep(interval_s)
             continue
@@ -1466,36 +1631,114 @@ async def cdp_real_click(ws_url: str, x: float, y: float):
         })
         await asyncio.sleep(0.05)
 
-async def get_element_center(ws_url: str, text: str) -> tuple[float, float] | None:
-    """Get the center coordinates of an element matching text.
+# US keyboard: character -> (key code name, Windows virtual key code, needs Shift).
+# Chrome maps the virtual key code of a keyDown to an editing command BEFORE it inserts the text.
+# The old typing code sent each character's own ASCII value as that code, and several ASCII values
+# are other keys: "." (46) is Delete, "-" (45) is Insert, "'" (39) is Right arrow, "%&(" are arrow
+# keys and "$#" are Home/End. Those characters were swallowed (2026-10-15: every dot of a URL typed
+# with key_type vanished). The codes below are the real keys' codes.
+def _build_us_keys() -> dict[str, tuple[str, int, bool]]:
+    keys: dict[str, tuple[str, int, bool]] = {}
+    for c in "abcdefghijklmnopqrstuvwxyz":
+        keys[c] = ("Key" + c.upper(), ord(c.upper()), False)
+        keys[c.upper()] = ("Key" + c.upper(), ord(c.upper()), True)
+    for i, (plain, shifted) in enumerate(zip("0123456789", ")!@#$%^&*(")):
+        keys[plain] = ("Digit" + plain, 48 + i, False)
+        keys[shifted] = ("Digit" + plain, 48 + i, True)
+    for code, vk, plain, shifted in (
+        ("Space", 32, " ", ""), ("Semicolon", 186, ";", ":"), ("Equal", 187, "=", "+"),
+        ("Comma", 188, ",", "<"), ("Minus", 189, "-", "_"), ("Period", 190, ".", ">"),
+        ("Slash", 191, "/", "?"), ("Backquote", 192, "`", "~"), ("BracketLeft", 219, "[", "{"),
+        ("Backslash", 220, "\\", "|"), ("BracketRight", 221, "]", "}"), ("Quote", 222, "'", '"'),
+    ):
+        keys[plain] = (code, vk, False)
+        if shifted:
+            keys[shifted] = (code, vk, True)
+    return keys
 
-    Returns the leaf's center — CDP's hit-test resolves the topmost element
-    at that pixel and event bubbling reaches any listener on parents. We do
-    NOT lift to an ancestor, because some sites put their click/mousedown
-    handler on an intermediate wrapper that a parent-level dispatch would
-    bypass (bubbles go up, not down).
-    """
-    js = f"""(function() {{
-        const all = document.querySelectorAll('li, button, a, [role=button], [role=combobox], [role=option], [role=menuitem], [role=link], [aria-haspopup], div, span, label');
-        const q = {json.dumps(text.lower())};
-        for (const el of all) {{
-            if (el.textContent.toLowerCase().includes(q) && el.offsetParent !== null) {{
-                const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0)
-                    return JSON.stringify({{x: r.left + r.width/2, y: r.top + r.height/2}});
-            }}
-        }}
-        return null;
-    }})()"""
-    result = await eval_in_tab(ws_url, js)
-    val = result.get("result", {}).get("value")
-    if val:
+
+_US_KEYS = _build_us_keys()
+_CDP_SHIFT = 8  # CDP modifier bits: Alt=1, Ctrl=2, Meta=4, Shift=8 (capitals used to go out with Alt)
+
+
+def _keystroke_events(ch: str) -> tuple[dict, dict] | None:
+    """(keyDown, keyUp) CDP payloads that type one character the way a real US keyboard does, or
+    None when the character has no key there (accents, emoji, other scripts): those go in with
+    Input.insertText. Enter and Tab stay real keys (Enter submits forms, Tab moves the focus)."""
+    if ch in ("\n", "\r"):
+        key = {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13}
+        return ({"type": "keyDown", **key, "text": "\r", "unmodifiedText": "\r"}, {"type": "keyUp", **key})
+    if ch == "\t":
+        key = {"key": "Tab", "code": "Tab", "windowsVirtualKeyCode": 9, "nativeVirtualKeyCode": 9}
+        return ({"type": "rawKeyDown", **key}, {"type": "keyUp", **key})
+    entry = _US_KEYS.get(ch)
+    if not entry:
+        return None
+    code, vk, shift = entry
+    key = {"key": ch, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+           "modifiers": _CDP_SHIFT if shift else 0, "location": 0}
+    return ({"type": "keyDown", **key, "text": ch, "unmodifiedText": ch}, {"type": "keyUp", **key})
+
+
+def _js_probe(expr: str) -> str:
+    """Wrap a JS expression so the PAGE judges its truthiness. Runtime.evaluate with returnByValue
+    sends a DOM node back as {} and {} is falsy in Python, so a wait on a bare element expression
+    never ended. This returns {truthy, value} with nodes turned into true, awaits promises, and
+    reports a throw (an element not there yet) as not-yet instead of an error."""
+    return ("(async () => { let v; try { v = await (\n" + expr + "\n); } catch (e) {"
+            " return {truthy: false, error: String((e && e.message) || e)}; }"
+            " let out = true; if (!(v instanceof Node) && typeof v !== 'function') {"
+            " try { out = JSON.parse(JSON.stringify(v === undefined ? null : v)); } catch (e) { out = true; } }"
+            " return {truthy: !!v, value: out}; })()")
+
+
+async def _wait_js(ws_url: str, expr: str, timeout_s: float, step_s: float = 0.5) -> tuple[bool, object, str]:
+    """Poll a JS expression until it is truthy in the page. Returns (held, value, last_error)."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(0.0, float(timeout_s))
+    last_err = ""
+    while True:
         try:
-            coords = json.loads(val)
-            return coords["x"], coords["y"]
-        except Exception:
-            pass
-    return None
+            r = await eval_in_tab(ws_url, _js_probe(expr))
+            v = (r.get("result") or {}).get("value")
+            if isinstance(v, dict):
+                if v.get("truthy"):
+                    return True, v.get("value"), ""
+                last_err = v.get("error") or last_err
+        except Exception as e:  # navigation in flight, context destroyed: keep polling
+            last_err = str(e)
+        if loop.time() >= deadline:
+            return False, None, last_err
+        await asyncio.sleep(step_s)
+
+
+async def _click_element_js(ws_url: str, element_js: str, timeout_s: float = 10.0, until_js: str | None = None,
+                            attempts: int = 1, until_timeout_s: float = 10.0) -> dict:
+    """Real CDP mouse click (isTrusted) at the center of the element a JS expression returns.
+    With until_js: after each click wait for that condition, and click again (up to `attempts`)
+    while it does not hold. That covers pages still hydrating, where the first click does nothing."""
+    box_expr = ("(() => { const e = (\n" + element_js + "\n); if (!e || !e.getBoundingClientRect) return null;"
+                " e.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
+                " const r = e.getBoundingClientRect(); if (r.width < 1 || r.height < 1) return null;"
+                " return {x: r.left + r.width / 2, y: r.top + r.height / 2, tag: e.tagName.toLowerCase(),"
+                " text: String(e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 60)}; })()")
+    attempts = max(1, int(attempts or 1))
+    clicked = None
+    for attempt in range(1, attempts + 1):
+        found, box, err = await _wait_js(ws_url, box_expr, timeout_s)
+        if not found or not isinstance(box, dict):
+            return {"ok": False, "error": "element not found" + (f" ({err})" if err else ""),
+                    "clicks": attempt - 1, "clicked": clicked}
+        await cdp_real_click(ws_url, box["x"], box["y"])
+        clicked = {k: (round(v) if isinstance(v, float) else v) for k, v in box.items()}
+        if not until_js:
+            return {"ok": True, "clicked": clicked, "clicks": attempt}
+        held, value, _ = await _wait_js(ws_url, until_js, until_timeout_s)
+        if held:
+            return {"ok": True, "clicked": clicked, "clicks": attempt, "until": value}
+    return {"ok": False, "error": f"clicked {attempts} time(s) and until_js never held", "clicked": clicked,
+            "clicks": attempts}
+
 
 async def eval_in_tab(ws_url: str, expression: str) -> dict:
     return await cdp_send(ws_url, "Runtime.evaluate", {
@@ -1508,17 +1751,7 @@ async def screenshot_tab(ws_url: str) -> str:
     result = await cdp_send(ws_url, "Page.captureScreenshot", {"format": "jpeg", "quality": 80})
     return result.get("data", "")
 
-CLICK_JS = """
-(function(description) {
-    // Widen scan to include modern interactive roles. Radix/HeadlessUI/
-    // react-select use combobox/listbox/option/menuitem.
-    const all = document.querySelectorAll(
-        'button, a, input[type=submit], input[type=button], '
-        + '[role=button], [role=link], [role=combobox], [role=option], '
-        + '[role=menuitem], [role=tab], [aria-haspopup], [onclick], label, '
-        + 'div, span'
-    );
-    const desc = description.toLowerCase();
+CLICK_JS = "(function(description, nth) {\n" + _LOCATE_JS + r"""
     // Fire on the LEAF — events bubble UP, reaching any listener on parents.
     // Lifting to an ancestor breaks listeners on intermediate wrappers (e.g.
     // D2D's listener on .select-component-control, INSIDE the [role=combobox]
@@ -1562,35 +1795,18 @@ CLICK_JS = """
         }
         return null;
     };
-    // Pick the MOST SPECIFIC match (smallest textContent length) — handlers
-    // are usually on inner elements; firing on an outer wrapper means the
-    // child listener never hears the event (bubbling goes up, not down).
-    const matches = [];
-    for (const el of all) {
-        const text = (el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').toLowerCase();
-        if (text.includes(desc)) {
-            matches.push({el, textLen: (el.textContent || '').length});
-        }
-    }
-    if (matches.length > 0) {
-        matches.sort((a, b) => a.textLen - b.textLen);
-        const el = matches[0].el;
-        fire(el);
-        const w = auiWrapper(el);
-        if (w && w !== el) fire(w);
-        return 'clicked: ' + (el.textContent || el.tagName).trim().slice(0, 80) + (w && w !== el ? ' (+ AUI wrapper)' : '');
-    }
-    // CSS selector fallback
-    try {
-        const el = document.querySelector(description);
-        if (el) {
-            fire(el);
-            const w = auiWrapper(el);
-            if (w && w !== el) fire(w);
-            return 'clicked by selector: ' + el.tagName + (w && w !== el ? ' (+ AUI wrapper)' : '');
-        }
-    } catch(e) {}
-    return 'not found: ' + description;
+    // The element comes from the shared locator (_LOCATE_JS): innermost exact text first, and a tie
+    // is reported instead of guessed.
+    const loc = __wlLocate(description, nth);
+    if (loc.ambiguous || loc.nthOutOfRange) return 'ambiguous: ' + JSON.stringify(loc.matches || []);
+    if (!loc.el) return 'not found: ' + description;
+    const el = loc.el;
+    fire(el);
+    const w = auiWrapper(el);
+    if (w && w !== el) fire(w);
+    const what = loc.by === 'css' ? 'clicked by selector: ' + el.tagName
+        : 'clicked: ' + String(el.innerText || el.value || el.tagName).trim().slice(0, 80);
+    return what + (w && w !== el ? ' (+ AUI wrapper)' : '');
 })(DESCRIPTION)
 """
 
@@ -1613,12 +1829,16 @@ FILL_JS = """
     for (const [key, value] of Object.entries(fields)) {
         const k = key.toLowerCase();
         let found = null;
-        // by label
+        // by label: exact text first, then starts-with, then contains (the first label that merely
+        // contained the word sent "Email" into "Backup email")
+        let bestTier = 0;
+        const kn = k.replace(/\\s+/g, ' ').trim();
         for (const label of document.querySelectorAll('label')) {
-            if (label.textContent.toLowerCase().includes(k)) {
-                const input = label.querySelector('input,textarea,select') || document.getElementById(label.htmlFor);
-                if (input) { found = input; break; }
-            }
+            const t = label.textContent.toLowerCase().replace(/\\s+/g, ' ').trim();
+            const tier = t === kn ? 3 : t.startsWith(kn) ? 2 : t.includes(kn) ? 1 : 0;
+            if (tier <= bestTier) continue;
+            const input = label.querySelector('input,textarea,select') || document.getElementById(label.htmlFor);
+            if (input) { found = input; bestTier = tier; }
         }
         // by placeholder / name / id / aria-label
         if (!found) {
@@ -2171,7 +2391,7 @@ async def list_tools():
         Tool(name="list_tabs", description="List all open tabs in a Chrome session", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name (main, farm, signups, email) or port number"}}, "required": ["session"]}),
         Tool(name="read_tab", description="Read the text content and form fields of a tab", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab ID, title substring, or URL substring. Defaults to active tab."}}, "required": ["session"]}),
         Tool(name="screenshot", description="Take a screenshot of a tab — returns an image", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
-        Tool(name="click", description="Click an element by text, aria-label, or CSS selector. Strategy ladder: (Stage 1) actionability wait + CDP isTrusted click → (Stage 2) full JS dispatch sequence (pointer+mouse+click on leaf) → (Stage 3) vision grounding (Claude). WebLoom NEVER moves the OS cursor — there is no Layer 3 / pyautogui path. If all stages fail, returns 'not interactable via DOM' and the caller should hand off to the user. Strategy choice is informed by playbook history (per-domain, per-description success rate ≥ 70% → try that strategy first). 🔁 IF ALL 3 STAGES FAIL — DO NOT GIVE UP. Escalate to: (1) `react_invoke_handler` — walks React fiber to find the element's onClick prop and invokes it directly. Bypasses DOM-event interceptors like LinkedIn's `interop-outlet` overlay that swallows ALL click events at document level. (2) `key_press` Tab+Enter — for menu items/triggers that respond to keyboard but block synthesized mouse. (3) `eval_js` to call the React handler from a known global state (Redux dispatch via `redux_dispatch`, Backbone via `backbone_inspect`). The 'click is blocked' wall almost always falls to fiber-invoke.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "description": {"type": "string", "description": "Text on the button/link, or a CSS selector"}, "allow_real_cursor": {"type": "boolean", "default": False, "description": "DEPRECATED / NO-OP. WebLoom will never move the OS cursor regardless of this flag. Kept only for backward-compat with old callers. Setting true is silently ignored."}, "debug": {"type": "boolean", "default": False, "description": "If true, return a full trace of what each stage tried (actionability probe, dispatch results, verifier diffs, playbook lookup). Use when click reports failure but the page reacted, or to debug strategy selection."}, "timeout_seconds": {"type": "number", "default": 5, "description": "Max time to wait for actionability (element visible+stable+enabled+hit-test) before falling through to JS dispatch."}}, "required": ["session", "description"]}),
+        Tool(name="click", description="Click an element by text, aria-label, or CSS selector (or name it exactly with element_js). Text matching picks the innermost element carrying the text, exact text first, and reports a tie instead of guessing (see nth). Strategy ladder: (Stage 1) actionability wait + CDP isTrusted click → (Stage 2) full JS dispatch sequence (pointer+mouse+click on leaf) → (Stage 3) vision grounding (Claude). WebLoom NEVER moves the OS cursor: there is no Layer 3 / pyautogui path. If all stages fail, returns 'not interactable via DOM' and the caller should hand off to the user. Strategy choice is informed by playbook history (per-domain, per-description success rate ≥ 70% → try that strategy first). 🔁 IF ALL 3 STAGES FAIL: DO NOT GIVE UP. Escalate to: (1) `react_invoke_handler`: walks React fiber to find the element's onClick prop and invokes it directly. Bypasses DOM-event interceptors like LinkedIn's `interop-outlet` overlay that swallows ALL click events at document level. (2) `key_press` Tab+Enter: for menu items/triggers that respond to keyboard but block synthesized mouse. (3) `eval_js` to call the React handler from a known global state (Redux dispatch via `redux_dispatch`, Backbone via `backbone_inspect`). The 'click is blocked' wall almost always falls to fiber-invoke.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "description": {"type": "string", "description": "Text on the button/link, or a CSS selector"}, "allow_real_cursor": {"type": "boolean", "default": False, "description": "DEPRECATED / NO-OP. WebLoom will never move the OS cursor regardless of this flag. Kept only for backward-compat with old callers. Setting true is silently ignored."}, "debug": {"type": "boolean", "default": False, "description": "If true, return a full trace of what each stage tried (actionability probe, dispatch results, verifier diffs, playbook lookup). Use when click reports failure but the page reacted, or to debug strategy selection."}, "timeout_seconds": {"type": "number", "default": 5, "description": "Max time to wait for actionability (element visible+stable+enabled+hit-test) before falling through to JS dispatch. With element_js: how long to wait for the element to exist."}, "nth": {"type": "integer", "minimum": 1, "description": "Text matching keeps the innermost elements carrying the text and ranks them: visible first, then exact text > starts with > contains, then a real control (button, link, option...) over plain text, then on screen, then reachable by a click at its center. If several still tie, NOTHING is clicked and the reply lists them; pass nth (1-based, page order among the tied ones) to pick one."}, "element_js": {"type": "string", "description": "Instead of description: a JS expression that returns the element to click, e.g. \"[...document.querySelectorAll('[role=dialog] button')].filter(b => /Submit/.test(b.innerText)).pop()\". WebLoom scrolls it into view and fires ONE real CDP mouse click (isTrusted) at its center. No JS-dispatch or vision fallback, so a checkbox is never toggled twice. Returns JSON {ok, clicked, clicks}."}, "until_js": {"type": "string", "description": "With element_js: a JS condition that proves the click worked (e.g. \"document.querySelector('[role=dialog] input')\"). After each click WebLoom waits for it up to until_timeout_seconds and clicks again, up to `attempts` times, while it does not hold. For pages still hydrating where the first click does nothing."}, "attempts": {"type": "integer", "default": 1, "description": "With element_js + until_js: how many clicks to try."}, "until_timeout_seconds": {"type": "number", "default": 10, "description": "With until_js: how long to wait after each click."}}, "required": ["session"]}),
         Tool(name="fill", description="Fill form fields. Pass a dict of {label_or_name: value}. 🔁 IF FILL FAILS (controlled input ignores it, value vanishes, no onChange fires): escalate to (1) `react_force_change` — calls the native HTMLInputElement.value setter that React DOES observe, plus dispatches input+change. Solves 90% of React-controlled-input fails. (2) `lexical_set_text` for Lexical editors (Reddit modern, Facebook composer). (3) `draftjs_set_text` for Draft.js (X/Twitter composer, Twilio). (4) `key_type` to type the value char-by-char via CDP keystrokes — last resort but works against anything that listens for real key events. (5) For body-signed APIs (X, TikTok, Instagram), skip DOM entirely and use the per-site protocol tool (e.g. `x_create_tweet`). DO NOT report 'can't fill this field' until the ladder is exhausted.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "fields": {"type": "object", "description": "Key-value pairs of field label/name → value"}}, "required": ["session", "fields"]}),
         Tool(name="eval_js", description="Run arbitrary JavaScript in a tab and return the result", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "code": {"type": "string"}}, "required": ["session", "code"]}),
         Tool(name="navigate", description="Navigate a tab to a URL — waits for Page.loadEventFired (no fixed sleep). Returns when the page has loaded or the timeout elapses.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url": {"type": "string"}, "timeout_seconds": {"type": "number", "default": 20}}, "required": ["session", "url"]}),
@@ -2205,7 +2425,7 @@ async def list_tools():
             "Always pass absolute file paths."
         ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}, "react_input_selector": {"type": "string", "description": "Strategy E: CSS selector for a React-controlled file input, possibly inside shadow DOM. Walks shadow roots recursively to find the input, builds File objects in page JS, assigns via the native HTMLInputElement.files prototype setter (which React's controlled-input observer DOES notice — unlike B/D's synthetic path), fires input+change, AND invokes the input's onChange via fiber walk for handler-gated implementations. Use for LinkedIn composer + similar Lit/shadow-DOM React patterns. Max 25MB combined."}, "chunked_input_selector": {"type": "string", "description": "Strategy F: CSS selector for the <input type=file> (light or shadow DOM). No size cap: files are streamed into the page in 2MB pieces, verified against disk size, then handed to the input's React onChange exactly once (or set via the native setter + one input/change event when there is no React handler). Use for files over 25MB and for React inputs that clear their value after reading."}}, "required": ["session", "selector", "files"]}),
         Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget, works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}, "background": {"type": "boolean", "description": "Open without raising the window (default: true in autopilot runs, false in chats). In a headless Chrome every new tab gets its own window instead, so it is never a hidden back tab (hidden pages never load audio or video)."}}, "required": ["session"]}),
-        Tool(name="wait_for", description="Wait for an element to appear in a tab (polls every 500ms)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session", "selector"]}),
+        Tool(name="wait_for", description="Wait for an element (CSS selector) or for a JS condition to hold in a tab (polls every 500ms). With js: returns JSON {ok, elapsed_s, value}, where value is what the expression returned (a DOM node counts as true).", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "js": {"type": "string", "description": "A JS expression; the wait ends when it is truthy IN THE PAGE (a returned element counts, a throw counts as not yet). Use it instead of selector for conditions like \"/Joined/.test(document.body.innerText)\"."}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session"]}),
         Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first: it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}, "background": {"type": "boolean", "default": False, "description": "Windows: open the window minimized without taking the focus, and keep the session's login confirmation (an unattended relaunch of the same profile). For scheduled jobs, not for a person who wants to see the window."}}, "required": []}),
         Tool(name="scan_tab", description="Page intelligence scan. Modes: 'ax-min' (v0.3.8, cheapest — ~80-200 tokens, format `@e1 button \"Sign in\"`, drops framework noise like Radix IDs); 'ax' (default — compressed accessibility tree with @eN refs, ~200-400 tokens, includes role brackets + placeholders + IDs); 'full' (legacy — every button/input/form with CSS selectors, ~5000 tokens, good for unfamiliar sites where you need everything). All modes share the same @eN ref cache so click/fill/key_type/upload work identically. Prefer ax-min for known/familiar sites; ax when you need placeholder/id hints; full only when nothing else works.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "mode": {"type": "string", "enum": ["ax-min", "ax", "full"], "default": "ax", "description": "ax-min = ultra-compact @eN + kind + label only (cheapest). ax = compact + roles/placeholders/ids (default). full = legacy verbose with CSS selectors."}, "save_to_playbook": {"type": "boolean", "default": True, "description": "Auto-save discovered structure to playbook for this domain (full mode only)"}}, "required": ["session"]}),
         Tool(name="get_playbook", description="Read everything Claude has learned about a domain — known quirks, field names, working patterns, affiliate links. Includes data merged from any installed Threads (profile packs).", inputSchema={"type": "object", "properties": {"domain": {"type": "string", "description": "Domain like bitget.com or mexc.com. Leave empty to list all known domains."}}, "required": []}),
@@ -2225,7 +2445,7 @@ async def list_tools():
         Tool(name="list_recipes", description="List all saved browser-workflow recipes with their goals and action counts.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="worker_jobs", description="See and manage the jobs run_worker keeps on disk. `list` shows every job with its done/failed counts. `show` returns the task names done and failed for one job. `retry` clears the failed list so the next run_worker call retries only those, keeping finished work. `reset` empties the job so it starts from scratch. Without this you can start a queue but not see where it stopped or rerun just the parts that broke.", inputSchema={"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "show", "retry", "reset"], "default": "list"}, "job": {"type": "string", "description": "Job name. Required for show, retry and reset."}}, "required": []}),
         Tool(name="run_worker", description="Run a QUEUE of tasks unattended, waiting for each one to finish before starting the next. This is what replay_recipe cannot do: a recipe repeats a FIXED sequence, while a worker polls the page and only advances when a done-signal appears. Use it whenever each step takes an unknown amount of time (generating audio/video, uploading, rendering, publishing). For every task it runs `before` (optional JS), fills `prompt_selector` with the task text using the React-safe native setter, invokes the `submit_selector` button, then polls the page for `done_text` up to `timeout_seconds`; when it appears it invokes `confirm_selector` (optional) and moves on. It runs as its OWN operating-system process, so it keeps going when the calling session is idle or closed, and it reconnects by itself if the browser dies. Progress is written to disk after EVERY task, so re-running with the same `job` resumes exactly where it left off instead of redoing finished work. While a job runs, do not query the page with eval_js: two concurrent users of the browser connection drop it. Returns per-task ok/failed plus the resume file path.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "job": {"type": "string", "description": "Job name. Used as the resume key: re-running with the same name skips tasks already done."}, "tasks": {"type": "array", "items": {"type": "object"}, "description": "List of {name, prompt} objects. `name` is the resume key, `prompt` the text typed into prompt_selector."}, "prompt_selector": {"type": "string", "description": "CSS selector of the input/textarea that receives each task text. Filled with the native value setter + input event, which is what React-controlled fields require."}, "submit_selector": {"type": "string", "description": "CSS selector, or aria-label in the form aria:Label, of the button that starts the task. Invoked through its React onClick prop, so it works on UIs that ignore synthetic clicks."}, "done_text": {"type": "string", "description": "Text that appears on the page when a task has finished (whatever the site shows: a confirm button, a status word, a result label). This is the signal the worker waits for instead of sleeping a fixed time."}, "confirm_selector": {"type": "string", "description": "Optional. Button to invoke once done_text appears, to accept or save the result. Accepts text:Foo / aria:Foo / a CSS selector."}, "before": {"type": "string", "description": "Optional JS to run before each task, for whatever the site needs first (open a row, pick a slot, clear a field). Runs in page context."}, "timeout_seconds": {"type": "number", "default": 200, "description": "How long to wait for done_text on each task before marking it failed and moving on."}, "poll_seconds": {"type": "number", "default": 4}, "url_match": {"type": "string", "description": "Optional. Piece of the tab URL to work on, e.g. a domain. Without it the worker takes the first page it finds in that session."}}, "required": ["session", "job", "tasks", "prompt_selector", "submit_selector", "done_text"]}),
-        Tool(name="replay_recipe", description="Replay a saved recipe — runs every recorded action in sequence with retry + abort-on-failure. Pass parameters dict to substitute {{var}} placeholders captured during recording.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Recipe name to replay"}, "parameters": {"type": "object", "description": "Key-value pairs for {{var}} substitution, e.g. {'email': 'foo@bar.com', 'password': 'secret'}"}, "session": {"type": "string", "description": "Optional session override (recipes don't store session — they replay against whatever you pass here)"}, "tab": {"type": "string", "description": "Optional tab override"}}, "required": ["name"]}),
+        Tool(name="replay_recipe", description="Replay a saved recipe (recipes/<name>.json) or a session_recipe of an installed Thread (name it \"<domain>/<recipe>\") and run every action in sequence. Pass parameters dict to substitute {{var}} placeholders captured during recording. A recipe with \"output\": \"json\" replies with one JSON object {ok, recipe, result, steps}: result is the value of the step marked \"returns\": true, and a failing step stops the run with ok:false unless it is marked \"optional\": true. A step {\"tool\": \"sleep\", \"args\": {\"seconds\": N}} pauses.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Recipe name to replay, or \"<domain>/<recipe>\" for a Thread's recipe"}, "parameters": {"type": "object", "description": "Key-value pairs for {{var}} substitution, e.g. {'email': 'foo@bar.com', 'password': 'secret'}"}, "session": {"type": "string", "description": "Optional session override (recipes don't store session: they replay against whatever you pass here)"}, "tab": {"type": "string", "description": "Optional tab override"}}, "required": ["name"]}),
         Tool(name="detect_blocker", description="Detect login walls, CAPTCHA (reCAPTCHA / hCaptcha / Cloudflare / DataDome / Arkose), 2FA prompts (TOTP / SMS / push / hardware key), and verification challenges on the current tab. Call before any flow that might hit one.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
         Tool(name="detect_anti_bot", description="Detect anti-bot interception. Returns the type (cloudflare_challenge / datadome / perimeterX / arkose / akamai / empty_shell / normal) plus signals. Different from detect_blocker — that's CAPTCHA/2FA for users; this is silent bot detection that returns a stub page. Use after navigation to know if the page actually loaded or if you hit a challenge.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
         Tool(name="framework_detect", description="Identify which JS frameworks the current page uses. Returns React (with version), Redux, AUI, Backbone, Vue, Angular, Radix, HeadlessUI, Svelte, Next.js, Nuxt, Amazon P-loader, plus DOM indicators (password input, file input, label-wrapped file, drop zone, iframe count). Use to pick the right strategy upfront — e.g. AUI detected → reach for aui_dispatch; Redux detected → react_inspect_store.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
@@ -2234,7 +2454,7 @@ async def list_tools():
         Tool(name="auth_totp", description="Fill a TOTP one-time code from a base32 secret into the page's OTP input. Provide the secret directly (e.g. retrieved from Credential Guardian vault out-of-band). Optionally specify a CSS selector; otherwise auto-detects input[autocomplete=one-time-code] / name=otp / name=2fa.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "secret": {"type": "string", "description": "Base32 TOTP secret (the 'shared secret' shown when setting up Google Authenticator / Authy)"}, "selector": {"type": "string", "description": "Optional CSS selector for the OTP field. If empty, auto-detect."}, "submit": {"type": "boolean", "default": False, "description": "If true, also press Enter / submit after filling."}}, "required": ["session", "secret"]}),
         Tool(name="pause_for_human", description="Pause an automated flow to hand off to the user — for CAPTCHA, push 2FA, hardware keys, or any step that legally requires a human. Returns a structured 'paused' message and plays a system sound. Caller should AskUserQuestion to confirm resume.", inputSchema={"type": "object", "properties": {"reason": {"type": "string", "description": "Why we're pausing — e.g. 'reCAPTCHA on bitget.com login', 'Duo push approval needed'"}, "instructions": {"type": "string", "description": "Plain-English instructions for what the user should do"}, "beep": {"type": "boolean", "default": True}}, "required": ["reason"]}),
         Tool(name="export_profile", description="Export all cookies and storage for a session to a JSON file — for portability across machines or as a session backup. Sensitive: do NOT commit the output to git.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "out_path": {"type": "string", "description": "Absolute path to write the JSON file"}}, "required": ["session", "out_path"]}),
-        Tool(name="import_profile", description="Import cookies from a JSON file (previously exported via export_profile) into a session. The session must be live.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "in_path": {"type": "string", "description": "Absolute path to the cookie JSON file"}}, "required": ["session", "in_path"]}),
+        Tool(name="import_profile", description="Import cookies from a JSON file into a session (the session must be live). Takes an export_profile file ({\"cookies\": [...]}) or a plain list from a browser cookie-export extension. __Host- cookies are set by url with no domain (Chrome refuses them otherwise), empty values are kept, and the jar is read back: returns JSON {ok, imported, of, not_set?}.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "in_path": {"type": "string", "description": "Absolute path to the cookie JSON file (alias: path)"}}, "required": ["session", "in_path"]}),
         Tool(name="capture_network_start", description="Start capturing network requests on a tab. Records URL, method, status, mimeType, request/response timing. Returns immediately; capture continues in the background until capture_network_stop.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
         Tool(name="capture_network_stop", description="Stop network capture and return all captured requests for the tab. Pass full=true to get headers + request body (required for replay_xhr). Default returns a one-line summary per request.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string", "description": "Optional substring — only return requests whose URL contains this"}, "full": {"type": "boolean", "description": "If true, return full request_headers, request_body, response_headers as JSON. Use when you need to replay (auth tokens, csrf, transaction-ids, body shape)."}}, "required": ["session"]}),
         Tool(name="get_captured_requests", description="Get current captured network requests for a tab without stopping capture. Pass full=true to get headers + request body.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url_filter": {"type": "string"}, "full": {"type": "boolean", "description": "If true, return full headers + body — needed for replay_xhr."}}, "required": ["session"]}),
@@ -2975,6 +3195,145 @@ def _mark_startup_done():
         pass
 
 
+# ── Recipes that live in Threads ──────────────────────────────────────────
+# replay_recipe used to read only recipes/<name>.json, so a Thread's session_recipes could not run
+# even through `webloom-autopilot run-recipe --thread`, which copies the Thread in and then asked
+# replay_recipe for a file that was never there. A session_recipe whose actions are real steps
+# ({"tool": ..., "args": ...}) now replays directly from the installed Thread: name it
+# "<domain>/<recipe>", or by the bare recipe name when only one installed Thread has it.
+
+def _thread_recipe_is_executable(r) -> bool:
+    acts = r.get("actions") if isinstance(r, dict) else None
+    return bool(acts) and isinstance(acts, list) and all(isinstance(a, dict) and isinstance(a.get("tool"), str) for a in acts)
+
+
+def _thread_recipes() -> list[tuple[str, dict]]:
+    """(domain, recipe) for every executable session_recipe of the installed Threads. Reads the
+    files directly so a replay does not print every other Thread's validation warnings."""
+    found: dict[tuple[str, str], dict] = {}
+    for d in (PROJECT_THREADS_DIR, THREADS_DIR):  # user-installed wins over bundled
+        try:
+            files = sorted(d.glob("*.thread.json")) if d.exists() else []
+        except OSError:
+            files = []
+        for p in files:
+            try:
+                t = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            dom = t.get("domain") if isinstance(t, dict) else None
+            if not dom:
+                continue
+            for r in t.get("session_recipes") or []:
+                if _thread_recipe_is_executable(r) and r.get("name"):
+                    found[(dom, r["name"])] = r
+    return [(dom, r) for (dom, _n), r in found.items()]
+
+
+def _find_recipe(name: str) -> tuple[dict | None, str]:
+    name = (name or "").strip()
+    if not name:
+        return None, "replay_recipe: name required."
+    domain, _, short = name.rpartition("/")
+    if not domain and re.fullmatch(r"[A-Za-z0-9_.\-]+", name):
+        r = recording.load_recipe(name)
+        if r:
+            return r, ""
+    hits = [(dom, r) for dom, r in _thread_recipes() if r.get("name") == short and (not domain or dom == domain)]
+    if len(hits) == 1:
+        dom, r = hits[0]
+        recipe = dict(r)
+        recipe["name"] = f"{dom}/{short}"
+        recipe.setdefault("domain", dom)
+        return recipe, ""
+    if len(hits) > 1:
+        return None, f"Recipe '{name}' is in several Threads: {[d + '/' + short for d, _ in hits]}. Pass the full name."
+    available = [r["name"] for r in recording.list_recipes()] + [f"{d}/{r['name']}" for d, r in _thread_recipes()]
+    return None, f"Recipe '{name}' not found. Available: {available}"
+
+
+def _first_text(result) -> str:
+    for item in result or []:
+        if hasattr(item, "text"):
+            return item.text or ""
+    return ""
+
+
+def _replay_step_failed(text: str) -> bool:
+    """Did a replayed step fail? Tools report most failures as text, not exceptions."""
+    t = (text or "").strip()
+    try:
+        d = json.loads(t)
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        # {"ok": false, ...} from WebLoom tools; eval_js returns the thrown error as subtype "error"
+        return d.get("ok") is False or d.get("subtype") == "error"
+    low = t.lower()
+    return (low.startswith(("timeout:", "navigation error", "error", "click failed", "no tabs", "session '", "❌"))
+            or "not interactable" in low)
+
+
+def _replay_value(tool: str, text: str):
+    """The value a step produced, as data: eval_js's returned value (parsed when it is a JSON
+    string), wait_for's value, otherwise the tool's JSON or plain text."""
+    try:
+        d = json.loads(text)
+    except Exception:
+        return text
+    if tool == "eval_js" and isinstance(d, dict) and "type" in d:
+        v = d.get("value")
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+    if tool == "wait_for" and isinstance(d, dict) and "value" in d:
+        return d["value"]
+    return d
+
+
+async def _replay_json(recipe: dict, params: dict, session_override, tab_override) -> dict:
+    """Replay a recipe that declares "output": "json": the reply is one JSON object
+    {ok, recipe, result, steps}. `result` is the value of the step marked "returns": true. A step
+    that fails stops the run with ok:false, unless it is marked "optional": true. A step
+    {"tool": "sleep", "args": {"seconds": N}} pauses (max 120 s)."""
+    rname = recipe.get("name", "")
+    declared = [p if isinstance(p, str) else (p or {}).get("name") for p in recipe.get("parameters") or []]
+    missing = [p for p in declared if p and p not in params]
+    if missing:
+        return {"ok": False, "recipe": rname, "error": f"missing parameter(s): {', '.join(missing)}"}
+    steps: list[dict] = []
+    result = None
+    actions = recipe.get("actions") or []
+    for i, action in enumerate(actions, 1):
+        tool = action["tool"]
+        args = recording.substitute_params(dict(action.get("args") or {}), params)
+        if tool == "sleep":
+            secs = min(max(float(args.get("seconds", 1) or 0), 0.0), 120.0)
+            await asyncio.sleep(secs)
+            steps.append({"step": i, "tool": tool, "ok": True, "note": f"{secs}s"})
+            continue
+        if session_override:
+            args["session"] = session_override
+        if tab_override and "tab" in (action.get("args") or {}):
+            args["tab"] = tab_override
+        try:
+            text = _first_text(await _execute_tool_action(tool, args))
+            failed = _replay_step_failed(text)
+        except Exception as e:
+            text, failed = f"{type(e).__name__}: {e}", True
+        note = action.get("note") or ""
+        steps.append({"step": i, "tool": tool, "ok": not failed, **({"note": note} if note else {}),
+                      **({"detail": text[:300]} if failed else {})})
+        if failed and not action.get("optional"):
+            return {"ok": False, "recipe": rname, "failed_step": i, "error": text[:1000], "steps": steps}
+        if action.get("returns") and not failed:
+            result = _replay_value(tool, text)
+    return {"ok": True, "recipe": rname, "result": result, "steps": steps}
+
+
 async def _handle_recipe_tool(name: str, arguments: dict):
     """Handle the 4 recipe-management tools. Returns list[TextContent] or None if not a recipe tool."""
     global _replaying
@@ -2999,12 +3358,19 @@ async def _handle_recipe_tool(name: str, arguments: dict):
 
     if name == "list_recipes":
         recipes = recording.list_recipes()
-        if not recipes:
+        thread_recipes = _thread_recipes()
+        if not recipes and not thread_recipes:
             return [TextContent(type="text", text="No recipes saved yet. Use start_recording to capture one.")]
         lines = ["## Saved recipes\n"]
         for r in recipes:
             params = f" · params: {', '.join(r['parameters'])}" if r["parameters"] else ""
             lines.append(f"• **{r['name']}** ({r['actions']} actions{params})\n  Goal: {r['goal'] or '(no goal)'}")
+        if thread_recipes:
+            lines.append("\n## Recipes in installed Threads (replay_recipe name=\"<domain>/<recipe>\")\n")
+            for dom, r in thread_recipes:
+                ps = [p if isinstance(p, str) else (p or {}).get("name", "") for p in r.get("parameters") or []]
+                params = f" · params: {', '.join(ps)}" if ps else ""
+                lines.append(f"• **{dom}/{r['name']}** ({len(r['actions'])} actions{params})\n  Goal: {r.get('goal') or '(no goal)'}")
         return [TextContent(type="text", text="\n".join(lines))]
 
     if name == "worker_jobs":
@@ -3478,19 +3844,31 @@ async def _handle_recipe_tool(name: str, arguments: dict):
 
     if name == "replay_recipe":
         rname = arguments.get("name", "").strip()
-        recipe = recording.load_recipe(rname)
+        recipe, not_found = _find_recipe(rname)
         if not recipe:
-            available = [r["name"] for r in recording.list_recipes()]
-            return [TextContent(type="text", text=f"Recipe '{rname}' not found. Available: {available}")]
+            # JSON with ok:false so `webloom-autopilot run` exits non-zero and a script notices
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": not_found}))]
         params = arguments.get("parameters", {}) or {}
         session_override = arguments.get("session")
         tab_override = arguments.get("tab")
+        if recipe.get("output") == "json":
+            _replaying = True
+            try:
+                out = await _replay_json(recipe, params, session_override, tab_override)
+            finally:
+                _replaying = False
+            return [TextContent(type="text", text=json.dumps(out))]
         log = [f"## Replay: **{rname}** ({len(recipe['actions'])} actions)\n"]
         _replaying = True
         try:
             for i, action in enumerate(recipe["actions"], 1):
                 tool = action["tool"]
                 args = recording.substitute_params(action.get("args", {}), params)
+                if tool == "sleep":
+                    secs = min(max(float(args.get("seconds", 1) or 0), 0.0), 120.0)
+                    await asyncio.sleep(secs)
+                    log.append(f"**[{i}/{len(recipe['actions'])}] sleep** {secs}s")
+                    continue
                 if session_override:
                     args["session"] = session_override
                 if tab_override and "tab" in action.get("args", {}):
@@ -4350,12 +4728,44 @@ async def _execute_tool_action(name: str, arguments: dict):
         return [TextContent(type="text", text="Screenshot failed.")]
 
     if name == "click":
-        desc = arguments["description"]
+        timeout_s = float(arguments.get("timeout_seconds", 5))
+        element_js = arguments.get("element_js")
+        if element_js:
+            # The caller names the exact element with JS: one real CDP click at its center, no
+            # JS-dispatch or vision fallback (a second, synthetic click would toggle a checkbox back).
+            res = await _click_element_js(
+                ws_url, element_js, timeout_s=timeout_s, until_js=arguments.get("until_js"),
+                attempts=int(arguments.get("attempts", 1) or 1),
+                until_timeout_s=float(arguments.get("until_timeout_seconds", 10)))
+            return [TextContent(type="text", text=json.dumps(res))]
+        desc = arguments.get("description") or ""
+        if not desc:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "click needs description or element_js"}))]
+        nth = arguments.get("nth")
         allow_real_cursor = bool(arguments.get("allow_real_cursor", False))
         debug = bool(arguments.get("debug", False))
-        timeout_s = float(arguments.get("timeout_seconds", 5))
         tab_domain = domain_from_url(tab.get("url", ""))
         trace: list[str] = []
+        ambiguity: dict = {}
+
+        def _ambiguous_result():
+            matches = ambiguity.get("matches") or []
+            if ambiguity.get("nth_out_of_range"):
+                head = f"click failed: nth={nth} but only {ambiguity.get('tied') or len(matches)} element(s) tie for best match on '{desc}'."
+            else:
+                head = (f"click failed: ambiguous. {ambiguity.get('tied') or len(matches)} elements match '{desc}' "
+                        f"equally well, so nothing was clicked:")
+            lines = [head]
+            for m in matches:
+                role = f" role={m.get('role')}" if m.get("role") else ""
+                lines.append(f"  {m.get('n')}) <{m.get('tag')}{role}> \"{m.get('text')}\" at ({m.get('x')},{m.get('y')})"
+                             f" {m.get('match')}{'' if m.get('on_screen') else ', off screen'}")
+            lines.append("Pick one with nth=<number> (page order), or pass the full visible text, a CSS selector, "
+                         "or an @eN ref from scan_tab.")
+            text = "\n".join(lines)
+            if debug:
+                text += "\n\n--- TRACE ---\n" + "\n".join(trace)
+            return [TextContent(type="text", text=text)]
 
         def _log(msg):
             trace.append(msg)
@@ -4381,8 +4791,11 @@ async def _execute_tool_action(name: str, arguments: dict):
 
         # ── Stage 2: actionability + CDP click (primary path — Playwright-style).
         async def _try_cdp() -> tuple[bool, str]:
-            probe = await wait_actionable(ws_url, desc, timeout_s=timeout_s)
-            _log(f"actionability probe: {json.dumps({k: probe.get(k) for k in ('found','actionable','visible','inViewport','notDisabled','hitsTarget','animating','tag','id','intercepting')})}")
+            probe = await wait_actionable(ws_url, desc, timeout_s=timeout_s, nth=nth)
+            _log(f"actionability probe: {json.dumps({k: probe.get(k) for k in ('found','actionable','visible','inViewport','notDisabled','hitsTarget','animating','tag','id','intercepting','match','matched_text','match_count')})}")
+            if probe.get("ambiguous") or probe.get("nth_out_of_range"):
+                ambiguity.update(probe)
+                return False, "ambiguous"
             if not probe.get("found"):
                 return False, "element not found"
             if probe.get("intercepting"):
@@ -4400,17 +4813,27 @@ async def _execute_tool_action(name: str, arguments: dict):
             changed = snap_after != snap_before
             _log(f"cdp click @ ({cx:.0f},{cy:.0f}) → verifier changed={changed}")
             if changed:
-                return True, f"clicked (actionability + CDP) '{desc}' at {cx:.0f},{cy:.0f}"
+                picked = ""
+                if (probe.get("match_count") or 0) > 1:
+                    picked = f" (the {probe.get('match')} match \"{probe.get('matched_text')}\", best of {probe.get('match_count')})"
+                return True, f"clicked (actionability + CDP) '{desc}' at {cx:.0f},{cy:.0f}{picked}"
             return False, "CDP click had no visible effect"
 
         # ── Stage 3: JS dispatch fallback (pointerdown+mousedown+click sequence on leaf).
         async def _try_js() -> tuple[bool, str]:
             snap_before = await snapshot_for_verify(ws_url)
-            js = CLICK_JS.replace("DESCRIPTION", json.dumps(desc))
+            js = CLICK_JS.replace("DESCRIPTION", json.dumps(desc) + ", " + json.dumps(nth))
             r = await eval_in_tab(ws_url, js)
             val = r.get("result", {}).get("value", "no result")
             _log(f"js dispatch result: {val[:160]}")
-            if "not found" in val:
+            if val.startswith("ambiguous: "):
+                try:
+                    ambiguity["matches"] = json.loads(val[len("ambiguous: "):])
+                except Exception:
+                    ambiguity["matches"] = []
+                ambiguity["ambiguous"] = True
+                return False, "ambiguous"
+            if val.startswith("not found"):
                 return False, "js dispatch: not found"
             await asyncio.sleep(0.4)
             snap_after = await snapshot_for_verify(ws_url)
@@ -4455,18 +4878,26 @@ async def _execute_tool_action(name: str, arguments: dict):
         # Detect AUI pattern + fire the declarative event. Returns hit:false when
         # not AUI so falls through to CDP/JS for non-Amazon sites.
         async def _try_aui_dispatch() -> tuple[bool, str]:
+            if nth:
+                return False, "not AUI (nth picks among ties; the CDP path handles it)"
             snap_before = await snapshot_for_verify(ws_url)
             aui_js = f"""(function() {{
-                const target_desc = {json.dumps(desc.lower())};
-                // Find any AUI-wrapped element matching the descriptor
+                const target_desc = {json.dumps(" ".join(desc.lower().split()))};
+                // Find the AUI-wrapped element matching the descriptor best: exact text, then
+                // starts-with, then contains, shortest text first (the first one in page order
+                // was often a wrapper holding the real button).
                 const all = document.querySelectorAll('button, [role=button], input[type=submit], a, .a-button-text, .a-button-input');
-                let best = null;
+                let best = null, bestScore = -1;
                 for (const el of all) {{
                     if (el.offsetParent === null) continue;
-                    const t = ((el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase());
-                    if (!t || (t !== target_desc && !t.includes(target_desc))) continue;
+                    const t = ((el.textContent || el.value || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().toLowerCase());
+                    if (!t) continue;
+                    const tier = t === target_desc ? 3 : t.startsWith(target_desc) ? 2 : t.includes(target_desc) ? 1 : 0;
+                    if (!tier) continue;
                     const auiHost = el.closest('.a-declarative[data-action], [data-action][data-component-type]');
-                    if (auiHost) {{ best = {{el, host: auiHost}}; break; }}
+                    if (!auiHost) continue;
+                    const score = tier * 1000000 - Math.min(t.length, 999999);
+                    if (score > bestScore) {{ best = {{el, host: auiHost}}; bestScore = score; }}
                 }}
                 if (!best) return JSON.stringify({{hit: false, reason: 'no AUI ancestor with data-action found'}});
                 const action = best.host.getAttribute('data-action');
@@ -4509,10 +4940,19 @@ async def _execute_tool_action(name: str, arguments: dict):
             _log(f"playbook prefers '{preferred}' (rate {pref['success_rate']:.0%})")
             all_strategies = [s for s in all_strategies if s[0] == preferred] + [s for s in all_strategies if s[0] != preferred]
 
+        # One tie check before any strategy, so no stage (vision above all) acts on a guess.
+        first_probe = await check_actionability(ws_url, desc, nth)
+        if first_probe.get("ambiguous") or first_probe.get("nth_out_of_range"):
+            ambiguity.update(first_probe)
+            return _ambiguous_result()
+
         for strat_name, fn in all_strategies:
             ok, msg = await fn()
             if ok:
                 return _result(strat_name, True, msg)
+            if ambiguity:
+                # Every later stage would face the same tie (vision would just guess): stop here.
+                return _ambiguous_result()
             _log(f"strategy '{strat_name}' failed: {msg}")
             # Record the per-strategy FAILURE so next run's playbook lookup
             # deprioritizes known-bad strategies for this descriptor. Without
@@ -5612,15 +6052,49 @@ async def _execute_tool_action(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Exported {len(cookies)} cookie(s) to {out_path}")]
 
     if name == "import_profile":
-        in_path = Path(arguments["in_path"])
+        raw_path = arguments.get("in_path") or arguments.get("path")
+        if not raw_path:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "import_profile needs in_path"}))]
+        in_path = Path(raw_path)
         if not in_path.is_file():
-            return [TextContent(type="text", text=f"import_profile: file not found: {in_path}")]
-        data = json.loads(in_path.read_text(encoding="utf-8"))
-        cookies = data.get("cookies", [])
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"file not found: {in_path}"}))]
+        try:
+            cookies = _cookies_for_cdp(json.loads(in_path.read_text(encoding="utf-8")))
+        except ValueError as e:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"not a cookie JSON file: {e}"}))]
         if not cookies:
-            return [TextContent(type="text", text="import_profile: no cookies in file.")]
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "no cookies in file"}))]
+        # A CDP error comes back as an empty result, not an exception, and one cookie that breaks a
+        # rule can sink the whole batch. So read the jar back, retry the missing ones one by one, and
+        # report what still is not there (expired cookies end up here too).
+        from urllib.parse import urlparse
         await cdp_browser_send(port, "Storage.setCookies", {"cookies": cookies})
-        return [TextContent(type="text", text=f"Imported {len(cookies)} cookie(s) from {in_path}")]
+
+        async def _missing() -> list[dict]:
+            jar = (await cdp_browser_send(port, "Storage.getCookies")).get("cookies", [])
+            have = {(c.get("name"), (c.get("domain") or "").lstrip(".")) for c in jar}
+            out = []
+            for c in cookies:
+                host = (c.get("domain") or "").lstrip(".") or urlparse(c.get("url", "")).hostname or ""
+                if (c["name"], host) not in have:
+                    out.append(c)
+            return out
+
+        missing = await _missing()
+        if missing:
+            for c in missing:
+                await cdp_browser_send(port, "Storage.setCookies", {"cookies": [c]})
+            missing = await _missing()
+        now = time.time()
+        expired = [c for c in missing if isinstance(c.get("expires"), (int, float)) and 0 < c["expires"] < now]
+        missing = [c for c in missing if c not in expired]
+        res = {"ok": not missing, "imported": len(cookies) - len(missing) - len(expired), "of": len(cookies),
+               "from": str(in_path), "host_prefixed_set_by_url": sum(1 for c in cookies if c["name"].startswith("__Host-"))}
+        if expired:
+            res["expired_skipped"] = len(expired)
+        if missing:
+            res["not_set"] = [f"{c['name']} ({c.get('domain') or c.get('url')})" for c in missing]
+        return [TextContent(type="text", text=json.dumps(res))]
 
     if name == "capture_network_start":
         conn = await _get_conn(ws_url)
@@ -5928,33 +6402,6 @@ async def _execute_tool_action(name: str, arguments: dict):
             return [TextContent(type="text", text=f"key_type (fast): {val}")]
 
 
-        # Map common chars to CDP code + key (for keys that aren't single letters/digits)
-        def _key_code_for(ch: str):
-            specials = {
-                " ": ("Space", " "),
-                "\n": ("Enter", "Enter"),
-                "\t": ("Tab", "Tab"),
-                ".": ("Period", "."),
-                ",": ("Comma", ","),
-                ";": ("Semicolon", ";"),
-                "/": ("Slash", "/"),
-                "\\": ("Backslash", "\\"),
-                "-": ("Minus", "-"),
-                "=": ("Equal", "="),
-                "[": ("BracketLeft", "["),
-                "]": ("BracketRight", "]"),
-                "'": ("Quote", "'"),
-                "`": ("Backquote", "`"),
-            }
-            if ch in specials:
-                return specials[ch]
-            if ch.isalpha():
-                return ("Key" + ch.upper(), ch)
-            if ch.isdigit():
-                return ("Digit" + ch, ch)
-            # Fallback — no specific code, Chrome will still process via text field
-            return ("", ch)
-
         if mode == "insertText":
             # CDP Input.insertText takes a string — one round-trip for the whole
             # buffer when no per-char pacing is requested. Loop only when the
@@ -5978,25 +6425,41 @@ async def _execute_tool_action(name: str, arguments: dict):
             return [TextContent(type="text", text=f"Typed {len(text)} char(s) (insertText mode).")]
 
         # keystrokes mode: per-char keyDown (with text= field triggers keypress+input
-        # in the renderer) → keyUp. Matches what real OS keyboard drivers generate.
-        # This is what Playwright does internally — fires React onChange properly.
+        # in the renderer) → keyUp, with the real key's code from the US layout map
+        # (_keystroke_events). This is what Playwright does internally and fires React
+        # onChange properly. A character with no key on that layout (é, ñ, emoji) goes in
+        # with Input.insertText, as Playwright does too; "\r\n" is one Enter.
+        pressed = inserted = 0
+        pending = ""
+
+        async def _flush_text():
+            nonlocal pending, inserted
+            if pending:
+                await cdp_send(ws_url, "Input.insertText", {"text": pending})
+                inserted += len(pending)
+                pending = ""
+
+        prev = ""
         for ch in text:
-            code, key = _key_code_for(ch)
-            vk = ord(ch.upper()) if ch.isalnum() else ord(ch)
-            base = {
-                "key": key,
-                "code": code,
-                "text": ch,
-                "unmodifiedText": ch,
-                "windowsVirtualKeyCode": vk,
-                "nativeVirtualKeyCode": vk,
-                "location": 0,
-                "modifiers": 1 if ch.isupper() else 0,  # Shift modifier for capitals
-            }
-            await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", **base})
-            await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", **{k: v for k, v in base.items() if k != "text" and k != "unmodifiedText"}})
+            if ch == "\n" and prev == "\r":
+                prev = ch
+                continue
+            prev = ch
+            events = _keystroke_events(ch)
+            if events is None:
+                pending += ch
+                if delay:
+                    await _flush_text()
+                    await asyncio.sleep(delay)
+                continue
+            await _flush_text()
+            down, up = events
+            await cdp_send(ws_url, "Input.dispatchKeyEvent", down)
+            await cdp_send(ws_url, "Input.dispatchKeyEvent", up)
+            pressed += 1
             if delay:
                 await asyncio.sleep(delay)
+        await _flush_text()
         try:
             tab_url_r = await eval_in_tab(ws_url, "location.href")
             tab_dom = domain_from_url(tab_url_r.get("result", {}).get("value", ""))
@@ -6007,7 +6470,8 @@ async def _execute_tool_action(name: str, arguments: dict):
                                  kind="key_type", selector_pattern=f"#{active_id}" if active_id else None)
         except Exception:
             pass
-        return [TextContent(type="text", text=f"Typed {len(text)} char(s) (keystrokes mode — keyDown+keyUp per char with full metadata).")]
+        extra = f", {inserted} char(s) with no US keyboard key inserted as text" if inserted else ""
+        return [TextContent(type="text", text=f"Typed {len(text)} char(s) (keystrokes mode: {pressed} real key press(es){extra}).")]
 
     if name in ("react_inspect_store", "redux_dispatch"):
         from_sel = arguments.get("from_selector", "")
@@ -6751,20 +7215,16 @@ async def _execute_tool_action(name: str, arguments: dict):
         def _char_to_keystroke(ch: str) -> tuple[dict, dict]:
             """Map any char → (keyDown, keyUp) CDP payloads. The `text` field
             on keyDown is what makes Chrome produce the actual character —
-            without it, the key fires but no text is entered."""
-            if ch == " ":
-                key, code, vk = " ", "Space", 32
-            elif ch == "\n":
-                key, code, vk = "Enter", "Enter", 13
-            elif ch == "\t":
-                key, code, vk = "Tab", "Tab", 9
-            elif ch.isalpha():
-                key, code, vk = ch, "Key" + ch.upper(), ord(ch.upper())
-            elif ch.isdigit():
-                key, code, vk = ch, "Digit" + ch, ord(ch)
-            else:
-                # Punctuation/symbols — pass char through, use ASCII code for vk
-                key, code, vk = ch, "Unidentified", ord(ch) if len(ch) == 1 else 0
+            without it, the key fires but no text is entered. Key codes come from
+            the US layout map: the ASCII value used before turned "." into Delete
+            and "'" into Right arrow, so those characters were dropped. A char with
+            no key (accents, emoji, a literal tab) is a keyDown carrying the text
+            with key code 0, which has no editing command attached."""
+            if ch != "\t":
+                events = _keystroke_events(ch)
+                if events is not None:
+                    return events
+            key, code, vk = ch, "", 0
             down = {
                 "type": "keyDown",
                 "key": key, "code": code,
@@ -9435,8 +9895,20 @@ async def _execute_tool_action(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Closed: {tab.get('title', tab_id)[:80]}")]
 
     if name == "wait_for":
-        selector = arguments["selector"]
         timeout_ms = arguments.get("timeout_ms", 10000)
+        js_cond = arguments.get("js")
+        if js_cond:
+            started = asyncio.get_event_loop().time()
+            held, value, err = await _wait_js(ws_url, js_cond, timeout_ms / 1000)
+            out = {"ok": held, "elapsed_s": round(asyncio.get_event_loop().time() - started, 2)}
+            if held:
+                out["value"] = value
+            else:
+                out["error"] = f"timeout after {timeout_ms}ms" + (f" (last error: {err})" if err else "")
+            return [TextContent(type="text", text=json.dumps(out))]
+        selector = arguments.get("selector")
+        if not selector:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "wait_for needs selector or js"}))]
         deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
         started = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() < deadline:
@@ -10798,20 +11270,25 @@ def _cli_autopilot(args: list[str]) -> int:
                     print(f"ERROR: --params is not valid JSON: {e}", file=sys.stderr)
                     return 2
                 # Ensure the Thread is available to the engine before replay.
-                # Copy it to ~/.webloom/threads/ if it isn't already there.
+                # Copy it to the threads dir (WEBLOOM_THREADS) if it isn't already there.
+                recipe_name = parsed.recipe
                 try:
                     thread_json = json.loads(thread_path.read_text(encoding="utf-8"))
                     domain = thread_json.get("domain", "")
                     if domain:
-                        threads_dir = _P.home() / ".webloom" / "threads"
-                        threads_dir.mkdir(parents=True, exist_ok=True)
-                        dest = threads_dir / f"{domain}.thread.json"
+                        THREADS_DIR.mkdir(parents=True, exist_ok=True)
+                        dest = THREADS_DIR / f"{domain}.thread.json"
                         if not dest.exists() or dest.stat().st_mtime < thread_path.stat().st_mtime:
-                            dest.write_text(thread_path.read_text(encoding="utf-8"))
+                            dest.write_text(thread_path.read_text(encoding="utf-8"), encoding="utf-8")
+                        # the Thread's own recipe, by its full name, so a same-named recipe elsewhere cannot win
+                        if "/" not in recipe_name and any(
+                                r.get("name") == recipe_name and _thread_recipe_is_executable(r)
+                                for r in thread_json.get("session_recipes") or []):
+                            recipe_name = f"{domain}/{recipe_name}"
                 except Exception:
                     pass
                 result = await call_tool("replay_recipe", {
-                    "name": parsed.recipe,
+                    "name": recipe_name,
                     "parameters": params,
                     "session": parsed.session,
                 })
