@@ -165,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.18"
+ENGINE_VERSION = "0.3.19"
 
 
 def _installed_version() -> str:
@@ -2537,7 +2537,7 @@ async def list_tools():
             "question": {"type": "string", "description": "Plain-English question. Examples: 'where is the post button?', 'is there a CAPTCHA visible?', 'what does the error message say?'. If asking for a click target, phrase as 'click coords for X' so the model returns coordinates."},
             "include_coords": {"type": "boolean", "default": True, "description": "Ask the model to return {x, y} coordinates when the question is locating a UI element."}
         }, "required": ["session", "question"]}),
-        Tool(name="click_at_coords", description="Real CDP click at absolute (x, y) viewport coordinates. Pair with vision_check when you have coords but no selector. Lower-level than click().", inputSchema={"type": "object", "properties": {
+        Tool(name="click_at_coords", description="Real CDP click at absolute (x, y) viewport coordinates. Pair with vision_check when you have coords but no selector. Lower-level than click(). A point outside the window is refused (ok: false) instead of clicking nothing; the reply names the element that was under the click (hit).", inputSchema={"type": "object", "properties": {
             "session": {"type": "string"}, "tab": {"type": "string"},
             "x": {"type": "number"}, "y": {"type": "number"},
             "double": {"type": "boolean", "default": False}
@@ -7444,6 +7444,28 @@ async def _execute_tool_action(name: str, arguments: dict):
         x = float(arguments["x"])
         y = float(arguments["y"])
         double = bool(arguments.get("double", False))
+        # A click outside the window does not fail, it lands on nothing and still reads as done: a
+        # narrow browser put a like button below the fold and 70% of a lane's likes vanished without
+        # a single error. So the point is checked against the window first, and the reply says what
+        # was under it.
+        vw = vh = 0
+        hit = ""
+        try:
+            probe = await eval_in_tab(ws_url, (
+                "(function(x,y){var e=document.elementFromPoint(x,y);var d='';"
+                "if(e){var l=e.closest('[aria-label]');d=e.tagName.toLowerCase()"
+                "+(l?' ['+l.getAttribute('aria-label').slice(0,60)+']':'');}"
+                "return JSON.stringify([innerWidth,innerHeight,d]);})(%s,%s)" % (json.dumps(x), json.dumps(y))))
+            vw, vh, hit = json.loads(probe.get("result", {}).get("value") or "[0,0,\"\"]")
+        except Exception:
+            pass
+        if vw and vh and not (0 <= x < vw and 0 <= y < vh):
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False, "x": x, "y": y, "viewport": [vw, vh],
+                "error": (f"({x:.0f}, {y:.0f}) is outside the window ({vw}x{vh}), a click there lands on nothing. "
+                          "Bring the element into view (element.scrollIntoView({block:'center'})) and read its "
+                          "position again, or start the browser with a larger --window-size."),
+            }))]
         for ev_type in ("mousePressed", "mouseReleased"):
             await cdp_send(ws_url, "Input.dispatchMouseEvent", {
                 "type": ev_type, "x": x, "y": y, "button": "left", "buttons": 1,
@@ -7461,7 +7483,8 @@ async def _execute_tool_action(name: str, arguments: dict):
                 _playbook_record(dom, f"click_at_coords:({x:.0f},{y:.0f})", "cdp_coords", True, kind="click")
         except Exception:
             pass
-        return [TextContent(type="text", text=json.dumps({"ok": True, "x": x, "y": y, "double": double}))]
+        return [TextContent(type="text", text=json.dumps({"ok": True, "x": x, "y": y, "double": double,
+                                                          "viewport": [vw, vh], "hit": hit}))]
 
     # ── #5 STEALTH PATCHES ──────────────────────────────────────────────
     if name == "enable_stealth":
