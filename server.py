@@ -166,6 +166,19 @@ TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
 ENGINE_VERSION = "0.3.18"
+
+
+def _installed_version() -> str:
+    """The ENGINE_VERSION in server.py on disk now. A session started before an update keeps running the
+    old code, so chrome_status compares the two and asks for a reconnect (2026-10-16: a session still on
+    the pre-0.3.18 locator clicked the wrong Accounts Center row, a bug 0.3.18 had already fixed)."""
+    try:
+        m = re.search(r'^ENGINE_VERSION = "([^"]+)"', Path(__file__).read_text(encoding="utf-8"), re.M)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
 _ANON_ID_FILE = Path.home() / ".webloom" / "anon_id"
 _CONFIG_FILE = Path.home() / ".webloom" / "config.json"
 
@@ -4305,6 +4318,10 @@ async def _execute_tool_action(name: str, arguments: dict):
         live_sessions = []
         offline_sessions = []
         lines = ["## Chrome MCP Status\n"]
+        installed = _installed_version()
+        if installed and installed != ENGINE_VERSION:
+            lines.append(f"⚠️ **This session is running WebLoom {ENGINE_VERSION}, but {installed} is installed.** "
+                         "Reconnect WebLoom (/mcp, pick webloom, Reconnect) to load the fixes before clicking.\n")
         lines.append("**Configured sessions:**")
         for sname, cfg in sessions.items():
             port_n = cfg["port"]
