@@ -165,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.19"
+ENGINE_VERSION = "0.3.20"
 
 
 def _installed_version() -> str:
@@ -3936,26 +3936,54 @@ _ADMIN_EMAILS: set[str] = {"dev@webloom.run"} | {
 }
 
 
+PRO_TRIAL_DAYS = 3
+
+
+def _trial_state() -> tuple[bool, float]:
+    """Every install gets Pro for PRO_TRIAL_DAYS from the first time a Pro tool is
+    asked for. Returns (still_in_trial, days_left). The start date lives in
+    ~/.webloom/trial.json; `"dev": true` there marks a maintainer machine."""
+    from pathlib import Path as _P
+    path = _P.home() / ".webloom" / "trial.json"
+    data: dict = {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    if data.get("dev") is True:
+        return True, float("inf")
+    started = data.get("started_at")
+    if not isinstance(started, (int, float)):
+        started = time.time()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"started_at": started}), encoding="utf-8")
+        except Exception:
+            pass
+    left = PRO_TRIAL_DAYS - (time.time() - started) / 86400
+    return left > 0, max(0.0, left)
+
+
 def _check_is_pro() -> tuple[bool, str]:
     """
-    Returns (is_pro, reason). Admin emails auto-pass. Local dev (no auth.json)
-    auto-passes too so the dev loop isn't crippled. A paired non-admin engine
-    is treated as free-tier — the real Pro-sub verification against
-    webloom.run/api/v1/pro-check lands with v0.4.0 public release.
+    Returns (is_pro, reason). Admin emails auto-pass, then the free Pro trial.
+    After the trial a non-admin engine is free tier. The real Pro-sub
+    verification against webloom.run/api/v1/pro-check lands with v0.4.0.
     """
     try:
         from pathlib import Path as _P
         _auth_path = _P.home() / ".webloom" / "auth.json"
-        if not _auth_path.exists():
-            return True, "local_dev"
-        _auth = json.loads(_auth_path.read_text(encoding="utf-8"))
-        _email = (_auth.get("user_email") or "").lower().strip()
-        if _email in _ADMIN_EMAILS:
-            return True, "admin"
-        # Non-admin paired engine = free tier
-        return False, "free_tier"
+        if _auth_path.exists():
+            _auth = json.loads(_auth_path.read_text(encoding="utf-8"))
+            _email = (_auth.get("user_email") or "").lower().strip()
+            if _email in _ADMIN_EMAILS:
+                return True, "admin"
+        in_trial, _left = _trial_state()
+        if in_trial:
+            return True, "trial"
+        return False, "trial_ended"
     except Exception:
-        return True, "local_dev_fallback"
+        return True, "check_failed"
 
 
 def _pro_denied_payload(tool_name: str, reason: str) -> str:
@@ -3965,6 +3993,7 @@ def _pro_denied_payload(tool_name: str, reason: str) -> str:
         "tool": tool_name,
         "error": (
             f"'{tool_name}' is a WebLoom Pro tool. "
+            f"The {PRO_TRIAL_DAYS}-day free Pro trial on this machine has ended. "
             f"Free tier = execution primitives + install & run Threads. "
             f"Pro tier ($19/mo) adds recording, playbook inspection, network capture, "
             f"self-discovery helpers, autopilot, and the advanced engine tools. "
@@ -10104,7 +10133,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             return [TextContent(type="text", text=json.dumps({
                 "ok": False,
                 "pro_required": True,
-                "error": "This is a WebLoom Pro tool. Subscribe at https://webloom.run/pro ($14.97/mo) to unlock.",
+                "error": "This is a WebLoom Pro tool. Subscribe at https://webloom.run/pro ($19/mo) to unlock.",
                 "upgrade_url": "https://webloom.run/pro",
                 "reason": _pro_reason,
             }, indent=2))]
