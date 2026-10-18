@@ -4574,9 +4574,22 @@ async def _execute_tool_action(name: str, arguments: dict):
             except Exception:
                 return 0, None
 
-        about_status, about = _fetch_json(f"https://www.reddit.com/user/{username}/about.json")
-        comments_status, comments = _fetch_json(f"https://www.reddit.com/user/{username}/comments.json?limit=25")
-        submitted_status, submitted = _fetch_json(f"https://www.reddit.com/user/{username}/submitted.json?limit=25")
+        urls = [f"https://www.reddit.com/user/{username}/about.json",
+                f"https://www.reddit.com/user/{username}/comments.json?limit=25",
+                f"https://www.reddit.com/user/{username}/submitted.json?limit=25"]
+        (about_status, about), (comments_status, comments), (submitted_status, submitted) = [_fetch_json(u) for u in urls]
+        # Since 2026-10 Reddit answers every anonymous automated request with 403 "blocked by network security", and
+        # an automated logged-out browser gets a "Prove your humanity" captcha (u/spez came back "suspended"). A 403
+        # or no answer therefore means "this checker was blocked", never "the account is suspended". The captcha is
+        # not worked around: the honest answer is UNKNOWN, with the check a person can do in ten seconds.
+        if about_status in (403, 0):
+            return [TextContent(type="text", text=(
+                f"## Reddit check: u/{username}\n**Verdict:** ❔ UNKNOWN (Reddit blocked the automated check)\n\n"
+                "Reddit now blocks anonymous automated requests and asks logged-out automated browsers for a captcha, "
+                "so visibility cannot be read from here. Check by hand: on a phone, in a private window (logged out), "
+                f"open https://www.reddit.com/user/{username}/ . If the profile says the page or user is not found, or "
+                "your recent comments are missing, the account is shadowbanned or filtered. Then open one of your "
+                "comment links the same way: a comment you can see logged in but not logged out was removed by a filter."))]
 
         signals: list[str] = []
         shadowbanned = False
@@ -4592,10 +4605,6 @@ async def _execute_tool_action(name: str, arguments: dict):
             signals.append("about.json returned 404 (profile not visible to anonymous)")
             shadowbanned = True
 
-        # 403 on about.json typically means suspended (different from shadowban)
-        if about_status == 403:
-            signals.append("about.json returned 403 (account suspended)")
-            suspended = True
 
         if about and about_status == 200:
             data = about.get("data", {}) or {}
