@@ -8497,6 +8497,13 @@ async def _execute_tool_action(name: str, arguments: dict):
         verify = bool(arguments.get("verify_landed", True))
         trace: list[str] = []
 
+        # 0. A Chrome window covered by other windows marks the tab hidden, and Reddit then never builds the post page
+        #    (2026-10-18: 123 nodes, no comment box). Focus emulation plus a reload builds it without raising the window.
+        try:
+            await cdp_send(ws_url, "Emulation.setFocusEmulationEnabled", {"enabled": True})
+        except Exception:
+            pass
+
         # 1. Navigate to the post if not already there
         cur_url_r = await eval_in_tab(ws_url, "location.href")
         cur_url = cur_url_r.get("result", {}).get("value", "")
@@ -8516,6 +8523,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         # 2. Click the comment composer placeholder to mount Lexical
         #    Reddit's selectors have churned; we try several known ones in order.
         placeholder_selectors = [
+            'shreddit-composer [contenteditable="true"]',
             'shreddit-async-loader[bundlename="comment_composer"] [contenteditable]',
             'faceplate-tracker[noun="comment_composer"] [contenteditable]',
             'div[role="textbox"][aria-label*="comment" i]',
@@ -8530,9 +8538,32 @@ async def _execute_tool_action(name: str, arguments: dict):
             'div[role="textbox"]',
             'faceplate-tracker[noun="comment_composer"]',
         ]
-        # First: try to click a placeholder/wrapper that mounts the composer
+        # First: a real (isTrusted) click on the visible "Join the conversation" box. A JS el.click() on the
+        # loader does not open the composer (2026-10-18): the text went into a hidden editor nobody submits.
         clicked = False
-        for sel in click_targets:
+        sess_tab = {k: arguments[k] for k in ("session", "tab") if arguments.get(k)}
+        ready_js = "!![...document.querySelectorAll('faceplate-textarea-input')].find(e => e.getBoundingClientRect().height > 0) || !!document.querySelector('shreddit-composer [contenteditable=\"true\"]')"
+        for attempt in range(2):
+            for _ in range(20):
+                r = await eval_in_tab(ws_url, ready_js)
+                if r.get("result", {}).get("value"):
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                if attempt == 0:
+                    trace.append("post page not built (tab hidden?): reloading")
+                    await cdp_send(ws_url, "Page.reload", {})
+                    await asyncio.sleep(2.0)
+                    continue
+            break
+        opened = await call_tool("click", {**sess_tab,
+            "element_js": "[...document.querySelectorAll('faceplate-textarea-input')].find(e => e.getBoundingClientRect().height > 0)",
+            "until_js": "(() => { const e = document.querySelector('shreddit-composer [contenteditable=\"true\"]'); return !!e && e.offsetHeight > 0; })()",
+            "attempts": 2, "timeout_seconds": 8})
+        if opened and '"until": true' in opened[0].text:
+            clicked = True
+            trace.append("opened the composer with a real click on the visible box")
+        for sel in ([] if clicked else click_targets):
             r = await eval_in_tab(ws_url, f"!!document.querySelector({json.dumps(sel)})")
             if r.get("result", {}).get("value"):
                 await eval_in_tab(ws_url, f"(function(){{const el=document.querySelector({json.dumps(sel)}); el && el.scrollIntoView({{block:'center'}}); el && el.click(); return true;}})()")
@@ -8638,47 +8669,63 @@ async def _execute_tool_action(name: str, arguments: dict):
             b.click();
             return JSON.stringify({ok: true, found_in: r.found_in, matched_text: r.matched_text});
         })()"""
-        r = await eval_in_tab(ws_url, submit_js)
-        sub_val = r.get("result", {}).get("value", "{}")
-        trace.append(f"submit: {sub_val}")
+        # Who is signed in, and their newest comment before submitting: "landed" means a NEW comment of theirs on
+        # this post with this text, read from Reddit's own listing. Searching the page for the text found it in the
+        # composer itself and reported success for a comment that was never sent (2026-10-18).
+        me_js = """(async () => { try { const me = await (await fetch('/api/me.json', {credentials: 'include'})).json();
+            const u = me.data && me.data.name; if (!u) return JSON.stringify({});
+            const j = await (await fetch('/user/' + u + '/comments.json?limit=1', {credentials: 'include', cache: 'no-store'})).json();
+            const c = (j.data.children[0] || {}).data || {}; return JSON.stringify({user: u, last: c.name || null}); }
+            catch (e) { return JSON.stringify({error: String(e)}); } })()"""
+        r = await cdp_send(ws_url, "Runtime.evaluate", {"expression": me_js, "awaitPromise": True, "returnByValue": True})
         try:
-            sub_data = json.loads(sub_val)
-            if not sub_data.get("ok"):
-                return [TextContent(type="text", text=(
-                    f"reddit_submit_comment: submit-button discovery failed.\n\n{sub_data.get('error','?')}\n\nTrace:\n" + "\n".join(trace)
-                ))]
+            me = json.loads(r.get("result", {}).get("value", "{}"))
         except Exception:
-            pass
+            me = {}
+        user, before = me.get("user"), me.get("last")
+        if not user:
+            return [TextContent(type="text", text="reddit_submit_comment: could not read the signed-in Reddit user, nothing was submitted.\n\nTrace:\n" + "\n".join(trace))]
 
-        # 6. Wait for the post to register + optionally verify
-        await asyncio.sleep(2.5)
-        landed = True  # assume success if we reached submit without errors
+        # A real (isTrusted) click on the composer's own submit button; a JS click() on it does nothing.
+        sent = await call_tool("click", {**sess_tab,
+            "element_js": "document.querySelector('shreddit-composer button[slot=\"submit-button\"]')",
+            "until_js": "[...document.querySelectorAll('shreddit-comment')].some(e => (e.getAttribute('author')||'').toLowerCase() === "
+                        + json.dumps(user.lower()) + ")",
+            "attempts": 1, "until_timeout_seconds": 15})
+        sent_text = sent[0].text if sent else ""
+        trace.append(f"submit (real click): {sent_text[-160:]}")
+        if '"ok": true' not in sent_text:
+            r = await eval_in_tab(ws_url, submit_js)
+            trace.append(f"submit (fallback): {r.get('result', {}).get('value', '{}')}")
+
+        landed, permalink = False, None
         if verify:
-            check_js = f"""(function() {{
-                const target = {json.dumps(markdown[:60])};
-                const matches = Array.from(document.querySelectorAll('p, div')).filter(el =>
-                    el.textContent && el.textContent.includes(target)
-                );
-                return JSON.stringify({{found: matches.length, sample: matches[0] ? matches[0].textContent.slice(0, 120) : null}});
-            }})()"""
-            r = await eval_in_tab(ws_url, check_js)
-            ver = r.get("result", {}).get("value", "{}")
-            trace.append(f"verify: {ver}")
+            post_id = post_url.split("/comments/")[1].split("/")[0] if "/comments/" in post_url else ""
+            check_js = ("(async () => { for (let i = 0; i < 6; i++) {"
+                        f" const j = await (await fetch('/user/{user}/comments.json?limit=3', {{credentials: 'include', cache: 'no-store'}})).json();"
+                        f" const c = (j.data.children || []).map(x => x.data).find(d => d.name !== {json.dumps(before)}"
+                        f" && d.link_id === 't3_{post_id}' && (d.body || '').startsWith({json.dumps(markdown[:40])}));"
+                        " if (c) return JSON.stringify({ok: true, permalink: 'https://www.reddit.com' + c.permalink});"
+                        " await new Promise(r => setTimeout(r, 2000)); }"
+                        " return JSON.stringify({ok: false}); })()")
+            r = await cdp_send(ws_url, "Runtime.evaluate", {"expression": check_js, "awaitPromise": True, "returnByValue": True})
             try:
-                ver_data = json.loads(ver)
-                landed = int(ver_data.get("found", 0)) > 0
+                ver = json.loads(r.get("result", {}).get("value", "{}"))
             except Exception:
-                landed = False
+                ver = {}
+            landed, permalink = bool(ver.get("ok")), ver.get("permalink")
+            trace.append(f"verify (u/{user} comment listing): " + (f"found {permalink}" if landed else "NOT found"))
 
-        # Record into playbook — submitting a Reddit comment is a textbook
-        # proven_action for the reddit.com Thread.
         try:
             d = domain_from_url(post_url) or "reddit.com"
             _playbook_record(d, "reddit_submit_comment", "composite", landed, kind="submit_comment", selector_pattern=post_url)
         except Exception:
             pass
 
-        return [TextContent(type="text", text="reddit_submit_comment complete.\n\nTrace:\n" + "\n".join(trace))]
+        if verify and not landed:
+            return [TextContent(type="text", text="reddit_submit_comment: NOT posted. The comment does not appear in the account's "
+                                "comment listing; check the composer on the page before retrying, it may still hold the text.\n\nTrace:\n" + "\n".join(trace))]
+        return [TextContent(type="text", text=f"reddit_submit_comment: posted {permalink or ''}\n\nTrace:\n" + "\n".join(trace))]
 
     if name == "touch_tap":
         sel = arguments["selector"]
