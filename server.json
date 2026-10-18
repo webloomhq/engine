@@ -14,7 +14,7 @@
       "registryType": "mcpb",
       "identifier": "https://github.com/webloomhq/engine/releases/download/v0.3.21/webloom-0.3.21.mcpb",
       "version": "0.3.21",
-      "fileSha256": "550b3819d14326fddf0c85eb5c04e6ca965da6c6017282976c534f86166ba4dd",
+      "fileSha256": "c740de13b810522b95e8d65cef1e29ace73a53d36fbb51c4d5c445d8beeacce2",
       "transport": {
         "type": "stdio"
       }
