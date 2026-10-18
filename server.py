@@ -3265,6 +3265,22 @@ def _find_recipe(name: str) -> tuple[dict | None, str]:
     return None, f"Recipe '{name}' not found. Available: {available}"
 
 
+def _is_thread_recipe(name: str) -> bool:
+    """True when `name` resolves to a recipe from an installed Thread, not a local recording.
+    Same lookup order as _find_recipe: a bare name that matches a local recording is local."""
+    try:
+        recipe, _ = _find_recipe(name)
+        if not recipe:
+            return False
+        name = (name or "").strip()
+        domain = name.rpartition("/")[0]
+        if not domain and re.fullmatch(r"[A-Za-z0-9_.\-]+", name) and recording.load_recipe(name):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _first_text(result) -> str:
     for item in result or []:
         if hasattr(item, "text"):
@@ -4008,7 +4024,9 @@ def _pro_denied_payload(tool_name: str, reason: str) -> str:
 async def call_tool(name: str, arguments: dict):
     # Learning-tools Pro gate — must fire BEFORE _handle_recipe_tool so the
     # recording/playbook subcommands can't sneak through.
-    if name in _LEARNING_TOOLS:
+    # Replaying a recipe that ships inside an installed Thread is part of using the Thread the
+    # user owns, so it stays free. Recording and replaying your own recordings is Pro.
+    if name in _LEARNING_TOOLS and not (name == "replay_recipe" and _is_thread_recipe((arguments or {}).get("name", ""))):
         is_pro, reason = _check_is_pro()
         if not is_pro:
             return [TextContent(type="text", text=_pro_denied_payload(name, reason))]
