@@ -8725,6 +8725,32 @@ async def _execute_tool_action(name: str, arguments: dict):
         if verify and not landed:
             return [TextContent(type="text", text="reddit_submit_comment: NOT posted. The comment does not appear in the account's "
                                 "comment listing; check the composer on the page before retrying, it may still hold the text.\n\nTrace:\n" + "\n".join(trace))]
+
+        # A subreddit's AutoModerator can remove the comment seconds later ("your account is too new") and Reddit keeps
+        # showing it to its author as if nothing happened (2026-10-18: both first comments of a new account, invisible to
+        # everyone else). AutoModerator says so in a reply under the comment: read it for ~30 s.
+        removed_note = ""
+        if landed and permalink:
+            mod_js = ("(async () => { for (let i = 0; i < 6; i++) { await new Promise(r => setTimeout(r, 5000));"
+                      f" const j = await (await fetch({json.dumps(permalink.replace('https://www.reddit.com', '').rstrip('/') + '.json')},"
+                      " {credentials: 'include', cache: 'no-store'})).json();"
+                      " const n = j[1] && j[1].data.children[0]; const reps = n && n.data.replies && n.data.replies.data ? n.data.replies.data.children : [];"
+                      " const am = reps.map(r => r.data).find(d => d.author === 'AutoModerator' && /remov|filter|approv|too new|karma/i.test(d.body || ''));"
+                      " if (am) return JSON.stringify({removed: true, why: (am.body || '').replace(/\\s+/g, ' ').slice(0, 300)}); }"
+                      " return JSON.stringify({removed: false}); })()")
+            r = await cdp_send(ws_url, "Runtime.evaluate", {"expression": mod_js, "awaitPromise": True, "returnByValue": True})
+            try:
+                am = json.loads(r.get("result", {}).get("value", "{}"))
+            except Exception:
+                am = {}
+            if am.get("removed"):
+                removed_note = am.get("why", "")
+                trace.append(f"AutoModerator removed it: {removed_note}")
+            else:
+                trace.append("no AutoModerator removal in the first 30 s")
+        if removed_note:
+            return [TextContent(type="text", text=f"reddit_submit_comment: POSTED BUT REMOVED by AutoModerator (only you can see it): "
+                                f"{removed_note}\n{permalink}\n\nTrace:\n" + "\n".join(trace))]
         return [TextContent(type="text", text=f"reddit_submit_comment: posted {permalink or ''}\n\nTrace:\n" + "\n".join(trace))]
 
     if name == "touch_tap":
