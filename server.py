@@ -430,9 +430,31 @@ def _port_live(port: int) -> bool:
         return False
 
 
+_HEADLESS_PORTS: set[int] = set()  # ports this server launched headless with a plain user agent
+
+
+def _plain_chrome_ua() -> str:
+    """The user agent a normal windowed Chrome of the installed version sends, or "" if the version is unknown.
+    Windows installs keep a folder named after the version next to chrome.exe."""
+    try:
+        vers = [p.name for p in Path(CHROME_EXE).parent.iterdir() if p.is_dir() and re.match(r"^\d+\.\d+", p.name)]
+    except Exception:
+        return ""
+    if not vers:
+        return ""
+    major = max(vers, key=lambda v: [int(x) for x in re.findall(r"\d+", v)]).split(".")[0]
+    plat = {"nt": "Windows NT 10.0; Win64; x64"}.get(os.name, "X11; Linux x86_64")
+    if _sys.platform == "darwin":
+        plat = "Macintosh; Intel Mac OS X 10_15_7"
+    return f"Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+
+
 def _is_headless(port: int) -> bool:
     """True when the Chrome on this port runs without a screen (--headless): its /json/version user agent says
-    HeadlessChrome. Asked every time, never cached by port, because the same port can host a windowed Chrome later."""
+    HeadlessChrome, or this server launched it headless under a plain user agent. Asked every time for the user
+    agent, because the same port can host a windowed Chrome later."""
+    if port in _HEADLESS_PORTS and _port_live(port):
+        return True
     try:
         with urllib.request.urlopen(f"http://{CDP_HOST}:{port}/json/version", timeout=3) as r:
             v = json.loads(r.read())
@@ -2439,7 +2461,8 @@ async def list_tools():
         ), inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the <input type=file> element (used by Strategy B). Required even when using Strategy A — pass any sentinel like 'input[type=file]' as a fallback."}, "files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths to local files"}, "click_first_selector": {"type": "string", "description": "Strategy A: CSS selector for the VISIBLE upload button that opens a native file picker. Clicks it and intercepts the file-chooser dialog. NOTE: on Windows + Chrome, file-chooser interception can drop the CDP websocket — if it does, fall back to drop_target_selector (Strategy C)."}, "drop_target_selector": {"type": "string", "description": "Strategy C: CSS selector for a drag-and-drop zone. Reads file bytes server-side, injects them as real File objects in JS, and fires native dragenter/dragover/drop events on the target. Works against React-controlled inputs that ignore programmatic FileList changes. Max 25MB combined."}, "inject_input_selector": {"type": "string", "description": "Strategy D: CSS selector for the hidden <input type=file>. Reads file bytes, constructs File objects in PAGE-JS context, assigns via DataTransfer.files to input.files, then fires input + change events. Solves label-wrapped-hidden-input designs (D2D, KDP) where file picker intercept drops CDP on Windows AND no drop listener exists. Max 25MB combined."}, "react_input_selector": {"type": "string", "description": "Strategy E: CSS selector for a React-controlled file input, possibly inside shadow DOM. Walks shadow roots recursively to find the input, builds File objects in page JS, assigns via the native HTMLInputElement.files prototype setter (which React's controlled-input observer DOES notice — unlike B/D's synthetic path), fires input+change, AND invokes the input's onChange via fiber walk for handler-gated implementations. Use for LinkedIn composer + similar Lit/shadow-DOM React patterns. Max 25MB combined."}, "chunked_input_selector": {"type": "string", "description": "Strategy F: CSS selector for the <input type=file> (light or shadow DOM). No size cap: files are streamed into the page in 2MB pieces, verified against disk size, then handed to the input's React onChange exactly once (or set via the native setter + one input/change event when there is no React handler). Use for files over 25MB and for React inputs that clear their value after reading."}}, "required": ["session", "selector", "files"]}),
         Tool(name="new_tab", description="Open a new tab in a session (uses Target.createTarget, works in all Chrome versions)", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "url": {"type": "string", "default": "about:blank"}, "background": {"type": "boolean", "description": "Open without raising the window (default: true in autopilot runs, false in chats). In a headless Chrome every new tab gets its own window instead, so it is never a hidden back tab (hidden pages never load audio or video)."}}, "required": ["session"]}),
         Tool(name="wait_for", description="Wait for an element (CSS selector) or for a JS condition to hold in a tab (polls every 500ms). With js: returns JSON {ok, elapsed_s, value}, where value is what the expression returned (a DOM node counts as true).", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string"}, "js": {"type": "string", "description": "A JS expression; the wait ends when it is truthy IN THE PAGE (a returned element counts, a throw counts as not yet). Use it instead of selector for conditions like \"/Joined/.test(document.body.innerText)\"."}, "timeout_ms": {"type": "integer", "default": 10000}}, "required": ["session"]}),
-        Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first: it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}, "background": {"type": "boolean", "default": False, "description": "Windows: open the window minimized without taking the focus, and keep the session's login confirmation (an unattended relaunch of the same profile). For scheduled jobs, not for a person who wants to see the window."}}, "required": []}),
+        Tool(name="close_session", description="Close the Chrome of a configured session the way a person closes it (it saves the profile and its logins first). Use after a headless or background read so nothing stays running.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from sessions.json"}}, "required": ["session"]}),
+        Tool(name="launch_session", description="Connect to or launch a Chrome debug session. ALWAYS call with no arguments first: it will list available sessions and pause. You MUST show that list to the user and wait for them to pick a session before calling again. Only set confirmed_by_user=true after the user has explicitly told you which session to use. Never guess or auto-select.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name from config: main, farm, signups, email. Leave empty to list available sessions."}, "url": {"type": "string", "description": "Optional URL to open if launching new"}, "force_new": {"type": "boolean", "default": False, "description": "Set true to launch a new Chrome window even if one is already running"}, "confirmed_by_user": {"type": "boolean", "default": False, "description": "Set true ONLY after you have shown the session list to the user and they have explicitly chosen a session. Never set this without user confirmation."}, "background": {"type": "boolean", "default": False, "description": "Windows: open the window minimized without taking the focus, and keep the session's login confirmation (an unattended relaunch of the same profile). For scheduled jobs, not for a person who wants to see the window."}, "headless": {"type": "boolean", "default": False, "description": "No window at all, with the user agent of a normal Chrome (not 'HeadlessChrome'). Uses the session's saved logins, like background. For reading a logged-in account without showing anything on the person's screen; close it with close_session when done."}}, "required": []}),
         Tool(name="scan_tab", description="Page intelligence scan. Modes: 'ax-min' (v0.3.8, cheapest — ~80-200 tokens, format `@e1 button \"Sign in\"`, drops framework noise like Radix IDs); 'ax' (default — compressed accessibility tree with @eN refs, ~200-400 tokens, includes role brackets + placeholders + IDs); 'full' (legacy — every button/input/form with CSS selectors, ~5000 tokens, good for unfamiliar sites where you need everything). All modes share the same @eN ref cache so click/fill/key_type/upload work identically. Prefer ax-min for known/familiar sites; ax when you need placeholder/id hints; full only when nothing else works.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "mode": {"type": "string", "enum": ["ax-min", "ax", "full"], "default": "ax", "description": "ax-min = ultra-compact @eN + kind + label only (cheapest). ax = compact + roles/placeholders/ids (default). full = legacy verbose with CSS selectors."}, "save_to_playbook": {"type": "boolean", "default": True, "description": "Auto-save discovered structure to playbook for this domain (full mode only)"}}, "required": ["session"]}),
         Tool(name="get_playbook", description="Read everything Claude has learned about a domain — known quirks, field names, working patterns, affiliate links. Includes data merged from any installed Threads (profile packs).", inputSchema={"type": "object", "properties": {"domain": {"type": "string", "description": "Domain like bitget.com or mexc.com. Leave empty to list all known domains."}}, "required": []}),
         Tool(name="list_threads", description="List installable Threads (profile packs) currently discovered by WebLoom. Shows domain, version, source path, and which keys it contributes.", inputSchema={"type": "object", "properties": {}}),
@@ -3010,7 +3033,7 @@ def resolve_session(session_str: str) -> int:
     except ValueError:
         raise ValueError(f"Unknown session '{session_str}'. Available: {list(sessions.keys())}")
 
-_STATUS_FREE = {"chrome_status", "list_sessions", "list_running_chrome", "get_playbook", "note", "save_playbook", "find_tab_by_selector", "start_recording", "end_recording", "list_recipes", "replay_recipe", "confirm_login", "detect_blocker", "auth_totp", "pause_for_human", "export_profile", "import_profile", "list_threads", "install_thread", "export_thread", "reddit_check_shadowban",
+_STATUS_FREE = {"chrome_status", "list_sessions", "close_session", "list_running_chrome", "get_playbook", "note", "save_playbook", "find_tab_by_selector", "start_recording", "end_recording", "list_recipes", "replay_recipe", "confirm_login", "detect_blocker", "auth_totp", "pause_for_human", "export_profile", "import_profile", "list_threads", "install_thread", "export_thread", "reddit_check_shadowban",
     # Marketplace + engine-status + auto-record tools — pure HTTP + local file
     # ops, no Chrome session needed. Without these here the session-pick gate
     # traps every call (reported by other tab 2026-06-21).
@@ -4137,8 +4160,11 @@ async def _execute_tool_action(name: str, arguments: dict):
 
     # Autopilot (WEBLOOM_AUTOPILOT=1) is a scheduled script with nobody to answer, like the login gate below: the
     # session check is for chats only. Without this, every unattended run after a quiet hour stopped here.
+    # A launch the person already chose (confirmed_by_user) is the answer this check would ask for; showing the
+    # list again made the first launch after a quiet spell do nothing.
+    _chosen_launch = name == "launch_session" and bool(arguments.get("confirmed_by_user")) and bool(target_session)
     if (not _startup_was_done_recently() and name not in _STATUS_FREE and not _live_target
-            and not os.environ.get("WEBLOOM_AUTOPILOT")):
+            and not _chosen_launch and not os.environ.get("WEBLOOM_AUTOPILOT")):
         _mark_startup_done()
         sessions = load_sessions()
         running = discover_running_chrome_sessions()
@@ -4229,6 +4255,14 @@ async def _execute_tool_action(name: str, arguments: dict):
             _login_guardar(_LOGIN_CONFIRMED)
             return [TextContent(type="text", text=f"⏳ Waiting for login on '{sname}'. Tell the user: \"Let me know when you've finished logging in, then I'll continue.\" Do NOT proceed with any interaction tools until they confirm and you call `confirm_login` again with logged_in=true.")]
 
+    if name == "close_session":
+        cfg = load_sessions().get(arguments.get("session", ""))
+        if not cfg:
+            return [TextContent(type="text", text=f"Unknown session '{arguments.get('session', '')}'. Available: {list(load_sessions().keys())}")]
+        closed = await _close_browser(cfg["port"])
+        _HEADLESS_PORTS.discard(cfg["port"])
+        return [TextContent(type="text", text=json.dumps({"ok": True, "session": arguments["session"], "closed": closed, "live": _port_live(cfg["port"])}))]
+
     if name == "launch_session":
         sname = arguments.get("session", "")
         force_new = arguments.get("force_new", False)
@@ -4256,8 +4290,11 @@ async def _execute_tool_action(name: str, arguments: dict):
                 f"Do NOT call any other Chrome tool before the user answers."
             ))]
 
+        # A confirmed, known session whose port is down gets launched. Before, any other live Chrome made this
+        # branch answer with the list of running ones and the asked session never opened.
+        wanted_down = bool(sname and sname in sessions and not any(r["port"] == sessions[sname]["port"] for r in running))
         # If no session specified or not force_new — show what's available
-        if running and not force_new:
+        if running and not force_new and not wanted_down:
             lines = ["**Running Chrome debug instances — pick one to connect:**\n"]
             for r in running:
                 tab_list = ", ".join(r["tabs"]) if r["tabs"] else "(no tabs)"
@@ -4299,6 +4336,13 @@ async def _execute_tool_action(name: str, arguments: dict):
         if headless:
             # no window at all; a real window size so pages lay out as on a laptop screen
             args += ["--headless=new", "--window-size=1366,900"]
+            # Without this every request says "HeadlessChrome", the first thing a site checks to flag a bot.
+            ua = _plain_chrome_ua()
+            if ua:
+                args.append(f"--user-agent={ua}")
+            _HEADLESS_PORTS.add(port)
+        else:
+            _HEADLESS_PORTS.discard(port)
         background = bool(arguments.get("background")) or headless
         if background:
             # a minimized window counts as hidden: without these Chrome slows its timers to a crawl and the
