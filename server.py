@@ -4364,7 +4364,9 @@ async def _execute_tool_action(name: str, arguments: dict):
 
         cfg = sessions[sname]
         port = cfg["port"]
-        user_data_dir = cfg["user_data_dir"]
+        # Sessions registered by launch_headless_chrome carry only a port; their profile lives in ~/.webloom/<name>-profile.
+        # Reading the key straight crashed with KeyError 'user_data_dir'.
+        user_data_dir = cfg.get("user_data_dir") or str(Path.home() / ".webloom" / f"{sname}-profile")
 
         Path(user_data_dir).mkdir(parents=True, exist_ok=True)
         args = [
