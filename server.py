@@ -165,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.22"
+ENGINE_VERSION = "0.3.23"
 
 
 def _installed_version() -> str:
@@ -2744,7 +2744,8 @@ async def list_tools():
             "tab": {"type": "string"},
             "post_url": {"type": "string", "description": "Full URL of the Reddit post to comment on"},
             "markdown": {"type": "string", "description": "Comment body in markdown (Reddit renders shortcuts)"},
-            "verify_landed": {"type": "boolean", "default": True, "description": "After submit, re-check the page for our comment (catches AutoMod silent removals)."}
+            "verify_landed": {"type": "boolean", "default": True, "description": "After submit, re-check the page for our comment (catches AutoMod silent removals)."},
+            "human_typing": {"type": "object", "description": "Type the comment one character at a time at a person's pace instead of pasting it at once. {\"cpm\": [min, max]} characters per minute (default [180, 300], about 35 to 60 words a minute), with longer pauses after punctuation and now and then between words. A paste of 100+ words in under a minute is a bot signature."}
         }, "required": ["session", "post_url", "markdown"]}),
         Tool(name="touch_tap", description="Fire a real touch event (CDP Input.dispatchTouchEvent — isTrusted=true touchStart + touchEnd) at an element's center. Use for mobile-first webapps that listen for touchstart/touchend instead of mouse/click — Telegram Web /a/, WhatsApp Web, Instagram Web mobile mode, anything with a custom tap detector. Enables Emulation.setTouchEmulationEnabled if not already on. Pass a CSS selector OR an @eN ref from scan_tab.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector for the element to tap (or @eN ref)."}, "double": {"type": "boolean", "default": False, "description": "Fire two taps in quick succession (double-tap)."}}, "required": ["session", "selector"]}),
         Tool(name="replay_xhr", description="Replay a captured network request with optional modifications. Takes a request shape (method, url, headers, body) usually obtained from capture_network_start/stop, optionally substitutes new values, and re-fires via fetch() with credentials:'include' so cookies/auth carry. Returns full response. Use to: (a) confirm a discovered endpoint actually works, (b) re-fire idempotent actions, (c) skip the UI entirely once an endpoint is known. Companion to xhr_upload — replay_xhr is for non-file requests.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url": {"type": "string", "description": "Full URL to fetch (absolute or relative to current page origin)"}, "method": {"type": "string", "default": "POST"}, "headers": {"type": "object", "description": "Request headers (do not include Cookie — that flows automatically via credentials:'include')"}, "body": {"description": "Request body. If object → JSON-encoded (Content-Type: application/json added if absent). If string → sent as-is. If null/omitted → no body."}, "params": {"type": "object", "description": "Optional URL query params merged into the URL"}}, "required": ["session", "url"]}),
@@ -4041,6 +4042,50 @@ def _pro_denied_payload(tool_name: str, reason: str) -> str:
         "upgrade_url": "https://webloom.run/pro",
         "reason": reason,
     }, indent=2)
+
+
+async def _reddit_type_like_a_person(ws_url: str, container_sel: str, text: str, opts: dict) -> str:
+    """Type into Reddit's Lexical composer one character at a time (CDP Input.insertText, which Lexical
+    handles as real input), at a pace drawn from opts["cpm"], with pauses after punctuation and now and
+    then between words. A run of newlines becomes one Enter (a new paragraph). Reads the composer back
+    and returns "ok ..." only when its text matches what we meant to type."""
+    import random as _r
+    lo, hi = (opts.get("cpm") or [180, 300])[:2]
+    cpm = _r.uniform(float(lo), float(hi))
+    base = 60.0 / cpm
+    focus_js = ("(function(){ const e = document.querySelector(" + json.dumps(container_sel) + ");"
+                " if (!e) return false; e.focus(); const s = window.getSelection(); const r = document.createRange();"
+                " r.selectNodeContents(e); r.collapse(false); s.removeAllRanges(); s.addRange(r);"
+                " return document.activeElement === e || e.contains(document.activeElement); })()")
+    r = await eval_in_tab(ws_url, focus_js)
+    if not r.get("result", {}).get("value"):
+        return "could not focus the composer"
+    started = time.time()
+    for pi, para in enumerate(re.split(r"\n+", text.strip())):
+        if pi:
+            await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter",
+                                                              "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r"})
+            await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter",
+                                                              "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
+            await asyncio.sleep(_r.uniform(0.8, 2.5))
+        for ch in para:
+            await cdp_send(ws_url, "Input.insertText", {"text": ch})
+            d = base * _r.uniform(0.45, 1.7)
+            if ch in ".!?":
+                d += _r.uniform(0.4, 1.4)
+            elif ch in ",;:":
+                d += _r.uniform(0.15, 0.6)
+            elif ch == " " and _r.random() < 0.04:
+                d += _r.uniform(1.5, 5.0)
+            await asyncio.sleep(d)
+    await asyncio.sleep(_r.uniform(1.0, 3.0))
+    rb = await eval_in_tab(ws_url, "(function(){ const e = document.querySelector(" + json.dumps(container_sel) + "); return e ? e.innerText : ''; })()")
+    got = re.sub(r"\s+", " ", rb.get("result", {}).get("value") or "").strip()
+    want = re.sub(r"\s+", " ", text).strip()
+    secs = int(time.time() - started)
+    if got != want:
+        return f"composer text does not match after typing ({len(got)} vs {len(want)} chars): {got[:120]!r}"
+    return f"ok {len(want)} chars in {secs}s (~{int(cpm)} cpm)"
 
 
 @server.call_tool()
@@ -8652,16 +8697,24 @@ async def _execute_tool_action(name: str, arguments: dict):
             ))]
         trace.append(f"composer found: {container_sel}")
 
-        # 4. Set text via lexical_set_text equivalent (inline the JS)
-        set_arguments = {
-            "container_selector": container_sel,
-            "text": markdown,
-            "mount_timeout_seconds": 4,
-        }
-        # Re-route into our lexical_set_text handler by recursion
-        sub = await call_tool("lexical_set_text", {**arguments, **set_arguments})
-        sub_text = sub[0].text if sub else ""
-        trace.append(f"lexical_set_text: {sub_text[:200]}")
+        # 4. Put the text in: typed at a person's pace when human_typing is set, else via lexical_set_text.
+        human = arguments.get("human_typing")
+        if human:
+            typed = await _reddit_type_like_a_person(ws_url, container_sel, markdown, human)
+            trace.append(f"human typing: {typed}")
+            if not typed.startswith("ok"):
+                return [TextContent(type="text", text="reddit_submit_comment: NOT posted. Typing into the composer failed: "
+                                    + typed + "\n\nTrace:\n" + "\n".join(trace))]
+        else:
+            set_arguments = {
+                "container_selector": container_sel,
+                "text": markdown,
+                "mount_timeout_seconds": 4,
+            }
+            # Re-route into our lexical_set_text handler by recursion
+            sub = await call_tool("lexical_set_text", {**arguments, **set_arguments})
+            sub_text = sub[0].text if sub else ""
+            trace.append(f"lexical_set_text: {sub_text[:200]}")
 
         # 5. Find + click submit button — SCOPED to the composer ancestor of the
         #    focused contenteditable. Reddit pages have ~22 button[type=submit]
