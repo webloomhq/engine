@@ -165,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.23"
+ENGINE_VERSION = "0.3.24"
 
 
 def _installed_version() -> str:
@@ -1877,8 +1877,12 @@ FILL_JS = """
         }
         // by placeholder / name / id / aria-label
         if (!found) {
-            const sel = `input[placeholder*="${key}" i], input[name*="${key}" i], input[id*="${key}" i], textarea[placeholder*="${key}" i], input[aria-label*="${key}" i]`;
-            try { found = document.querySelector(sel); } catch(e) {}
+            // textareas and selects too: X's profile bio is <textarea name="description"> and was "not found"
+            // exact name/id first (a comma list returns the first in page order, not the best match)
+            const tags = ['input', 'textarea', 'select'];
+            const exact = tags.map(t => `${t}[name="${key}" i], ${t}[id="${key}" i]`).join(', ');
+            const loose = tags.map(t => `${t}[placeholder*="${key}" i], ${t}[name*="${key}" i], ${t}[id*="${key}" i], ${t}[aria-label*="${key}" i]`).join(', ');
+            try { found = document.querySelector(exact) || document.querySelector(loose); } catch(e) {}
         }
         if (found) {
             found.focus();
@@ -2753,7 +2757,7 @@ async def list_tools():
         Tool(name="remove_injected_script", description="Remove a previously injected persistent script by its identifier (returned from inject_on_new_document). Future navigations on this tab will no longer auto-install it.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "identifier": {"type": "string", "description": "Identifier returned by inject_on_new_document"}}, "required": ["session", "identifier"]}),
         Tool(name="xhr_upload", description="Direct file upload via fetch()/FormData against a server endpoint. Bypasses widgets that intercept and corrupt programmatic file injection (KDP AjaxInput, custom AJAX uploaders that clear input.files after onchange). Uses the page's cookies/CSRF/session via credentials:'include' — appears identical to the page's own upload request. Pair with capture_network_start/stop to discover the URL and field names by watching one manual upload. Max 25MB combined.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "url": {"type": "string", "description": "Upload endpoint URL (absolute or relative to current page origin). Discover via capture_network_start during a real upload."}, "files": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute local file path"}, "field": {"type": "string", "description": "FormData field name (e.g. 'file', 'cover_image', 'manuscript'). Watch a real upload to identify."}}, "required": ["path", "field"]}, "description": "Files to upload, each with its FormData field name."}, "fields": {"type": "object", "description": "Additional FormData fields (CSRF tokens, book IDs, hidden params). Often required — capture a real upload to identify."}, "method": {"type": "string", "default": "POST"}, "headers": {"type": "object", "description": "Extra headers (X-CSRF-Token, etc). Cookies are automatic via credentials:'include'."}}, "required": ["session", "url", "files"]}),
         Tool(name="key_press", description="Press a single named key via CDP Input.dispatchKeyEvent. Use for Enter, Tab, Escape, ArrowUp/Down/Left/Right, Backspace, Space. For navigating React dropdowns/menus (Radix, Headless UI) keyboard-style: focus the trigger, ArrowDown to highlight, Enter to select.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "key": {"type": "string", "description": "Key name: Enter, Tab, Escape, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Backspace, Space, PageDown, PageUp, Home, End"}, "modifiers": {"type": "array", "items": {"type": "string", "enum": ["Alt", "Control", "Meta", "Shift"]}, "description": "Optional modifier keys held during the press"}}, "required": ["session", "key"]}),
-        Tool(name="x_create_tweet", description="Post a tweet on X without typing into the DOM. Computes x-client-transaction-id from the page (reverses X's body-signed anti-replay header), refreshes ct0 from cookie, fires CreateTweet GraphQL POST from the tab context (cookies auto-attach). Zero manual seed needed — kills the seed-and-replay dance entirely. Use this instead of draftjs_set_text+click for X posting. Requires the X tab to be open and logged in.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching x.com (defaults to first x.com tab)"}, "text": {"type": "string", "description": "Tweet body"}, "query_id": {"type": "string", "description": "X's CreateTweet GraphQL queryId. Optional — if omitted, scraped from the page. Pass explicitly when scrape fails (X bundles changed)."}, "reply_to_tweet_id": {"type": "string", "description": "Optional — if set, posts as a reply to this tweet id."}}, "required": ["session", "text"]}),
+        Tool(name="x_create_tweet", description="Post a tweet on X (optionally with one image or video: media_path) without typing into the DOM. Computes x-client-transaction-id from the page (reverses X's body-signed anti-replay header), refreshes ct0 from cookie, fires CreateTweet GraphQL POST from the tab context (cookies auto-attach). Zero manual seed needed: kills the seed-and-replay dance entirely. Use this instead of draftjs_set_text+click for X posting. Requires the X tab to be open and logged in.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching x.com (defaults to first x.com tab)"}, "text": {"type": "string", "description": "Tweet body"}, "query_id": {"type": "string", "description": "X's CreateTweet GraphQL queryId. Optional: if omitted, scraped from the page. Pass explicitly when scrape fails (X bundles changed)."}, "reply_to_tweet_id": {"type": "string", "description": "Optional: if set, posts as a reply to this tweet id."}, "media_path": {"type": "string", "description": "Optional: a local image (jpg, png, gif, webp) or video (mp4, mov) on the machine running WebLoom. Uploaded in chunks the way x.com does it, from the logged-in tab; a video is posted once X finishes processing it (up to ~3 min)."}}, "required": ["session", "text"]}),
         Tool(name="tiktok_sign", description="Compute TikTok's anti-bot signature for any URL via the page's own in-bundle signer. Reads window.byted_acrawler.sign(url) — TikTok exposes this on every page after the bundle loads, used for their own internal API calls. Returns {x-bogus, x-tt-params, signature, msToken} for the given URL so you can hit TikTok's authenticated API endpoints directly (POST aweme/create, upload, comment, follow, etc.) WITHOUT driving the DOM. msToken is read from cookie. Requires an already-loaded tiktok.com tab (any page; opens / first if needed).", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab matching tiktok.com (defaults to first one)"}, "url": {"type": "string", "description": "Full URL to sign. The signer takes the full URL including query params and returns the headers TikTok's API expects on that request."}}, "required": ["session", "url"]}),
         Tool(name="tiktok_post_video", description=(
             "Post a video on TikTok through the logged-in TikTok Studio page (/tiktokstudio/upload): hands the file to the page, waits until it is fully uploaded, "
@@ -4086,6 +4090,71 @@ async def _reddit_type_like_a_person(ws_url: str, container_sel: str, text: str,
     if got != want:
         return f"composer text does not match after typing ({len(got)} vs {len(want)} chars): {got[:120]!r}"
     return f"ok {len(want)} chars in {secs}s (~{int(cpm)} cpm)"
+
+
+async def _x_upload_media(ws_url: str, media_path: str, base_headers: dict, ct) -> tuple:
+    """Upload one image or video to X from a logged-in x.com tab. Returns (media_id, "") or ("", error)."""
+    import base64 as _b64
+    import mimetypes as _mt
+    data = Path(media_path).read_bytes()
+    mime = _mt.guess_type(media_path)[0] or ("video/mp4" if media_path.lower().endswith((".mp4", ".mov")) else "image/jpeg")
+    if mime == "video/quicktime":
+        mime = "video/mp4"
+    category = "tweet_video" if mime.startswith("video/") else ("tweet_gif" if mime == "image/gif" else "tweet_image")
+    url = "https://upload.x.com/i/media/upload.json"
+    hdr = {k: v for k, v in base_headers.items() if k.lower() not in ("content-type", "x-client-transaction-id")}
+
+    async def call(method: str, query: dict, chunk_b64: str = "") -> dict:
+        h = dict(hdr)
+        try:
+            h["x-client-transaction-id"] = ct.generate_transaction_id(method, "/i/media/upload.json")
+        except Exception:
+            pass
+        q = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in query.items())
+        js = ("(async function(u, m, h, b64) { try {"
+              "  let body = null;"
+              "  if (b64) { const bin = atob(b64); const arr = new Uint8Array(bin.length);"
+              "    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);"
+              "    body = new FormData(); body.append('media', new Blob([arr])); }"
+              "  const res = await fetch(u, {method: m, credentials: 'include', headers: h, body: body});"
+              "  const t = await res.text(); return JSON.stringify({status: res.status, body: t.slice(0, 3000)});"
+              "} catch (e) { return JSON.stringify({status: 0, body: 'fetch threw: ' + (e && e.message)}); } })("
+              + json.dumps(f"{url}?{q}") + "," + json.dumps(method) + "," + json.dumps(h) + "," + json.dumps(chunk_b64) + ")")
+        r = await eval_in_tab(ws_url, js)
+        try:
+            res = json.loads(r.get("result", {}).get("value") or "{}")
+        except Exception:
+            res = {"status": 0, "body": "unreadable reply"}
+        try:
+            res["json"] = json.loads(res.get("body") or "null")
+        except Exception:
+            res["json"] = None
+        return res
+
+    init = await call("POST", {"command": "INIT", "total_bytes": len(data), "media_type": mime, "media_category": category})
+    media_id = ((init.get("json") or {}).get("media_id_string") or "")
+    if not media_id:
+        return "", f"INIT {init.get('status')}: {(init.get('body') or '')[:300]}"
+    seg = 1024 * 1024
+    for idx, off in enumerate(range(0, len(data), seg)):
+        part = await call("POST", {"command": "APPEND", "media_id": media_id, "segment_index": idx},
+                          _b64.b64encode(data[off:off + seg]).decode())
+        if not (200 <= int(part.get("status") or 0) < 300):
+            return "", f"APPEND segment {idx} {part.get('status')}: {(part.get('body') or '')[:300]}"
+    fin = await call("POST", {"command": "FINALIZE", "media_id": media_id})
+    if not (200 <= int(fin.get("status") or 0) < 300):
+        return "", f"FINALIZE {fin.get('status')}: {(fin.get('body') or '')[:300]}"
+    info = (fin.get("json") or {}).get("processing_info")
+    deadline = time.time() + 180
+    while info and info.get("state") in ("pending", "in_progress"):
+        if time.time() > deadline:
+            return "", "X was still processing the video after 3 minutes"
+        await asyncio.sleep(min(max(int(info.get("check_after_secs") or 3), 1), 10))
+        st = await call("GET", {"command": "STATUS", "media_id": media_id})
+        info = (st.get("json") or {}).get("processing_info")
+    if info and info.get("state") == "failed":
+        return "", f"X could not process the media: {json.dumps(info.get('error') or info)[:300]}"
+    return media_id, ""
 
 
 @server.call_tool()
@@ -9018,6 +9087,9 @@ async def _execute_tool_action(name: str, arguments: dict):
         tweet_text = arguments["text"]
         query_id = arguments.get("query_id") or ""
         reply_to = arguments.get("reply_to_tweet_id") or ""
+        media_path = (arguments.get("media_path") or "").strip()
+        if media_path and not Path(media_path).is_file():
+            return [TextContent(type="text", text=f"x_create_tweet: media_path not found: {media_path}")]
 
         # Auto-route to an x.com / twitter.com tab when caller didn't pass one.
         # The session may have many tabs (IH, LinkedIn, HN…) and the generic
@@ -9172,6 +9244,14 @@ async def _execute_tool_action(name: str, arguments: dict):
             "x-client-transaction-id": transaction_id,
             "content-type": "application/json",
         }
+
+        # 4b. Optional media: chunked upload to upload.x.com from the tab (cookies attach), the way the web
+        #     client does it (INIT, APPEND per 1 MB segment, FINALIZE, then STATUS until a video is processed).
+        if media_path:
+            media_id, media_err = await _x_upload_media(ws_url, media_path, headers, ct)
+            if not media_id:
+                return [TextContent(type="text", text=f"x_create_tweet: media upload failed, nothing was posted: {media_err}")]
+            body["variables"]["media"]["media_entities"] = [{"media_id": media_id, "tagged_users": []}]
 
         # 5. Fire from tab context — cookies auto-attach
         post_js = (
