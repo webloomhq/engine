@@ -3161,6 +3161,13 @@ _UPDATE_CHECK_URL = os.environ.get("WEBLOOM_UPDATE_CHECK_URL", "https://webloom.
 _UPDATE_NOTICE_PATH = Path.home() / ".webloom" / "update_available.json"
 
 
+def _ver_tuple(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v).lstrip("v").split("."))
+    except ValueError:
+        return ()
+
+
 def _check_engine_update_once() -> dict:
     import urllib.request, urllib.parse
     try:
@@ -10318,13 +10325,14 @@ async def _execute_tool_action(name: str, arguments: dict):
                 d = json.loads(_UPDATE_NOTICE_PATH.read_text(encoding="utf-8")) if _UPDATE_NOTICE_PATH.exists() else None
             except Exception:
                 d = None
-            if d is None:
+            # A notice written by an older engine (before an upgrade) describes that engine, not this one
+            if d is None or d.get("current") != ENGINE_VERSION:
                 d = _check_engine_update_once()
         result = {
             "ok": True,
             "running_version": ENGINE_VERSION,
             "latest_version": d.get("latest") if d else None,
-            "update_available": bool(d and d.get("latest") and d.get("latest") != ENGINE_VERSION),
+            "update_available": bool(d and d.get("latest") and _ver_tuple(d["latest"]) > _ver_tuple(ENGINE_VERSION)),
             "mcpb_url": d.get("mcpb_url") if d else None,
             "release_url": d.get("release_url") if d else None,
             "install_hint": (d.get("install_hint") if d else "Could not reach webloom.run. Check your internet."),
