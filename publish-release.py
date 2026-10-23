@@ -276,7 +276,7 @@ def main() -> int:
     run_publisher(["publish"])
 
     print()
-    print(f"✓ Published io.github.webloomhq/engine v{version} to registry.modelcontextprotocol.io")
+    print(f"OK Published io.github.webloomhq/engine v{version} to registry.modelcontextprotocol.io")
     print(f"  Verify: curl 'https://registry.modelcontextprotocol.io/v0/servers?search=webloom'")
     return 0
 
