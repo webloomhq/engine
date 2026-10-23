@@ -165,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.24"
+ENGINE_VERSION = "0.3.25"
 
 
 def _installed_version() -> str:
@@ -573,7 +573,13 @@ class _CDPConn:
         self._events.clear()
 
     def is_alive(self) -> bool:
-        return self.ws is not None and not getattr(self.ws, "closed", True)
+        if self.ws is None:
+            return False
+        closed = getattr(self.ws, "closed", None)  # websockets < 14 (legacy client)
+        if closed is not None:
+            return not closed
+        # websockets >= 14 has no .closed; without this every call opened a new socket and leaked the old one
+        return getattr(getattr(self.ws, "state", None), "value", None) == 1  # State.OPEN
 
     async def send(self, method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
         # Default timeout raised from 15 -> 60s. Some legitimate CDP calls

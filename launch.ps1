@@ -16,7 +16,7 @@ function Launch-Session($name, $cfg) {
     $dir = $cfg.user_data_dir
 
     # Check if already running
-    $existing = try { Invoke-RestMethod "http://localhost:$port/json/version" -TimeoutSec 1 } catch { $null }
+    $existing = try { Invoke-RestMethod "http://127.0.0.1:$port/json/version" -TimeoutSec 1 } catch { $null }
     if ($existing) {
         # ASCII only. PowerShell 5.1 reads this file as ANSI, so a UTF-8 dash arrives as three
         # bytes, one of them a quote, and the whole script dies with "string is missing the
@@ -36,7 +36,7 @@ function Launch-Session($name, $cfg) {
     )
 
     Start-Sleep -Milliseconds 1500
-    $check = try { Invoke-RestMethod "http://localhost:$port/json/version" -TimeoutSec 2 } catch { $null }
+    $check = try { Invoke-RestMethod "http://127.0.0.1:$port/json/version" -TimeoutSec 2 } catch { $null }
     if ($check) {
         Write-Host "[$name] Ready on port $port" -ForegroundColor Green
     } else {

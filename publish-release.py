@@ -151,7 +151,48 @@ def gh_request(method: str, path: str, body=None) -> dict:
         return {"_http_error": e.code, "_body": e.read().decode()[:500]}
 
 
-def get_or_create_release(version: str) -> int:
+def git(*args: str) -> str:
+    # Never let git fall back to the OS credential manager: on Windows it pops a GitHub login window.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    return subprocess.run(["git", "-c", "credential.helper=", *args], cwd=HERE, env=env,
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def remote_url() -> str:
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise SystemExit("GH_TOKEN is required")
+    return f"https://marstudio360:{token}@github.com/webloomhq/engine.git"
+
+
+def preflight(version: str) -> str:
+    """Refuse to publish anything the public repo cannot reproduce. Returns the commit to tag.
+
+    0.3.22 shipped without a git push: GitHub put tag v0.3.22 on the old main (0.3.21 code),
+    so a clone of the tag reported 0.3.21 and the update check kept offering 0.3.22.
+    """
+    import re
+    m = re.search(r'^ENGINE_VERSION = "([^"]+)"', (HERE / "server.py").read_text(encoding="utf-8"), re.M)
+    if not m or m.group(1) != version:
+        raise SystemExit(f"server.py ENGINE_VERSION is {m.group(1) if m else '?'}, not {version}: bump and commit it first")
+    # server.json / manifest.json are rewritten by this script (version, mcpb url, sha) and committed after
+    dirty = [l for l in git("status", "--porcelain", "--untracked-files=no").splitlines()
+             if l[3:] not in ("server.json", "manifest.json")]
+    if dirty:
+        raise SystemExit("uncommitted changes (the release must match a pushed commit):\n" + "\n".join(dirty))
+    head = git("rev-parse", "HEAD")
+    url = remote_url()
+    remote_main = git("ls-remote", url, "refs/heads/main").split()[:1]
+    if remote_main != [head]:
+        raise SystemExit(f"HEAD {head[:7]} is not on GitHub main: push it first")
+    tag_lines = git("ls-remote", url, f"refs/tags/v{version}", f"refs/tags/v{version}^{{}}").splitlines()
+    tagged = tag_lines[-1].split()[0] if tag_lines else None  # peeled line (^{}) comes last for annotated tags
+    if tagged and tagged != head:
+        raise SystemExit(f"tag v{version} already points at {tagged[:7]}, not HEAD {head[:7]}")
+    return head
+
+
+def get_or_create_release(version: str, commit: str) -> int:
     tag = f"v{version}"
     rel = gh_request("GET", f"/repos/webloomhq/engine/releases/tags/{tag}")
     if isinstance(rel, dict) and rel.get("id"):
@@ -159,6 +200,7 @@ def get_or_create_release(version: str) -> int:
     print(f"[publish] creating release {tag}")
     created = gh_request("POST", "/repos/webloomhq/engine/releases", {
         "tag_name": tag,
+        "target_commitish": commit,
         "name": f"{tag}",
         "draft": False,
         "prerelease": False,
@@ -218,15 +260,19 @@ def main() -> int:
     version = load_version()
     print(f"[publish] target version: {version}")
 
+    commit = preflight(version)
     download_publisher_if_missing()
     mcpb, sha = build_mcpb(version)
-    release_id = get_or_create_release(version)
+    release_id = get_or_create_release(version, commit)
     mcpb_url = upload_mcpb(release_id, mcpb)
     update_server_json(mcpb_url, sha)
 
     run_publisher(["validate"])
     if not args.skip_login:
-        run_publisher(["login", "github"])
+        # Device flow lacks read:org and gets a 403 for io.github.webloomhq/*; the PAT works.
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        run_publisher(["logout"])
+        run_publisher(["login", "github", f"-token={token}"] if token else ["login", "github"])
     run_publisher(["publish"])
 
     print()
