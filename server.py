@@ -165,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.25"
+ENGINE_VERSION = "0.3.26"
 
 
 def _installed_version() -> str:
@@ -765,25 +765,33 @@ async def navigate_and_wait_load(ws_url: str, url: str, timeout: float = 20.0) -
         return f"Navigated to {url} (load event timed out after {timeout}s — page may still be loading)"
 
 
+# What a click changed. Lengths alone missed same-length changes ("sent 17927" -> "sent 17928", a counter going
+# 1 -> 2), so a click that worked read as "no effect" and the next stage clicked AGAIN (double submit, a like undone).
+_VERIFY_SNAPSHOT_JS = """JSON.stringify({
+    url: location.href,
+    ready: document.readyState,
+    title: document.title,
+    bodyLen: (document.body && document.body.innerText || '').length,
+    htmlLen: (document.body && document.body.innerHTML || '').length,
+    textHash: (() => { const t = document.body ? document.body.innerText : ''; let h = 0;
+        for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0; return h; })(),
+    pressed: document.querySelectorAll('[aria-pressed="true"], [aria-checked="true"], [aria-selected="true"], :checked').length,
+    kids: document.body ? document.body.children.length : 0,
+    modal: !!document.querySelector('[role=dialog], .modal, .popup, [aria-modal=true]'),
+    listbox: document.querySelectorAll('[role=listbox], [role=menu], [role=tree]').length,
+    expanded: document.querySelectorAll('[aria-expanded="true"]').length,
+    portals: document.querySelectorAll('[data-radix-popper-content-wrapper], [data-headlessui-portal], [data-state="open"]').length,
+    focused: document.activeElement ? document.activeElement.tagName + '#' + (document.activeElement.id || '') : ''
+})"""
+
+
 async def verify_click_effect(ws_url: str, snapshot_before: str) -> bool:
     """Return True if the page changed since snapshot_before — i.e. the click took effect.
 
     Detects URL change, document state change, body size change, modal/popup appearance.
     Used to catch silent rejections from sites that gate on event.isTrusted.
     """
-    js = """JSON.stringify({
-        url: location.href,
-        ready: document.readyState,
-        title: document.title,
-        bodyLen: (document.body && document.body.innerText || '').length,
-        htmlLen: (document.body && document.body.innerHTML || '').length,
-        kids: document.body ? document.body.children.length : 0,
-        modal: !!document.querySelector('[role=dialog], .modal, .popup, [aria-modal=true]'),
-        listbox: document.querySelectorAll('[role=listbox], [role=menu], [role=tree]').length,
-        expanded: document.querySelectorAll('[aria-expanded="true"]').length,
-        portals: document.querySelectorAll('[data-radix-popper-content-wrapper], [data-headlessui-portal], [data-state="open"]').length,
-        focused: document.activeElement ? document.activeElement.tagName + '#' + (document.activeElement.id || '') : ''
-    })"""
+    js = _VERIFY_SNAPSHOT_JS
     try:
         r = await eval_in_tab(ws_url, js)
         snapshot_after = r.get("result", {}).get("value", "")
@@ -1380,6 +1388,8 @@ async def wait_actionable(ws_url: str, desc: str, timeout_s: float = 5.0, interv
             if last_rect and abs(r.get("x", 0) - last_rect.get("x", 0)) < 1 and abs(r.get("y", 0) - last_rect.get("y", 0)) < 1:
                 return probe
             last_rect = r
+            await asyncio.sleep(0.035)  # stability re-probe: two animation frames, not a full poll interval
+            continue
         await asyncio.sleep(interval_s)
     return last
 
@@ -1631,19 +1641,7 @@ def reset_session_state(domain: str | None = None):
 
 
 async def snapshot_for_verify(ws_url: str) -> str:
-    js = """JSON.stringify({
-        url: location.href,
-        ready: document.readyState,
-        title: document.title,
-        bodyLen: (document.body && document.body.innerText || '').length,
-        htmlLen: (document.body && document.body.innerHTML || '').length,
-        kids: document.body ? document.body.children.length : 0,
-        modal: !!document.querySelector('[role=dialog], .modal, .popup, [aria-modal=true]'),
-        listbox: document.querySelectorAll('[role=listbox], [role=menu], [role=tree]').length,
-        expanded: document.querySelectorAll('[aria-expanded="true"]').length,
-        portals: document.querySelectorAll('[data-radix-popper-content-wrapper], [data-headlessui-portal], [data-state="open"]').length,
-        focused: document.activeElement ? document.activeElement.tagName + '#' + (document.activeElement.id || '') : ''
-    })"""
+    js = _VERIFY_SNAPSHOT_JS
     try:
         r = await eval_in_tab(ws_url, js)
         return r.get("result", {}).get("value", "")
@@ -2215,6 +2213,43 @@ def _load_thread_file(path: Path) -> dict | None:
         return None
 
 
+# Read-side caches. load_playbook() runs several times per click and re-read every Thread file plus the live
+# playbook each time (111 Threads + a 0.9 MB playbook = ~36 ms per call on Windows). Writers never use these:
+# they go through _load_live_playbook_raw() and always read the file fresh.
+_READ_CACHE: dict = {}
+_READ_CACHE_RECHECK_S = 2.0
+
+
+def _files_signature(paths) -> tuple:
+    sig = []
+    for p in paths:
+        try:
+            st = p.stat()
+            sig.append((str(p), st.st_mtime_ns, st.st_size))
+        except OSError:
+            pass
+    return tuple(sig)
+
+
+def _cached_read(key: str, list_paths, build):
+    """build() again only when a file in list_paths() changed; checks at most every _READ_CACHE_RECHECK_S."""
+    now = time.monotonic()
+    hit = _READ_CACHE.get(key)
+    if hit and now - hit["checked"] < _READ_CACHE_RECHECK_S:
+        return hit["value"]
+    sig = _files_signature(list_paths())
+    if hit and hit["sig"] == sig:
+        hit["checked"] = now
+        return hit["value"]
+    value = build()
+    _READ_CACHE[key] = {"sig": sig, "checked": now, "value": value}
+    return value
+
+
+def _invalidate_read_cache() -> None:
+    _READ_CACHE.clear()
+
+
 def load_threads() -> dict[str, dict]:
     """Discover installable Threads and return {domain: thread_dict}.
 
@@ -2222,6 +2257,12 @@ def load_threads() -> dict[str, dict]:
     Threads are JSON files with a 'domain' key; other keys are merged into
     the live playbook at read time so WebLoom / WebLoom auto-consults them.
     """
+    def _paths():
+        return [p for d in (PROJECT_THREADS_DIR, THREADS_DIR) if d.exists() for p in d.glob("*.thread.json")]
+    return _cached_read("threads", _paths, _load_threads_uncached)
+
+
+def _load_threads_uncached() -> dict[str, dict]:
     threads: dict[str, dict] = {}
     for d in (PROJECT_THREADS_DIR, THREADS_DIR):
         if not d.exists():
@@ -2242,13 +2283,7 @@ def load_playbook() -> dict:
     - click_log uses live entries when present, falls back to Thread's
     - default_strategy, quirks, endpoints, selectors etc. use live if set, else Thread
     """
-    PLAYBOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    live: dict = {}
-    if PLAYBOOK_FILE.exists():
-        try:
-            live = json.loads(PLAYBOOK_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            live = {}
+    live = _cached_read("live_playbook", lambda: [PLAYBOOK_FILE], _load_live_playbook_raw)
 
     threads = load_threads()
     if not threads:
@@ -2327,6 +2362,7 @@ def _load_live_playbook_raw() -> dict:
 def save_playbook_data(playbook: dict):
     PLAYBOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
     PLAYBOOK_FILE.write_text(json.dumps(playbook, indent=2))
+    _invalidate_read_cache()  # a write inside the 2 s recheck window must be visible to the next read
 
 def domain_from_url(url: str) -> str:
     try:
@@ -4278,10 +4314,9 @@ async def _execute_tool_action(name: str, arguments: dict):
         try:
             _sessions_cfg = load_sessions()
             if target_session in _sessions_cfg:
-                _running = discover_running_chrome_sessions()
-                _live_ports = {r["port"] for r in _running}
-                if _sessions_cfg[target_session]["port"] in _live_ports:
-                    _live_target = True
+                # Ask the session's own port. discover_running_chrome_sessions() walks every process on the machine
+                # (about 190 ms per call on a busy server, paid by EVERY tool call) and misses tunneled ports.
+                _live_target = _port_live(_sessions_cfg[target_session]["port"])
         except Exception:
             pass
 
@@ -4716,6 +4751,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         if dest.exists() and not overwrite:
             return [TextContent(type="text", text=f"install_thread: {dest} already exists. Pass overwrite=true to replace.")]
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        _invalidate_read_cache()
         return [TextContent(type="text", text=(
             f"Installed Thread for **{domain}** → {dest}\n"
             f"  framework: {data.get('framework','?')}  ·  version: {data.get('version','?')}\n"
@@ -4744,6 +4780,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             out_path = str(THREADS_DIR / f"{domain}.thread.json")
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_text(json.dumps(thread, indent=2), encoding="utf-8")
+        _invalidate_read_cache()
         return [TextContent(type="text", text=(
             f"Exported live playbook for **{domain}** → {out_path}\n"
             f"  {len(thread)-1} keys captured  ·  ready to share, install on another machine, or sell."
@@ -5054,9 +5091,13 @@ async def _execute_tool_action(name: str, arguments: dict):
                 return False, "no coords"
             snap_before = await snapshot_for_verify(ws_url)
             await cdp_real_click(ws_url, cx, cy)
-            await asyncio.sleep(0.4)
-            snap_after = await snapshot_for_verify(ws_url)
-            changed = snap_after != snap_before
+            # Look every 50 ms instead of one blind 400 ms sleep; same 400 ms ceiling before calling it "no effect"
+            changed = False
+            for wait in (0.02, 0.03, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05):  # 400 ms in all
+                await asyncio.sleep(wait)
+                if await snapshot_for_verify(ws_url) != snap_before:
+                    changed = True
+                    break
             _log(f"cdp click @ ({cx:.0f},{cy:.0f}) → verifier changed={changed}")
             if changed:
                 picked = ""
