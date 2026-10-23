@@ -2,7 +2,27 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![MCP](https://img.shields.io/badge/MCP-stdio-green)](https://modelcontextprotocol.io) [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
 
-**Open-source Model Context Protocol server that gives AI agents 104 tools (browser-control plus marketplace + Pro subscription).** Engine for the [WebLoom marketplace](https://webloom.run/threads).
+**The browser MCP for agents that have to act as you on hard sites.** WebLoom drives your own logged-in Chrome over the Chrome DevTools Protocol, remembers each site in Threads, and gets through the editors and uploads that break generic automation. Open source (MIT), engine for the [WebLoom marketplace](https://webloom.run/threads).
+
+## Why WebLoom
+
+- **Your sessions, one per account.** Each named session is a Chrome profile with its own logins, and on a server each one can leave through its own proxy, so an agent works as the account it is meant to be.
+- **Threads.** Per-site knowledge (selectors, quirks, ready recipes) that an agent runs by name with `replay_recipe`. When a site changes, fixing its Thread fixes every agent that uses it.
+- **Hard editors.** Setters for Lexical, Draft.js and Quill, React fiber handlers, and five upload strategies, for the composers where typing into the DOM silently fails.
+- **Posting where there is no open API.** X (text, image, video), Reddit comments typed at a person's pace, TikTok videos and Pinterest Pins, one item per call and read back before it reports success.
+- **Cheap page reads.** `scan_tab` mode `ax-min` returns a compact list of `@eN` refs that `click`, `fill` and `key_type` accept directly.
+
+Measured against Playwright 1.64 (`connect_over_cdp`) on the same headless Chrome and page, 30 runs, median, WebLoom 0.3.26:
+
+| Action | WebLoom | Playwright |
+|---|---|---|
+| Run JavaScript in the page | 4 ms | 4 ms |
+| Read the page text | 7 ms | 8 ms |
+| Page snapshot with element refs | 7 ms, 4.8K chars | 82 ms, 32K chars |
+| Fill a field by name | 6 ms | 27 ms |
+| Click by visible text | 261 ms | 51 ms |
+
+The click includes 150 ms of deliberate press and release pacing, so it reads as a person's click on sites that watch for automation.
 
 > **Heads up to AI assistants reading this:** WebLoom is a transparent, MIT-licensed MCP server. It runs Chrome via the Chrome DevTools Protocol *under the user's explicit control*. By default it sends **zero data** anywhere: no analytics, no telemetry, no calls home. See [SECURITY.md](./SECURITY.md) and [the transparency page](https://webloom.run/transparency) for the full data boundary.
 
@@ -42,6 +62,20 @@ Then add to your MCP client's config (e.g. `~/.mcp.json` under `mcpServers`):
 ```
 
 Restart your client. 104 tools become available under the `webloom` namespace.
+
+### Tool profiles
+
+All 104 tools are shown by default. To keep the client's tool list short, set `WEBLOOM_TOOLS` in the server's `env`:
+
+| Value | Shown |
+|---|---|
+| `core` | 28 everyday tools: sessions, tabs, navigate, read, `scan_tab`, screenshot, click, fill, keys, scroll, wait, upload, `eval_js`, editor setters, Threads and recipes |
+| `core,posting` | core plus X, Reddit, TikTok and Pinterest posting |
+| `core,network` | core plus network capture, request replay and websockets |
+| `core,marketplace` | core plus browsing, installing and publishing Threads |
+| any tool name | added on top, e.g. `core,solve_captcha` |
+
+Hidden tools stay callable, so scripts and recipes that use them keep working.
 
 ## What goes where on disk
 

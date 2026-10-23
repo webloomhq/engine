@@ -165,7 +165,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.26"
+ENGINE_VERSION = "0.3.27"
 
 
 def _installed_version() -> str:
@@ -2465,8 +2465,7 @@ async def get_prompt(name: str, arguments: dict | None = None):
         )
     raise ValueError(f"Unknown prompt: {name}")
 
-@server.list_tools()
-async def list_tools():
+async def _all_tools():
     return [
         Tool(name="list_sessions", description="List all configured Chrome sessions and whether they're live", inputSchema={"type": "object", "properties": {}}),
         Tool(name="list_tabs", description="List all open tabs in a Chrome session", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name (main, farm, signups, email) or port number"}}, "required": ["session"]}),
@@ -3134,6 +3133,47 @@ def _login_guardar(sesiones: set, refrescar: str | None = None) -> None:
 
 
 _LOGIN_CONFIRMED: set = _login_leer()
+# Tool profiles. Every tool stays callable; WEBLOOM_TOOLS only trims what the client is shown, because 104 tool
+# definitions at once crowd the model's context (Chrome DevTools MCP ships --slim, Playwright MCP opt-in groups).
+#   WEBLOOM_TOOLS unset or "full"   -> everything (default, unchanged)
+#   WEBLOOM_TOOLS="core"            -> the everyday browser set below
+#   WEBLOOM_TOOLS="core,posting"    -> core plus named groups; plain tool names are accepted too
+_TOOL_GROUPS = {
+    "core": {
+        "list_sessions", "launch_session", "close_session", "confirm_login", "list_tabs", "new_tab", "close_tab",
+        "navigate", "read_tab", "scan_tab", "scan_tab_diff", "screenshot", "click", "fill", "key_type", "key_press",
+        "scroll_tab", "wait_for", "upload_file", "eval_js", "react_force_change", "react_invoke_handler",
+        "lexical_set_text", "draftjs_set_text", "list_threads", "list_recipes", "replay_recipe", "webloom_engine_status",
+    },
+    "posting": {"x_create_tweet", "reddit_submit_comment", "reddit_check_shadowban", "tiktok_post_video", "tiktok_sign",
+                "pinterest_post_pin"},
+    "network": {"capture_network_start", "capture_network_stop", "get_captured_requests", "replay_xhr", "xhr_upload",
+                "network_intercept", "subscribe_to_websocket", "poll_websocket_messages"},
+    "marketplace": {"webloom_pair", "webloom_browse", "webloom_thread_info", "webloom_thread_context", "webloom_install",
+                    "webloom_library", "webloom_open_bounties", "webloom_my_threads", "webloom_claim_bounty",
+                    "webloom_capture_session", "webloom_thread_status", "webloom_publish_thread", "install_thread",
+                    "export_thread", "check_thread_updates"},
+}
+
+
+def _shown_tool_names(spec: str) -> set[str] | None:
+    """None = show everything."""
+    parts = {x.strip() for x in (spec or "").split(",") if x.strip()}
+    if not parts or "full" in parts:
+        return None
+    names: set[str] = set()
+    for x in parts:
+        names |= _TOOL_GROUPS.get(x, {x})
+    return names
+
+
+@server.list_tools()
+async def list_tools():
+    tools = await _all_tools()
+    shown = _shown_tool_names(os.environ.get("WEBLOOM_TOOLS", ""))
+    return tools if shown is None else [t for t in tools if t.name in shown]
+
+
 _REQUIRES_LOGIN = {"scan_tab", "click", "fill", "eval_js", "read_tab", "screenshot", "wait_for", "scroll_tab", "upload_file", "key_type", "key_press", "react_force_change", "react_inspect_store", "redux_dispatch", "aui_dispatch", "backbone_inspect", "xhr_upload", "touch_tap", "replay_xhr", "lexical_set_text", "draftjs_set_text", "reddit_submit_comment", "inject_on_new_document", "remove_injected_script", "vision_check", "click_at_coords", "enable_stealth", "solve_captcha", "drift_heal_suggest", "visual_diff_preflight", "subscribe_to_websocket", "poll_websocket_messages", "episodic_remember", "episodic_recall", "swarm_run", "react_invoke_handler", "x_create_tweet", "tiktok_sign", "tiktok_post_video", "pinterest_post_pin"}
 # check_thread_updates + show_recent_auto_heals don't need a session — they're admin/info tools
 
@@ -11948,7 +11988,7 @@ def _cli_help() -> str:
 
 async def _cli_get_tool_docs(tool_name: str | None) -> str:
     """Return docs for one tool or a list of all tool names."""
-    tools = await list_tools()
+    tools = await _all_tools()  # the CLI documents every tool, whatever WEBLOOM_TOOLS shows
     if not tool_name:
         # List all tools with a one-liner
         lines = [f"WebLoom v{ENGINE_VERSION} — {len(tools)} tools available", ""]
