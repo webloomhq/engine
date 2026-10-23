@@ -177,7 +177,7 @@ def preflight(version: str) -> str:
         raise SystemExit(f"server.py ENGINE_VERSION is {m.group(1) if m else '?'}, not {version}: bump and commit it first")
     # server.json / manifest.json are rewritten by this script (version, mcpb url, sha) and committed after
     dirty = [l for l in git("status", "--porcelain", "--untracked-files=no").splitlines()
-             if l[3:] not in ("server.json", "manifest.json")]
+             if l.split(maxsplit=1)[-1] not in ("server.json", "manifest.json")]
     if dirty:
         raise SystemExit("uncommitted changes (the release must match a pushed commit):\n" + "\n".join(dirty))
     head = git("rev-parse", "HEAD")
