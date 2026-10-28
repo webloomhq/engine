@@ -3,7 +3,7 @@
   "name": "io.github.webloomhq/engine",
   "title": "WebLoom",
   "description": "104 tools: drive YOUR real Chrome via CDP + browse/install/publish Threads in chat. webloom.run.",
-  "version": "0.3.28",
+  "version": "0.3.29",
   "websiteUrl": "https://webloom.run",
   "repository": {
     "url": "https://github.com/webloomhq/engine",
@@ -12,9 +12,9 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/webloomhq/engine/releases/download/v0.3.28/webloom-0.3.28.mcpb",
-      "version": "0.3.28",
-      "fileSha256": "8aa17cf388e2780b3135abe40a253f5debea7ef39a215207e8a6baaa042f765b",
+      "identifier": "https://github.com/webloomhq/engine/releases/download/v0.3.29/webloom-0.3.29.mcpb",
+      "version": "0.3.29",
+      "fileSha256": "df87feb4327026744663c2e3b10870dab4c116d49e8b9cacb98ee8ed84ac601f",
       "transport": {
         "type": "stdio"
       }
