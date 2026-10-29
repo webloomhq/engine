@@ -185,7 +185,7 @@ def list_recipes() -> list:
     out = []
     for p in sorted(RECIPES_DIR.glob("*.json")):
         try:
-            r = json.loads(p.read_text())
+            r = json.loads(p.read_text(encoding="utf-8"))
             out.append({
                 "name": r.get("name", p.stem),
                 "goal": r.get("goal", ""),
@@ -204,20 +204,37 @@ def load_recipe(name: str) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 
+_PLACEHOLDER = re.compile(r"\{\{(json:)?([^{}]+?)\}\}")
+
+
 def substitute_params(args: dict, params: dict) -> dict:
-    """Replace {{var}} in any string value of args with params[var]."""
+    """Replace {{var}} in any string value of args with params[var].
+
+    - A value that is exactly "{{var}}" takes params[var] as it is when that is a list or a dict, so
+      upload_file "files": "{{media_paths}}" receives the real list (str() of a list was never usable).
+    - {{json:var}} puts json.dumps(params[var]) in place: a safe JavaScript literal for eval_js code
+      (quotes, newlines and emoji in a caption cannot break the script).
+    - One pass: text that a parameter brings in is never scanned for more placeholders."""
     if not params:
         return args
+
+    def one(m):
+        as_json, key = m.group(1), m.group(2)
+        if key not in params:
+            return m.group(0)
+        return json.dumps(params[key]) if as_json else str(params[key])
+
     def sub(v):
         if isinstance(v, str):
-            for k, val in params.items():
-                v = v.replace("{{" + k + "}}", str(val))
-            return v
+            whole = _PLACEHOLDER.fullmatch(v)
+            if whole and not whole.group(1) and isinstance(params.get(whole.group(2)), (list, dict)):
+                return params[whole.group(2)]
+            return _PLACEHOLDER.sub(one, v)
         if isinstance(v, dict):
             return {kk: sub(vv) for kk, vv in v.items()}
         if isinstance(v, list):

@@ -2527,7 +2527,7 @@ async def _all_tools():
         Tool(name="list_recipes", description="List all saved browser-workflow recipes with their goals and action counts.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="worker_jobs", description="See and manage the jobs run_worker keeps on disk. `list` shows every job with its done/failed counts. `show` returns the task names done and failed for one job. `retry` clears the failed list so the next run_worker call retries only those, keeping finished work. `reset` empties the job so it starts from scratch. Without this you can start a queue but not see where it stopped or rerun just the parts that broke.", inputSchema={"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "show", "retry", "reset"], "default": "list"}, "job": {"type": "string", "description": "Job name. Required for show, retry and reset."}}, "required": []}),
         Tool(name="run_worker", description="Run a QUEUE of tasks unattended, waiting for each one to finish before starting the next. This is what replay_recipe cannot do: a recipe repeats a FIXED sequence, while a worker polls the page and only advances when a done-signal appears. Use it whenever each step takes an unknown amount of time (generating audio/video, uploading, rendering, publishing). For every task it runs `before` (optional JS), fills `prompt_selector` with the task text using the React-safe native setter, invokes the `submit_selector` button, then polls the page for `done_text` up to `timeout_seconds`; when it appears it invokes `confirm_selector` (optional) and moves on. It runs as its OWN operating-system process, so it keeps going when the calling session is idle or closed, and it reconnects by itself if the browser dies. Progress is written to disk after EVERY task, so re-running with the same `job` resumes exactly where it left off instead of redoing finished work. While a job runs, do not query the page with eval_js: two concurrent users of the browser connection drop it. Returns per-task ok/failed plus the resume file path.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "job": {"type": "string", "description": "Job name. Used as the resume key: re-running with the same name skips tasks already done."}, "tasks": {"type": "array", "items": {"type": "object"}, "description": "List of {name, prompt} objects. `name` is the resume key, `prompt` the text typed into prompt_selector."}, "prompt_selector": {"type": "string", "description": "CSS selector of the input/textarea that receives each task text. Filled with the native value setter + input event, which is what React-controlled fields require."}, "submit_selector": {"type": "string", "description": "CSS selector, or aria-label in the form aria:Label, of the button that starts the task. Invoked through its React onClick prop, so it works on UIs that ignore synthetic clicks."}, "done_text": {"type": "string", "description": "Text that appears on the page when a task has finished (whatever the site shows: a confirm button, a status word, a result label). This is the signal the worker waits for instead of sleeping a fixed time."}, "confirm_selector": {"type": "string", "description": "Optional. Button to invoke once done_text appears, to accept or save the result. Accepts text:Foo / aria:Foo / a CSS selector."}, "before": {"type": "string", "description": "Optional JS to run before each task, for whatever the site needs first (open a row, pick a slot, clear a field). Runs in page context."}, "timeout_seconds": {"type": "number", "default": 200, "description": "How long to wait for done_text on each task before marking it failed and moving on."}, "poll_seconds": {"type": "number", "default": 4}, "url_match": {"type": "string", "description": "Optional. Piece of the tab URL to work on, e.g. a domain. Without it the worker takes the first page it finds in that session."}}, "required": ["session", "job", "tasks", "prompt_selector", "submit_selector", "done_text"]}),
-        Tool(name="replay_recipe", description="Replay a saved recipe (recipes/<name>.json) or a session_recipe of an installed Thread (name it \"<domain>/<recipe>\") and run every action in sequence. Pass parameters dict to substitute {{var}} placeholders captured during recording. A recipe with \"output\": \"json\" replies with one JSON object {ok, recipe, result, steps}: result is the value of the step marked \"returns\": true, and a failing step stops the run with ok:false unless it is marked \"optional\": true. A step {\"tool\": \"sleep\", \"args\": {\"seconds\": N}} pauses.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Recipe name to replay, or \"<domain>/<recipe>\" for a Thread's recipe"}, "parameters": {"type": "object", "description": "Key-value pairs for {{var}} substitution, e.g. {'email': 'foo@bar.com', 'password': 'secret'}"}, "session": {"type": "string", "description": "Optional session override (recipes don't store session: they replay against whatever you pass here)"}, "tab": {"type": "string", "description": "Optional tab override"}}, "required": ["name"]}),
+        Tool(name="replay_recipe", description="Replay a saved recipe (recipes/<name>.json) or a session_recipe of an installed Thread (name it \"<domain>/<recipe>\") and run every action in sequence. Pass parameters dict to substitute {{var}} placeholders captured during recording. A recipe with \"output\": \"json\" replies with one JSON object {ok, recipe, result, steps}: result is the value of the step marked \"returns\": true, and a failing step stops the run with ok:false unless it is marked \"optional\": true; a step marked \"always\": true still runs after a failure and its returned value comes back as result next to the error. A step {\"tool\": \"sleep\", \"args\": {\"seconds\": N}} pauses. A parameter declared as \"name?\" is optional (\"\" when not passed). In args, \"{{var}}\" alone takes a list or dict parameter as it is (e.g. upload_file files) and {{json:var}} inserts the parameter as a JSON literal (safe inside eval_js code).", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Recipe name to replay, or \"<domain>/<recipe>\" for a Thread's recipe"}, "parameters": {"type": "object", "description": "Key-value pairs for {{var}} substitution, e.g. {'email': 'foo@bar.com', 'password': 'secret'}"}, "session": {"type": "string", "description": "Optional session override (recipes don't store session: they replay against whatever you pass here)"}, "tab": {"type": "string", "description": "Optional tab override"}}, "required": ["name"]}),
         Tool(name="detect_blocker", description="Detect login walls, CAPTCHA (reCAPTCHA / hCaptcha / Cloudflare / DataDome / Arkose), 2FA prompts (TOTP / SMS / push / hardware key), and verification challenges on the current tab. Call before any flow that might hit one.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
         Tool(name="detect_anti_bot", description="Detect anti-bot interception. Returns the type (cloudflare_challenge / datadome / perimeterX / arkose / akamai / empty_shell / normal) plus signals. Different from detect_blocker — that's CAPTCHA/2FA for users; this is silent bot detection that returns a stub page. Use after navigation to know if the page actually loaded or if you hit a challenge.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
         Tool(name="framework_detect", description="Identify which JS frameworks the current page uses. Returns React (with version), Redux, AUI, Backbone, Vue, Angular, Radix, HeadlessUI, Svelte, Next.js, Nuxt, Amazon P-loader, plus DOM indicators (password input, file input, label-wrapped file, drop zone, iframe count). Use to pick the right strategy upfront — e.g. AUI detected → reach for aui_dispatch; Redux detected → react_inspect_store.", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}}, "required": ["session"]}),
@@ -3444,18 +3444,28 @@ def _replay_value(tool: str, text: str):
 async def _replay_json(recipe: dict, params: dict, session_override, tab_override) -> dict:
     """Replay a recipe that declares "output": "json": the reply is one JSON object
     {ok, recipe, result, steps}. `result` is the value of the step marked "returns": true. A step
-    that fails stops the run with ok:false, unless it is marked "optional": true. A step
+    that fails stops the run with ok:false, unless it is marked "optional": true. A step marked
+    "always": true still runs after a failed step (the run stays ok:false and keeps the first
+    failure), so a recipe can always end with a step that reads the page and reports what really
+    happened; its "returns" value comes back as `result` next to the error. A step
     {"tool": "sleep", "args": {"seconds": N}} pauses (max 120 s)."""
     rname = recipe.get("name", "")
     declared = [p if isinstance(p, str) else (p or {}).get("name") for p in recipe.get("parameters") or []]
-    missing = [p for p in declared if p and p not in params]
+    # "name?" declares an optional parameter: when it is not passed it is "" (the recipe picks its default)
+    optional = [p[:-1] for p in declared if p and p.endswith("?")]
+    missing = [p for p in declared if p and not p.endswith("?") and p not in params]
     if missing:
         return {"ok": False, "recipe": rname, "error": f"missing parameter(s): {', '.join(missing)}"}
+    params = {**{o: "" for o in optional if o not in params}, **params}
     steps: list[dict] = []
     result = None
     actions = recipe.get("actions") or []
+    first_fail = None  # (step, error) once a step failed and a later step is marked "always"
     for i, action in enumerate(actions, 1):
         tool = action["tool"]
+        if first_fail and not action.get("always"):
+            steps.append({"step": i, "tool": tool, "ok": None, "note": "skipped: an earlier step failed"})
+            continue
         args = recording.substitute_params(dict(action.get("args") or {}), params)
         if tool == "sleep":
             secs = min(max(float(args.get("seconds", 1) or 0), 0.0), 120.0)
@@ -3474,10 +3484,17 @@ async def _replay_json(recipe: dict, params: dict, session_override, tab_overrid
         note = action.get("note") or ""
         steps.append({"step": i, "tool": tool, "ok": not failed, **({"note": note} if note else {}),
                       **({"detail": text[:300]} if failed else {})})
-        if failed and not action.get("optional"):
-            return {"ok": False, "recipe": rname, "failed_step": i, "error": text[:1000], "steps": steps}
+        if failed and not action.get("optional") and not first_fail:
+            if not any(a.get("always") for a in actions[i:]):
+                return {"ok": False, "recipe": rname, "failed_step": i, "error": text[:1000], "steps": steps}
+            first_fail = (i, text[:1000])
         if action.get("returns") and not failed:
             result = _replay_value(tool, text)
+    if first_fail:
+        out = {"ok": False, "recipe": rname, "failed_step": first_fail[0], "error": first_fail[1], "steps": steps}
+        if result is not None:
+            out["result"] = result
+        return out
     return {"ok": True, "recipe": rname, "result": result, "steps": steps}
 
 
@@ -5372,6 +5389,13 @@ async def _execute_tool_action(name: str, arguments: dict):
         code = arguments["code"]
         result = await eval_in_tab(ws_url, code)
         val = result.get("result", {})
+        exc = result.get("exceptionDetails")
+        if exc:
+            # A promise that REJECTS came back as {"type": "object", "value": {}} (the Error serialized by value), so an
+            # async script that threw read as a success. Report it with the same error shape a synchronous throw has.
+            ex = exc.get("exception") or {}
+            val = {"type": "object", "subtype": "error", "className": ex.get("className") or "Error",
+                   "description": ex.get("description") or str(ex.get("value") or exc.get("text") or "exception")}
 
         # Heuristic auto-recording: if the eval_js code includes a fetch() call
         # AND the returned value looks like a successful HTTP response
