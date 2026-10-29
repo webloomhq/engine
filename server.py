@@ -225,6 +225,11 @@ _AUTO_UPDATE_INTERVAL_S = 6 * 3600  # 6 hours
 _THREADS_DIR_PATH = Path.home() / ".webloom" / "threads"
 
 
+def _version_key(v) -> tuple:
+    """'1.4.0' -> (1, 4, 0) for ordering Thread versions; anything without digits sorts first."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:4]) or (0,)
+
+
 def _auto_update_threads_once() -> dict:
     """For every Thread file in ~/.webloom/threads/, poll the marketplace for a
     newer version. If found, atomically overwrite. Logs heals to a notification
@@ -263,6 +268,11 @@ def _auto_update_threads_once() -> dict:
                 continue
             new_thread = data.get("thread")
             if not new_thread:
+                continue
+            # Only a strictly NEWER marketplace copy replaces the local one. The site answers "not up to date"
+            # for any different version, so a Thread built locally ahead of the marketplace was rolled back to
+            # the older public copy on every engine start (instagram.com 1.4.0 -> 1.3.1, 2026-10-29).
+            if _version_key(new_thread.get("version") or data.get("version")) <= _version_key(local_version):
                 continue
             # Atomic write: tmp file → rename. Never leaves a half-written Thread on disk.
             tmp = f.with_suffix(".thread.json.tmp")
