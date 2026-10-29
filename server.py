@@ -54,6 +54,15 @@ CHROME_EXE = os.environ.get(
     "CHROME_EXE",
     r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 )
+if os.name != "nt" and not os.path.exists(CHROME_EXE):
+    # Linux / macOS box: the Windows default path never exists there (2026-10-29: launch_session
+    # could not start Chrome); take the first browser binary found on PATH.
+    import shutil as _shutil_chrome
+    for _b in ("google-chrome-stable", "google-chrome", "chromium-browser", "chromium", "microsoft-edge"):
+        _p = _shutil_chrome.which(_b)
+        if _p:
+            CHROME_EXE = _p
+            break
 
 def find_and_focus_chrome_window(port: int) -> int | None:
     """Find the specific Chrome window for this debug port, bring it to front."""
@@ -165,7 +174,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.30"
+ENGINE_VERSION = "0.3.31"
 
 
 def _installed_version() -> str:
@@ -4588,7 +4597,13 @@ async def _execute_tool_action(name: str, arguments: dict):
             args.append(f"--proxy-server={cfg['proxy']}")
         if arguments.get("url"):
             args.append(arguments["url"])
-        popen_kw = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt":
+            popen_kw = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            # subprocess.DETACHED_PROCESS and creationflags exist only on Windows (2026-10-29 Outreach
+            # report: "module 'subprocess' has no attribute 'DETACHED_PROCESS'"): a new session detaches here.
+            popen_kw = {"start_new_session": True, "stdin": subprocess.DEVNULL,
+                        "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
         if background and os.name == "nt":
             # Minimized and never activated: whatever window the person is using keeps the focus.
             si = subprocess.STARTUPINFO()
@@ -9240,22 +9255,33 @@ async def _execute_tool_action(name: str, arguments: dict):
                 else:
                     return [TextContent(type="text", text=f"x_create_tweet: no x.com tab open in this session. Open https://x.com/home and retry, or pass tab=<id>. Current tabs: {[t.get('url','') for t in real_tabs(tabs)][:5]}")]
 
-        # 1. Pull home HTML + ondemand JS from Python directly (urllib).
-        #    In-page fetch to x.com → abs.twimg.com is blocked by X's CSP
-        #    (connect-src omits the CDN). The home HTML scaffold + ondemand JS
-        #    are PUBLIC — no auth required, so a server-side fetch is fine and
-        #    avoids the CORS surface entirely. Only ct0 + queryId still come
-        #    from the tab (cookie + same-origin main bundle scrape).
+        # 1. Home HTML from the logged-in tab, ondemand JS from the CDN (urllib).
+        #    2026-10-29: X now serves a ~28 KB stub (no ondemand manifest, no verification
+        #    meta, no animation svgs) to a urllib GET from the box, so "ondemand index not in
+        #    home HTML" for every brand. The tab's own same-origin fetch('/home') gets the real
+        #    ~300 KB page (cookies attach, no CSP issue for same-origin). document.documentElement
+        #    .outerHTML is NOT used: hydration removes the loading svgs the transaction id needs.
+        #    abs.twimg.com is blocked by CSP from the tab, but it is a public CDN: urllib is fine.
+        #    urllib on x.com/home stays only as a fallback if the tab fetch fails.
         UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+        home_html = ""
         try:
-            req = urllib.request.Request("https://x.com/home", headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
-            home_html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
-        except Exception as e:
-            return [TextContent(type="text", text=f"x_create_tweet: home fetch failed — {type(e).__name__}: {e}")]
+            hr = await eval_in_tab(ws_url, "(async()=>{try{const r=await fetch('/home',{credentials:'same-origin'});return await r.text();}catch(e){return '';}})()")
+            hv = hr.get("result", {}).get("value", "")
+            if isinstance(hv, str):
+                home_html = hv
+        except Exception:
+            home_html = ""
+        if not re.search(r',(\d+):["\']ondemand\.s["\']', home_html):
+            try:
+                req = urllib.request.Request("https://x.com/home", headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+                home_html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
+            except Exception as e:
+                return [TextContent(type="text", text=f"x_create_tweet: home fetch failed (tab and urllib) — {type(e).__name__}: {e}")]
 
         idx_match = re.search(r',(\d+):["\']ondemand\.s["\']', home_html)
         if not idx_match:
-            return [TextContent(type="text", text="x_create_tweet: ondemand index not in home HTML — X may have changed the manifest layout.")]
+            return [TextContent(type="text", text="x_create_tweet: ondemand index not in home HTML (tab fetch and urllib both) — is the tab logged in to X, or did X change the manifest layout?")]
         idx = idx_match.group(1)
         hash_match = re.search(r',' + idx + r':"([0-9a-f]+)"', home_html)
         if not hash_match:
