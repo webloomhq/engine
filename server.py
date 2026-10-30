@@ -2455,7 +2455,7 @@ async def list_prompts():
     return [
         Prompt(
             name="chrome-start",
-            description="Chrome MCP startup — always run this at the start of any browser session",
+            description="WebLoom startup: always run this at the start of any browser session",
         )
     ]
 
@@ -2537,7 +2537,7 @@ async def _all_tools():
         Tool(name="note", description="Add a freeform note for a domain — tips, warnings, timing quirks, things to remember. Auto-shows when you scan that domain.", inputSchema={"type": "object", "properties": {"domain": {"type": "string", "description": "e.g. bitget.com, mexc.com"}, "text": {"type": "string", "description": "The note — e.g. 'wait 1.5s after login before clicking dashboard' or 'reCAPTCHA fires on step 3, hand off to user'"}}, "required": ["domain", "text"]}),
         Tool(name="list_running_chrome", description="Discover all currently running Chrome instances with debug ports — named sessions and unknown ones.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="confirm_login", description="Record the user's answer to the 'Are you logged in?' question for a given session. Only call this AFTER asking the user via AskUserQuestion and getting their explicit answer. Never call with logged_in=true unless the user said yes.", inputSchema={"type": "object", "properties": {"session": {"type": "string", "description": "Session name the user answered for."}, "logged_in": {"type": "boolean", "description": "True if user confirmed they are logged in, false if they still need to log in."}}, "required": ["session", "logged_in"]}),
-        Tool(name="chrome_status", description="CALL THIS FIRST — full status: which sessions are live, which are offline, what tabs are open, and what to do next. Always call before any Chrome MCP work.", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="chrome_status", description="CALL THIS FIRST — full status: which sessions are live, which are offline, what tabs are open, and what to do next. Always call before any WebLoom work.", inputSchema={"type": "object", "properties": {}}),
         Tool(name="scroll_tab", description="Scroll a Chrome tab — useful for pages where content loads below the fold", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string"}, "direction": {"type": "string", "enum": ["down", "up", "left", "right"], "default": "down"}, "amount": {"type": "integer", "default": 500, "description": "Pixels to scroll"}}, "required": ["session"]}),
         Tool(name="close_tab", description="Close a specific tab in a Chrome session", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "tab": {"type": "string", "description": "Tab title, URL substring, or ID"}}, "required": ["session", "tab"]}),
         Tool(name="find_tab_by_selector", description="Scan all tabs in a session and return the first tab where a JS expression returns truthy. Use this when multiple tabs share the same URL and you need the one with the right DOM state. Example: js_test='!!document.querySelector(\"button\")' or js_test='document.title.includes(\"loaded\")'", inputSchema={"type": "object", "properties": {"session": {"type": "string"}, "js_test": {"type": "string", "description": "JS expression evaluated in each tab — return the tab where this is truthy"}, "url_filter": {"type": "string", "description": "Optional URL substring to skip irrelevant tabs"}}, "required": ["session", "js_test"]}),
@@ -3321,7 +3321,7 @@ _start_update_check_timer()
 _STATUS_FREE_EXTRA = {"detect_anti_bot", "framework_detect", "wait_for_idle", "seed_from_tab",
                      "launch_headless_chrome", "register_autostart", "schedule_task", "autopilot_status"}
 
-# Startup check fires every new "session" (10 min of no Chrome MCP activity = new session)
+# Startup check fires every new "session" (10 min of no WebLoom activity = new session)
 _STARTUP_STATE = Path.home() / ".webloom" / "startup-check.json"
 _STARTUP_RESET_SECONDS = 600
 
@@ -4409,7 +4409,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         running = discover_running_chrome_sessions()
         running_ports = {r["port"]: r for r in running}
         live, offline = [], []
-        lines = ["## Chrome MCP — Session Check\n"]
+        lines = ["## WebLoom: Session Check\n"]
         for sname, cfg in sessions.items():
             r = running_ports.get(cfg["port"])
             if r:
@@ -4655,7 +4655,7 @@ async def _execute_tool_action(name: str, arguments: dict):
         running_ports = {r["port"]: r for r in running}
         live_sessions = []
         offline_sessions = []
-        lines = ["## Chrome MCP Status\n"]
+        lines = ["## WebLoom Status\n"]
         installed = _installed_version()
         if installed and installed != ENGINE_VERSION:
             lines.append(f"⚠️ **This session is running WebLoom {ENGINE_VERSION}, but {installed} is installed.** "

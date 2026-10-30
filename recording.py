@@ -1,4 +1,4 @@
-"""Recording engine for Chrome MCP — records browser workflows, replays them deterministically.
+"""Recording engine for WebLoom: records browser workflows, replays them deterministically.
 
 Design goals:
 - Smart: captures multiple selector strategies per click/wait so replay survives small UI changes

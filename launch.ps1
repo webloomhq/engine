@@ -1,4 +1,4 @@
-# Launch a Chrome session for the Chrome MCP
+# Launch a Chrome session for WebLoom
 # Usage: .\launch.ps1 -Session main
 #        .\launch.ps1 -Session farm
 #        .\launch.ps1 -Session all
