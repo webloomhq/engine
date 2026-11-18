@@ -174,7 +174,7 @@ PLAYBOOK_FILE = Path(os.environ.get("WEBLOOM_PLAYBOOK", os.environ.get("CHROME_P
 TELEMETRY_URL = os.environ.get("WEBLOOM_TELEMETRY_URL", "https://webloom.run/api/telemetry")
 ENGINE_TELEMETRY_URL = os.environ.get("WEBLOOM_ENGINE_TELEMETRY_URL", "https://webloom.run/api/engine-telemetry")
 PROPOSAL_URL = os.environ.get("WEBLOOM_PROPOSAL_URL", "https://webloom.run/api/patch-proposal")
-ENGINE_VERSION = "0.3.32"
+ENGINE_VERSION = "0.3.33"
 
 
 def _installed_version() -> str:
@@ -2862,7 +2862,9 @@ async def _all_tools():
         Tool(name="webloom_pair", description=(
             "Link this engine install to the user's webloom.run account so they can browse, buy, install, and manage Threads from inside chat. "
             "Prints a short code + a URL, opens the URL in their browser, and polls until they confirm. Saves the session token to ~/.webloom/auth.json. "
-            "Idempotent: if already paired, returns the existing user_email and does nothing."
+            "Idempotent: if already paired, returns the existing user_email and does nothing. "
+            "With VIBEDNA_LICENSE_KEY set in this engine's environment (a tool bought on vibedna.ai passes the buyer's key), "
+            "it pairs with that key and opens no browser, then installs every Thread the account owns (WebLoom and Vibedna share one account)."
         ), inputSchema={"type": "object", "properties": {
             "poll_seconds": {"type": "integer", "default": 180, "description": "How long to block waiting for the user to confirm in the browser (max 600)."},
             "open_browser": {"type": "boolean", "default": True, "description": "Open the pair URL in the default browser. Set false if running headless."},
@@ -10358,8 +10360,15 @@ async def _execute_tool_action(name: str, arguments: dict):
             "End":       {"key": "End",       "code": "End",       "vk": 35},
         }
         info = key_table.get(key)
+        if not info and len(key) == 1 and key.isalnum():
+            # single letter or digit, so shortcuts like Control+a (select all) work
+            ch = key.lower()
+            info = {"key": ch, "code": ("Key" + ch.upper()) if ch.isalpha() else ("Digit" + ch), "vk": ord(ch.upper())}
+            if not (mod_mask & 6):
+                info["text"] = key
         if not info:
-            return [TextContent(type="text", text=f"key_press: unknown key '{key}'. Supported: {list(key_table.keys())}")]
+            return [TextContent(type="text", text=f"key_press: unknown key '{key}'. Supported: {list(key_table.keys())} plus any single letter or digit")]
+        edit_cmd = {"a": "selectAll", "c": "copy", "x": "cut", "v": "paste", "z": "undo"}.get(key.lower()) if (mod_mask & 6) and len(key) == 1 else None
         base = {
             "key": info["key"],
             "code": info["code"],
@@ -10367,7 +10376,7 @@ async def _execute_tool_action(name: str, arguments: dict):
             "nativeVirtualKeyCode": info["vk"],
             "modifiers": mod_mask,
         }
-        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", **base, **({"text": info["text"]} if "text" in info else {})})
+        await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyDown", **base, **({"text": info["text"]} if "text" in info else {}), **({"commands": [edit_cmd]} if edit_cmd else {})})
         await cdp_send(ws_url, "Input.dispatchKeyEvent", {"type": "keyUp", **base})
         # Record key_press into playbook — Enter on a form submit / Ctrl+S save /
         # Escape on a modal can each be the "unlock" move for a flow.
@@ -11939,15 +11948,15 @@ _CLI_ALIASES = {
 }
 _CLI_POSITIONAL = {
     "navigate":  ["url"],
-    "click":     ["selector"],
+    "click":     ["description"],
     "fill":      ["selector", "text"],
     "key_type":  ["text"],
     "key_press": ["key"],
     "read_tab":  [],
     "screenshot": [],
-    "eval_js":   ["expression"],
+    "eval_js":   ["code"],
     "wait_for":  ["selector"],
-    "scroll_tab": ["y"],
+    "scroll_tab": ["direction", "amount"],
     "chrome_status": [],
     "list_tabs": [],
     "list_sessions": [],
@@ -11995,6 +12004,11 @@ def _cli_coerce(v: str):
         return float(v)
     except (ValueError, TypeError):
         pass
+    if isinstance(v, str) and v[:1] in ("[", "{"):
+        try:
+            return json.loads(v)
+        except (ValueError, TypeError):
+            pass
     return v
 
 
@@ -12161,6 +12175,9 @@ def _cli_run(argv: list[str]) -> int:
     tool_name = _CLI_ALIASES.get(cmd, cmd)
     positional = _CLI_POSITIONAL.get(tool_name, [])
     args = _cli_parse_args(rest, positional)
+    # `fill <selector> <text>` on the command line; the tool takes fields={label_or_selector: value}.
+    if tool_name == "fill" and "fields" not in args and "selector" in args:
+        args["fields"] = {args.pop("selector"): args.pop("text", "")}
     try:
         result = asyncio.run(call_tool(tool_name, args))
         print(_cli_render(result, json_out))

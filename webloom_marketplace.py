@@ -33,6 +33,7 @@ from typing import Any
 WEBLOOM_BASE_URL = os.environ.get("WEBLOOM_BASE_URL", "https://webloom.run")
 PAIR_INIT_URL = f"{WEBLOOM_BASE_URL}/api/auth/pair/init"
 PAIR_CLAIM_URL = f"{WEBLOOM_BASE_URL}/api/auth/pair/claim"
+PAIR_KEY_URL = f"{WEBLOOM_BASE_URL}/api/auth/pair/key"
 BROWSE_URL = f"{WEBLOOM_BASE_URL}/api/marketplace/browse"
 THREAD_INFO_URL_BASE = f"{WEBLOOM_BASE_URL}/api/marketplace/thread"
 INSTALL_URL = f"{WEBLOOM_BASE_URL}/api/marketplace/install"
@@ -111,21 +112,80 @@ def _post(url: str, body: dict, timeout: float = 10.0) -> tuple[int, dict]:
 
 
 # --- public tool implementations ----------------------------------------
+def _vibedna_key() -> str:
+    """A Vibedna licence key given to this engine (a tool bought on vibedna.ai passes the buyer's own key here)."""
+    return os.environ.get("VIBEDNA_LICENSE_KEY", "").strip()
+
+
+def install_owned() -> dict:
+    """Install every Thread this account owns that is not on this machine yet. Owned Threads cost nothing to
+    install; nothing is bought here. Returns {installed: [...], already: [...], failed: [{domain, error}]}."""
+    lib = tool_library()
+    out = {"installed": [], "already": [], "failed": []}
+    if not lib.get("ok"):
+        out["failed"].append({"domain": "*", "error": str(lib.get("error") or lib)[:200]})
+        return out
+    for item in lib.get("items") or []:
+        domain = str(item.get("domain") or "")
+        if not domain:
+            continue
+        if (THREADS_DIR / f"{domain}.thread.json").exists():
+            out["already"].append(domain)
+            continue
+        r = tool_install(domain, confirm_paywall=False, open_checkout=False)
+        if r.get("ok") and r.get("status") in ("owned", "pro", "free"):
+            out["installed"].append(domain)
+        else:
+            out["failed"].append({"domain": domain, "error": str(r.get("error") or r.get("status") or r)[:200]})
+    return out
+
+
+def _pair_with_key(anon_id: str, key: str) -> dict:
+    """Pair with a Vibedna licence key: no browser, no second sign-in (WebLoom and Vibedna share one account)."""
+    s, b = _post(PAIR_KEY_URL, {"anon_id": anon_id, "key": key}, timeout=20)
+    if s != 200 or not b.get("paired") or not b.get("session_token"):
+        return {"ok": False, "error": b.get("error") or f"pairing with the Vibedna key failed (HTTP {s})",
+                "hint": "Check VIBEDNA_LICENSE_KEY (the key in your purchase email), or unset it and pair in the browser."}
+    _save_auth({
+        "session_token": b["session_token"],
+        "user_email": b.get("user_email"),
+        "anon_id": anon_id,
+        "paired_at": int(time.time()),
+        "via": "vibedna_key",
+    })
+    return {"ok": True, "paired": True, "user_email": b.get("user_email")}
+
+
 def tool_pair(anon_id: str, poll_seconds: int = 180, open_browser: bool = True) -> dict:
     """Initiate pairing. Returns instructions + polls for confirmation.
 
-    The MCP wrapper prints the code + URL, optionally opens the browser, and
-    blocks polling until the user confirms or the timeout elapses. Both sides
-    have a 10-minute server-side TTL so we never poll forever.
+    With VIBEDNA_LICENSE_KEY set (a Vibedna purchase: Social Brain, a System) the engine pairs with that key and
+    no browser opens; every Thread the account owns is then installed. Otherwise the MCP wrapper prints the code +
+    URL, optionally opens the browser, and blocks polling until the user confirms or the timeout elapses. Both
+    sides have a 10-minute server-side TTL so we never poll forever.
     """
+    key = _vibedna_key()
     existing = get_session_token()
     if existing:
-        return {
+        result = {
             "ok": True,
             "already_paired": True,
             "user_email": get_user_email(),
             "message": "Engine is already paired. To re-pair as a different user run webloom_pair_reset() first.",
         }
+        if key:
+            result["threads"] = install_owned()
+        return result
+
+    if key:
+        r = _pair_with_key(anon_id, key)
+        if not r.get("ok"):
+            return r
+        r["threads"] = install_owned()
+        r["message"] = (f"Paired to webloom.run as {r.get('user_email')} with your Vibedna key, no browser step. "
+                        f"Threads installed now: {', '.join(r['threads']['installed']) or 'none'}"
+                        f"{'; already here: ' + ', '.join(r['threads']['already']) if r['threads']['already'] else ''}.")
+        return r
 
     status, body = _post(PAIR_INIT_URL, {"anon_id": anon_id})
     if status != 200 or not body.get("ok"):
